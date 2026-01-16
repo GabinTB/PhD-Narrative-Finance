@@ -1,0 +1,6 @@
+lab/*
+data/RavenPack/*
+data/DeutscheBoerse/*
+.env
+.eggs/*
+*.egg-info/
