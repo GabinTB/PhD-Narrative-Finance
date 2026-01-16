@@ -1,6 +1,9 @@
+# Kepp lab/ out of version control (private raw prototypes)
 lab/*
-data/RavenPack/*
-data/DeutscheBoerse/*
+
+data/*
+outputs/*
+
 .env
 .eggs/*
 *.egg-info/

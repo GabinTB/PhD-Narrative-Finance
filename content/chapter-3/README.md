@@ -27,8 +27,7 @@ Lorem ipsum.
 
 - **Nanosecond Microstructure: High-Frequency Traders Participation Stylized Facts**
   Gabin Taibi, Setfan Schlamp, Joerg Osterrieder (2026). *SSRN preprint*.
-  DOI: (available soon)
-  Link: (available soon)
+  Link: https://papers.ssrn.com/sol3/papers.cfm?abstract_id=6031357
 
 - **Lorem ipsum**  
   Gabin Taibi, Setfan Schlamp, Joerg Osterrieder (2026). *Ongoing*.  

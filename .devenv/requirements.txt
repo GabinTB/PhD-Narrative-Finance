@@ -1,0 +1,27 @@
+sympy==1.13.1
+line_profiler
+memory_profiler
+ratelimit
+python-dotenv
+Cython
+jupyter
+ipykernel
+pyarrow
+tqdm
+PyYAML
+fastparquet
+pandas
+polars
+numpy
+numba
+scipy
+statsmodels
+scikit-learn
+spacy
+transformers
+huggingface-hub
+# torch
+matplotlib
+seaborn
+plotly
+gingado
