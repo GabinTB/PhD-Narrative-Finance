@@ -1,9 +1,39 @@
-# Kepp lab/ out of version control (private raw prototypes)
-lab/*
+# uv
+.venv/
+uv.lock
 
+# Data and outputs (local only)
 data/*
+!data/README.md
 outputs/*
+models/*
+!models/README.md
 
-.env
-.eggs/*
+# Python
+__pycache__/
+*.py[cod]
 *.egg-info/
+dist/
+build/
+.eggs/
+
+# Env
+.env
+
+# Editors
+.DS_Store
+.vscode/settings.json
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Logs
+logs/
+
+# Git
+.gitattributes
+
+# Specific to this project
+src/NRC-VAD/
+models/mlx/
+models/others/

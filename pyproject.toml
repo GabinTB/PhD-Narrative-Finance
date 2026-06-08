@@ -1,0 +1,119 @@
+[project]
+name = "phd-narrative-finance"
+version = "0.1.0"
+description = "Narrative finance: NLP-driven signals for systematic investments"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+authors = [{name = "Gabin Taibi"}]
+
+dependencies = [
+    "python-dotenv>=1.0",
+    "pyyaml>=6.0",
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "polars>=0.20",
+    "pyarrow>=14.0",
+    "scipy>=1.12",
+    "scikit-learn>=1.4",
+    "statsmodels>=0.14",
+    "cython>=3.0",
+    "numba>=0.59",
+    "matplotlib>=3.8",
+    "plotly>=5.18",
+    "seaborn>=0.13",
+    "requests>=2.31",
+    "httpx>=0.27",
+    # rols = { path = "/Users/tig1/Programming/rols", editable = true } # Local editable version of rols
+    "rols>=0.1",
+]
+
+[build-system]
+requires      = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/phd_narrative_finance"]
+
+[tool.uv]
+package = true
+
+[tool.uv.sources]
+# { path = "/Users/tig1/Programming/realized-library", editable = true }, # Local editable version of realized-library
+# { path = "/Users/tig1/Programming/dbg-cdm", editable = true }, # Local editable version of dbg-cdm
+
+[dependency-groups]
+
+# -------------------------------------------------------------------
+# NLP - Install: `uv sync --group nlp`
+# -------------------------------------------------------------------
+nlp = [
+    "torch>=2.2",
+    "huggingface-hub>=0.22",
+    "transformers>=4.40",
+    "sentence-transformers>=2.7",
+    "mlx>=0.22",
+    "mlx-embeddings>=0.1",
+    "tiktoken>=0.3",
+    "openai>=1.25",
+    "anthropic>=0.25",
+    "google-generativeai>=0.5",
+    "voyageai>=0.2",
+    "spacy>=3.7",
+    "networkx>=3.2",
+    "python-igraph>=0.11",
+]
+
+# -------------------------------------------------------------------
+# Volatility - Install: `uv sync --group volatility`
+# -------------------------------------------------------------------
+volatility = [
+    "realized-library>=0.1.2",
+]
+
+# -------------------------------------------------------------------
+# Dev - Install: `uv sync --group dev`
+# -------------------------------------------------------------------
+dev = [
+    # Notebook execution (VS Code needs ipykernel)
+    "jupyterlab>=4.1",
+    "ipykernel>=6.29",
+    "ipywidgets>=8.1",
+    "tqdm>=4.66",
+    "pytest>=8.0",
+    "ruff>=0.4",
+]
+
+# -------------------------------------------------------------------
+# Project-specific groups -- add deps as each project grows
+# Install e.g.: uv sync --group dev --group nlp --group quoniam
+# -------------------------------------------------------------------
+
+central-bank = [
+    "gingado>=0.2.7",  # Central Bank API client
+    "fredapi>=0.3.0",  # St Louis Fed FRED API client
+]
+
+deutsche-boerse = [
+    "a7>=0.2.3",  # Deutsche Börse A7 API client
+    # { git = "https://github.com/GabinTB/dbg-cdm.git", branch = "main" }, # dbg-cdm from github
+]
+
+quoniam = [
+    
+]
+
+snsf = [
+
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
