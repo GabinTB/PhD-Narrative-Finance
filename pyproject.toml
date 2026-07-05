@@ -26,6 +26,7 @@ dependencies = [
     "httpx>=0.27",
     # rols = { path = "/Users/tig1/Programming/rols", editable = true } # Local editable version of rols
     "rols>=0.1",
+    "ravenbert",
 ]
 
 [build-system]
@@ -39,6 +40,7 @@ packages = ["src/phd_narrative_finance"]
 package = true
 
 [tool.uv.sources]
+ravenbert = { git = "ssh://git@github.com/GabinTB/RavenBERT.git" }
 # { path = "/Users/tig1/Programming/realized-library", editable = true }, # Local editable version of realized-library
 # { path = "/Users/tig1/Programming/dbg-cdm", editable = true }, # Local editable version of dbg-cdm
 
