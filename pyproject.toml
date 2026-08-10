@@ -27,6 +27,8 @@ dependencies = [
     # rols = { path = "/Users/tig1/Programming/rols", editable = true } # Local editable version of rols
     "rols>=0.1",
     "ravenbert",
+    "openai>=2.44.0",
+    "duckdb[parquet]>=1.5.5",
 ]
 
 [build-system]
