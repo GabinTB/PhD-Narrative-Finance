@@ -33,6 +33,16 @@ logs/
 # Git
 .gitattributes
 
+# Tooling caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# edgar_tools local runtime data (catalog, raw/derived/extracted blobs)
+data/edgar/
+src/edgar_tools/**/*.db
+src/edgar_tools/**/*.db-journal
+
 # Specific to this project
 src/NRC-VAD/
 models/mlx/
