@@ -47,3 +47,4 @@ src/edgar_tools/**/*.db-journal
 src/NRC-VAD/
 models/mlx/
 models/others/
+.claude/
