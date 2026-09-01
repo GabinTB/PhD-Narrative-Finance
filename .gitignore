@@ -38,13 +38,9 @@ logs/
 .pytest_cache/
 .ruff_cache/
 
-# edgar_tools local runtime data (catalog, raw/derived/extracted blobs)
-data/edgar/
-src/edgar_tools/**/*.db
-src/edgar_tools/**/*.db-journal
+# Datalake
+# TODO
 
 # Specific to this project
-src/NRC-VAD/
-models/mlx/
-models/others/
 .claude/
+/content/latex/

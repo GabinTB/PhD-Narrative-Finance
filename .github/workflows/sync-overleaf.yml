@@ -1,0 +1,36 @@
+# .github/workflows/sync-overleaf.yml
+name: Sync LaTeX to Overleaf
+
+on:
+  push:
+    paths:
+      - 'content/latex/**'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout Overleaf repo
+        uses: actions/checkout@v4
+        with:
+          repository: GabinTB/PhD-Thesis-Latex  # your private repo linked to Overleaf
+          token: ${{ secrets.OVERLEAF_REPO_PAT }}
+          path: overleaf-repo
+
+      - name: Sync latex folder
+        run: |
+          rsync -av --delete content/latex/ overleaf-repo/
+
+      - name: Commit and push to Overleaf repo
+        run: |
+          cd overleaf-repo
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add .
+          git diff --staged --quiet || git commit -m "sync: latex from main repo"
+          git push
