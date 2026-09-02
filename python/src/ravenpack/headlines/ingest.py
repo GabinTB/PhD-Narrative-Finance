@@ -462,7 +462,7 @@ def ingest_to_datalake(
         pipeline_repo=pipeline_repo,
         repo_dir=repo_dir,
         hyperparams=hyperparams,
-        notes=notes,
+        verifier=KIND,
         hash_pattern="*.parquet",
     ) as run:
         ingest_range(
@@ -483,3 +483,124 @@ def ingest_to_datalake(
         run.note(f"{n_months} monthly files ingested")
 
     return index.get(run.artifact_id)
+
+# ---------------------------------------------------------------------------
+# Content verifiers (registered via pyproject.toml entry points)
+# ---------------------------------------------------------------------------
+
+def verify_artifact(artifact: "Artifact") -> list:
+    """Verify a ravenpack_headlines artifact's content matches its declared scope.
+
+    Registered as the `ravenpack_headlines` entry point.  Checks:
+      - one parquet per month in [start_year, end_year], none missing
+      - no parquet outside the declared range
+      - a sample of files are non-empty and match STRUCTURED_SCHEMA
+    """
+    import polars as pl
+
+    from datalake.verify import Finding, Severity
+
+    findings: list = []
+    aid = artifact.artifact_id
+    hp = artifact.meta.hyperparams
+    start_year = hp.get("start_year")
+    end_year = hp.get("end_year")
+
+    if start_year is None or end_year is None:
+        findings.append(Finding(
+            Severity.WARNING, aid,
+            "no start_year/end_year in hyperparams; cannot verify date coverage",
+        ))
+        return findings
+
+    present = {p.name for p in artifact.path.glob("*.parquet")}
+    expected = {
+        f"{y}-{m:02d}.parquet"
+        for y in range(start_year, end_year + 1)
+        for m in range(1, 13)
+    }
+
+    missing = expected - present
+    if missing:
+        # Missing months are a WARNING not ERROR: raw zips genuinely lack some
+        # months, but a complete artifact should surface the gap.
+        findings.append(Finding(
+            Severity.WARNING, aid,
+            f"{len(missing)} of {len(expected)} declared months missing: "
+            f"{', '.join(sorted(missing)[:6])}"
+            + (" ..." if len(missing) > 6 else ""),
+        ))
+
+    unexpected = present - expected
+    if unexpected:
+        findings.append(Finding(
+            Severity.ERROR, aid,
+            f"{len(unexpected)} parquet(s) outside declared range "
+            f"[{start_year}, {end_year}]: {', '.join(sorted(unexpected)[:6])}",
+        ))
+
+    # Deep-check a sample: first, middle, last present file.
+    sample_names = sorted(present)
+    if sample_names:
+        sample = {
+            sample_names[0],
+            sample_names[len(sample_names) // 2],
+            sample_names[-1],
+        }
+        expected_cols = set(STRUCTURED_SCHEMA.names)
+        for name in sorted(sample):
+            path = artifact.path / name
+            try:
+                df = pl.read_parquet(path)
+            except Exception as exc:
+                findings.append(Finding(
+                    Severity.ERROR, aid, f"{name}: unreadable parquet: {exc}",
+                ))
+                continue
+            if df.is_empty():
+                findings.append(Finding(
+                    Severity.ERROR, aid, f"{name}: file is empty",
+                ))
+                continue
+            actual_cols = set(df.columns)
+            if actual_cols != expected_cols:
+                findings.append(Finding(
+                    Severity.ERROR, aid,
+                    f"{name}: schema mismatch "
+                    f"(missing={expected_cols - actual_cols}, "
+                    f"extra={actual_cols - expected_cols})",
+                ))
+
+    return findings
+
+
+def verify_canonical(artifact: "Artifact") -> list:
+    """Verify a canonical_narratives artifact has the expected structure.
+
+    Registered as the `canonical_narratives` entry point.  Hand-curated
+    taxonomy artifacts must carry a taxonomy.yaml and a grounding_table.csv;
+    their absence means the artifact is incomplete regardless of hash state.
+    """
+    from datalake.verify import Finding, Severity
+
+    findings: list = []
+    aid = artifact.artifact_id
+
+    required = {"taxonomy.yaml", "grounding_table.csv"}
+    present = {p.name for p in artifact.path.iterdir() if p.is_file()}
+    missing = required - present
+    if missing:
+        findings.append(Finding(
+            Severity.ERROR, aid,
+            f"canonical narratives artifact missing required file(s): "
+            f"{', '.join(sorted(missing))}",
+        ))
+
+    # A taxonomy.yaml that is present but empty is worse than absent.
+    tax = artifact.path / "taxonomy.yaml"
+    if tax.is_file() and tax.stat().st_size == 0:
+        findings.append(Finding(
+            Severity.ERROR, aid, "taxonomy.yaml is empty",
+        ))
+
+    return findings
