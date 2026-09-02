@@ -1,6 +1,5 @@
 """Datalake CLI.
 
-    datalake init [--root PATH]
     datalake ls [--kind KIND] [--all]
     datalake show ARTIFACT_ID
     datalake verify [--no-hashes] [--artifact ID]
@@ -45,11 +44,10 @@ def _flags(artifact) -> str:
 def cmd_init(index: DatalakeIndex, args: argparse.Namespace) -> int:
     root = index.root
 
-    # Directories: exist_ok=True means existing data is never touched.
+    # exist_ok=True: never touches existing directories or their contents.
     for subdir in ("raw", "derived", "outputs"):
         (root / subdir).mkdir(exist_ok=True)
 
-    # Only reindex if explicitly requested or index is currently empty.
     n_existing = index._conn.execute(
         "SELECT COUNT(*) FROM artifacts"
     ).fetchone()[0]
@@ -123,6 +121,7 @@ def cmd_verify(index: DatalakeIndex, args: argparse.Namespace) -> int:
         index,
         check_hashes=not args.no_hashes,
         check_lineage=not args.no_lineage,
+        check_content=not args.no_content,
         artifact_ids=[args.artifact] if args.artifact else None,
     )
     for finding in report.findings:
@@ -205,6 +204,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_verify.add_argument("--no-hashes", action="store_true",
                           help="skip re-hashing (fast structural check only)")
     p_verify.add_argument("--no-lineage", action="store_true")
+    p_verify.add_argument("--no-content", action="store_true",
+                          help="skip per-kind content verifiers")
     p_verify.add_argument("--artifact", help="verify a single artifact")
     p_verify.set_defaults(func=cmd_verify)
 
@@ -231,10 +232,6 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.DEBUG if args.verbose else logging.WARNING,
         format="%(levelname)s %(name)s %(message)s",
     )
-
-    from dotenv import load_dotenv
-    load_dotenv()                    # add this
-
     try:
         with DatalakeIndex(_resolve_root(args.root)) as index:
             return args.func(index, args)

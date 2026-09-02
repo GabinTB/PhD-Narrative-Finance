@@ -13,13 +13,29 @@ Verification never mutates anything.  It reports; the human decides.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
+from importlib.metadata import entry_points
 
+from datalake.artifact import Artifact
 from datalake.index import DatalakeIndex
 from datalake.meta import META_FILENAME, hash_file, read_meta
 
 log = logging.getLogger(__name__)
+
+# Entry-point group that per-kind content verifiers register under in their
+# package's pyproject.toml:
+#
+#   [project.entry-points."narrative_finance.verifiers"]
+#   ravenpack_headlines = "ravenpack.headlines.ingest:verify_artifact"
+#
+# Each verifier is a callable taking one Artifact and returning list[Finding].
+VERIFIER_ENTRYPOINT_GROUP = "narrative_finance.verifiers"
+
+# A verifier receives an Artifact and returns findings.  A None return is
+# treated as an empty list.
+VerifierFn = Callable[[Artifact], "list[Finding] | None"]
 
 
 class Severity(str, Enum):
@@ -205,11 +221,78 @@ def verify_lineage(index: DatalakeIndex, report: VerifyReport) -> None:
                 )
 
 
+# ---------------------------------------------------------------------------
+# Per-kind content verifiers (discovered via entry points)
+# ---------------------------------------------------------------------------
+
+def discover_verifiers() -> dict[str, VerifierFn]:
+    """Load per-kind content verifiers declared as entry points.
+
+    Any installed package can contribute a verifier by declaring it under the
+    `narrative_finance.verifiers` group, keyed by the entry-point name.  An
+    artifact's `meta.verifier` field names which entry point verifies it.
+
+    A verifier that fails to import is skipped with a warning rather than
+    aborting discovery: one broken package must not disable verification of
+    everything else.
+    """
+    verifiers: dict[str, VerifierFn] = {}
+    try:
+        eps = entry_points(group=VERIFIER_ENTRYPOINT_GROUP)
+    except TypeError:
+        # Python <3.10 compatibility: entry_points() took no args.
+        eps = entry_points().get(VERIFIER_ENTRYPOINT_GROUP, [])  # type: ignore[attr-defined]
+
+    for ep in eps:
+        try:
+            verifiers[ep.name] = ep.load()
+        except Exception as exc:
+            log.warning("could not load verifier entry point %r: %s", ep.name, exc)
+    return verifiers
+
+
+def verify_content(index: DatalakeIndex, report: VerifyReport) -> None:
+    """Run each artifact's declared content verifier, if one is available.
+
+    An artifact declares its verifier via `meta.verifier` (an entry-point
+    name).  If that entry point is not installed, the artifact is flagged: a
+    missing verifier means its content coverage cannot be checked, which is
+    itself worth surfacing.
+    """
+    available = discover_verifiers()
+
+    for artifact in index.list(include_partial=True, include_deprecated=True):
+        verifier_name = artifact.meta.verifier
+        if verifier_name is None:
+            continue  # kinds without a declared verifier skip content checks
+
+        fn = available.get(verifier_name)
+        if fn is None:
+            report.add(
+                Severity.WARNING, artifact.artifact_id,
+                f"declared verifier {verifier_name!r} is not installed; "
+                "content coverage cannot be checked",
+            )
+            continue
+
+        try:
+            findings = fn(artifact) or []
+        except Exception as exc:
+            report.add(
+                Severity.WARNING, artifact.artifact_id,
+                f"verifier {verifier_name!r} raised: {exc}",
+            )
+            continue
+
+        report.findings.extend(findings)
+
+
 def verify(
     index: DatalakeIndex,
     *,
     check_hashes: bool = True,
     check_lineage: bool = True,
+    check_content: bool = True,
     artifact_ids: list[str] | None = None,
 ) -> VerifyReport:
     """Run all verification passes.  Never mutates the datalake."""
@@ -226,5 +309,8 @@ def verify(
 
     if check_lineage:
         verify_lineage(index, report)
+
+    if check_content:
+        verify_content(index, report)
 
     return report

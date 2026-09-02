@@ -39,10 +39,7 @@ _HASH_CHUNK_BYTES = 8 * 1024 * 1024
 # ---------------------------------------------------------------------------
 
 def hash_file(path: Path) -> tuple[str, int]:
-    """Return (hex digest, size in bytes) for one file.
-
-    Streams in chunks so a multi-GB parquet never lands in memory.
-    """
+    """Return (hex digest, size in bytes) for one file, streamed in chunks."""
     digest = hashlib.blake2b(digest_size=_HASH_DIGEST_SIZE)
     size = 0
     with path.open("rb") as fh:
@@ -59,19 +56,14 @@ def hash_directory(
 ) -> dict[str, dict[str, Any]]:
     """Hash every matching file directly inside `directory` (non-recursive).
 
-    Sidecars are excluded by default: meta.json cannot contain its own hash,
-    and README.md is derived from it.
-
-    Returns {filename: {"digest": ..., "size_bytes": ..., "algorithm": ...}},
-    sorted by filename so the mapping is stable across runs.
+    Sidecars are excluded by default.  Returns
+    {filename: {"digest", "size_bytes", "algorithm"}}, sorted by filename.
     """
     results: dict[str, dict[str, Any]] = {}
     for path in sorted(directory.glob(pattern)):
         if not path.is_file() or path.name in exclude:
             continue
         if path.name.endswith(".tmp"):
-            # A .tmp file inside a completed artifact means a crashed write.
-            # Skip it here; `verify` reports it.
             log.warning("skipping stray tmp file while hashing: %s", path)
             continue
         digest, size = hash_file(path)
@@ -90,9 +82,7 @@ def hash_directory(
 def git_commit(repo_dir: Path | None = None) -> str | None:
     """Current HEAD SHA, with '-dirty' appended if the tree has changes.
 
-    Returns None when git is unavailable or the directory is not a repo: a
-    missing commit is recorded honestly rather than faked, and `verify`
-    reports artifacts that lack one.
+    Returns None when git is unavailable or the directory is not a repo.
     """
     cwd = str(repo_dir) if repo_dir else None
     try:
@@ -126,7 +116,7 @@ def write_meta(
     """Write meta.json atomically.  Returns the written path."""
     directory.mkdir(parents=True, exist_ok=True)
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "artifact_id": meta.artifact_id,
         **meta.to_dict(),
         "files": file_hashes or {},
@@ -141,9 +131,7 @@ def write_meta(
 def read_meta(directory: Path) -> tuple[RunMeta, dict[str, dict[str, Any]]]:
     """Read meta.json back into (RunMeta, file_hashes).
 
-    Raises FileNotFoundError when the sidecar is absent, which for a directory
-    that looks like an artifact means a run that never completed its first
-    write.
+    Raises FileNotFoundError when the sidecar is absent.
     """
     path = directory / META_FILENAME
     payload = json.loads(path.read_text())
@@ -171,11 +159,7 @@ def render_readme(
     meta: RunMeta,
     file_hashes: dict[str, dict[str, Any]] | None = None,
 ) -> str:
-    """Render RunMeta as human-readable Markdown.
-
-    Written for someone browsing the datalake with no tooling: a file manager,
-    a Google Drive web view, a GitHub blob page.
-    """
+    """Render RunMeta as human-readable Markdown."""
     files = file_hashes or {}
     lines: list[str] = [f"# {meta.artifact_id}", ""]
 
@@ -194,18 +178,31 @@ def render_readme(
         f"- **Kind**: `{meta.kind}`",
         f"- **Pipeline**: `{meta.pipeline}` version `{meta.pipeline_version}`",
     ]
-    if meta.pipeline_commit:
-        lines.append(f"- **Commit**: `{meta.pipeline_commit}`")
     if meta.pipeline_repo:
         lines.append(f"- **Repo**: {meta.pipeline_repo}")
-    lines.append(f"- **Started**: {meta.run_start}")
-    lines.append(f"- **Finished**: {meta.run_end or 'never (incomplete)'}")
+    if meta.verifier:
+        lines.append(f"- **Verifier**: `{meta.verifier}`")
+    lines.append(f"- **Created**: {meta.created}")
+    lines.append(f"- **Executions**: {len(meta.runs)}")
     lines.append("")
 
     if meta.hyperparams:
         lines += ["## Hyperparameters", ""]
         for key in sorted(meta.hyperparams):
             lines.append(f"- `{key}` = `{meta.hyperparams[key]!r}`")
+        lines.append("")
+
+    if meta.runs:
+        lines += ["## Execution history", ""]
+        lines += ["| # | Started | Finished | Commit | Version | Outputs | State |",
+                  "| --: | --- | --- | --- | --- | --: | --- |"]
+        for i, r in enumerate(meta.runs, 1):
+            commit = (r.pipeline_commit[:10] + "...") if r.pipeline_commit else "(none)"
+            state = "partial" if r.partial else "complete"
+            lines.append(
+                f"| {i} | {r.run_start} | {r.run_end or '(unfinished)'} | "
+                f"`{commit}` | {r.pipeline_version} | {len(r.produced)} | {state} |"
+            )
         lines.append("")
 
     if meta.model_card is not None:
@@ -227,10 +224,7 @@ def render_readme(
             lines.append("- **Weights**: public, fetchable from the repo above")
         else:
             digest = card.weights_sha256 or "not recorded"
-            lines.append(
-                f"- **Weights**: private, not distributable "
-                f"(sha256 `{digest}`)"
-            )
+            lines.append(f"- **Weights**: private, not distributable (sha256 `{digest}`)")
         if card.notes:
             lines.append(f"- **Notes**: {card.notes}")
         lines.append("")
@@ -293,11 +287,6 @@ def write_sidecars(
     meta: RunMeta,
     file_hashes: dict[str, dict[str, Any]] | None = None,
 ) -> None:
-    """Write meta.json and README.md together.
-
-    meta.json is written first: it is the source of truth, and if the process
-    dies between the two writes a stale README is a cosmetic problem while a
-    missing meta.json is a correctness one.
-    """
+    """Write meta.json and README.md together (meta first, it is truth)."""
     write_meta(directory, meta, file_hashes)
     write_readme(directory, meta, file_hashes)

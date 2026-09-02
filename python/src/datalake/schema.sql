@@ -30,6 +30,12 @@ CREATE TABLE IF NOT EXISTS artifacts (
     hyperparams_json    TEXT NOT NULL DEFAULT '{}',
     model_card_json     TEXT,
 
+    -- Full serialised RunMeta (including the runs[] history).  The index is a
+    -- cache over the meta.json sidecars; this column lets _row_to_artifact
+    -- reconstruct the complete artifact without re-reading the sidecar, while
+    -- the denormalised columns above/below drive fast filtering.
+    meta_json           TEXT NOT NULL DEFAULT '{}',
+
     run_start           TEXT NOT NULL,
     run_end             TEXT,
 

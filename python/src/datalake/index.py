@@ -24,12 +24,17 @@ Typical use in a pipeline script:
         hyperparams={"pooling": "cls"},
         sources=[source],
         model_card=RAVENBERT_V1_2,
+        verifier="headline_embeddings",
     ) as run:
         embed_corpus(input_dir=source.path, out_dir=run.out_dir)
 
-On clean exit the run hashes its outputs, writes both sidecars, flips
-partial to false, and registers lineage edges.  On exception it leaves the
-artifact registered as partial so the crash is visible rather than silent.
+On clean exit the run's RunRecord is marked complete, outputs are hashed, both
+sidecars written, and lineage edges registered.  On exception the record is
+left partial so the crash is visible rather than silent.
+
+Each entry to run() appends a new RunRecord to the artifact's meta.  A fresh
+artifact starts with one record; a completed artifact that is later extended
+appends another, preserving each execution's own commit and timestamps.
 """
 from __future__ import annotations
 
@@ -41,7 +46,13 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from datalake.artifact import Artifact, ModelCard, RunMeta, utc_now_iso
+from datalake.artifact import (
+    Artifact,
+    ModelCard,
+    RunMeta,
+    RunRecord,
+    utc_now_iso,
+)
 from datalake.meta import (
     META_FILENAME,
     git_commit,
@@ -57,9 +68,7 @@ _SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
 VALID_LAYERS = ("raw", "derived", "output")
 
-# Which layer a kind lands in.  Kinds not listed default to 'derived', which
-# is correct for everything the pipelines produce; 'raw' is for vintaged
-# source data registered by hand, 'output' for final research artifacts.
+# Which layer a kind lands in.  Kinds not listed default to 'derived'.
 _LAYER_OVERRIDES: dict[str, str] = {}
 
 
@@ -74,13 +83,22 @@ class DatalakeError(RuntimeError):
 class RunHandle:
     """Handle to an in-progress run.
 
-    `out_dir` is the directory the pipeline should write its outputs into.  It
-    exists by the time the handle is yielded.
+    `out_dir` is the directory the pipeline writes into; it exists by the time
+    the handle is yielded.  `record` is this execution's RunRecord, already
+    appended to `meta.runs`.
     """
 
-    def __init__(self, index: DatalakeIndex, meta: RunMeta, out_dir: Path, layer: str):
+    def __init__(
+        self,
+        index: DatalakeIndex,
+        meta: RunMeta,
+        record: RunRecord,
+        out_dir: Path,
+        layer: str,
+    ):
         self._index = index
         self.meta = meta
+        self.record = record
         self.out_dir = out_dir
         self.layer = layer
         self._file_hashes: dict[str, dict[str, Any]] | None = None
@@ -90,17 +108,28 @@ class RunHandle:
         return self.meta.artifact_id
 
     def note(self, text: str) -> None:
-        """Append a free-text note recorded in the sidecars."""
-        self.meta.notes = f"{self.meta.notes} {text}".strip() if self.meta.notes else text
+        """Append a free-text note to this execution's record."""
+        self.record.notes = (
+            f"{self.record.notes} {text}".strip() if self.record.notes else text
+        )
 
     def finalize(self, pattern: str = "*") -> dict[str, dict[str, Any]]:
-        """Hash outputs and cache the result.
+        """Hash all outputs and record which files THIS execution produced.
 
-        Called automatically on clean exit; call it explicitly only to inspect
-        hashes before the context closes.
+        The returned hashes cover the whole artifact directory (so the index
+        and sidecar record every file).  But `record.produced` is set to only
+        the files not already claimed by an earlier execution, so the per-run
+        audit trail attributes each file to the run that actually wrote it.
         """
         if self._file_hashes is None:
             self._file_hashes = hash_directory(self.out_dir, pattern=pattern)
+            already_claimed: set[str] = set()
+            for earlier in self.meta.runs:
+                if earlier is not self.record:
+                    already_claimed.update(earlier.produced)
+            self.record.produced = sorted(
+                set(self._file_hashes.keys()) - already_claimed
+            )
         return self._file_hashes
 
 
@@ -121,8 +150,6 @@ class DatalakeIndex:
         self.db_path = self.root / INDEX_FILENAME
         self._conn = sqlite3.connect(self.db_path)
         self._conn.row_factory = sqlite3.Row
-        # WAL lets a long-running writer coexist with readers (a notebook
-        # querying the index while a pipeline registers a new artifact).
         self._conn.execute("PRAGMA journal_mode = WAL")
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.executescript(_SCHEMA_PATH.read_text())
@@ -156,6 +183,13 @@ class DatalakeIndex:
         path: Path,
         file_hashes: dict[str, dict[str, Any]] | None = None,
     ) -> None:
+        """Write (or update) the index row for an artifact.
+
+        The full RunMeta is stored as a JSON blob (meta_json) so that
+        _row_to_artifact can reconstruct the complete run history without
+        re-reading the sidecar.  The denormalised columns exist only for fast
+        filtering (kind, model, partial, deprecated).
+        """
         card = meta.model_card
         self._conn.execute(
             """
@@ -163,10 +197,12 @@ class DatalakeIndex:
                 artifact_id, layer, kind, path,
                 pipeline, pipeline_version, pipeline_commit, pipeline_repo,
                 model_id, model_version, model_commit,
-                hyperparams_json, model_card_json,
+                hyperparams_json, model_card_json, meta_json,
                 run_start, run_end, partial, deprecated, deprecation_reason, notes
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT (artifact_id) DO UPDATE SET
+                meta_json          = excluded.meta_json,
+                run_start          = excluded.run_start,
                 run_end            = excluded.run_end,
                 partial            = excluded.partial,
                 deprecated         = excluded.deprecated,
@@ -183,6 +219,7 @@ class DatalakeIndex:
                 card.commit if card else None,
                 json.dumps(meta.hyperparams, sort_keys=True),
                 json.dumps(card.to_dict()) if card else None,
+                json.dumps(meta.to_dict()),
                 meta.run_start, meta.run_end,
                 int(meta.partial), int(meta.deprecated),
                 meta.deprecation_reason, meta.notes,
@@ -227,102 +264,111 @@ class DatalakeIndex:
         sources: Sequence[Artifact | str] | None = None,
         model_card: ModelCard | None = None,
         pipeline_repo: str | None = None,
+        verifier: str | None = None,
         repo_dir: Path | None = None,
         layer: str | None = None,
         notes: str = "",
         hash_pattern: str = "*",
+        extend: str | None = None,
     ) -> Iterator[RunHandle]:
-        """Register, execute, and finalise one pipeline run.
+        """Register, execute, and finalise one pipeline execution.
 
-        The yielded handle's `out_dir` is where the pipeline writes.  On clean
-        exit outputs are hashed, sidecars written, and partial cleared.  On
-        exception the artifact stays registered with partial=1 so the failure
-        is inspectable rather than invisible.
+        By default this creates a NEW artifact.  Pass `extend=<artifact_id>` to
+        append a new RunRecord to an existing complete artifact (e.g. adding
+        more years to a finished corpus) -- this preserves the earlier
+        execution's commit and timestamps rather than overwriting them.
+
+        On clean exit the execution's RunRecord is marked complete, outputs are
+        hashed, and both sidecars are written.  On exception the record is left
+        partial so the crash is inspectable.
 
         Args:
             kind:             Artifact kind, e.g. "headline_embeddings".
             pipeline:         Producing repo name.
             pipeline_version: Semantic version of the pipeline.
-            hyperparams:      Parameters that define this run's identity.
-            sources:          Input Artifacts (or their IDs) for lineage.
+            hyperparams:      Parameters that define the artifact's identity.
+            sources:          Input Artifacts (or IDs) for lineage.
             model_card:       Model used, if any.
             pipeline_repo:    URL of the producing repo.
+            verifier:         Entry-point name for content verification.
             repo_dir:         Directory to read the git SHA from (default cwd).
             layer:            Override the default layer for this kind.
-            notes:            Free text recorded in the sidecars.
+            notes:            Free text recorded on this execution's record.
             hash_pattern:     Glob for which output files to hash.
+            extend:           Artifact ID to append a new execution to.
         """
         source_ids = [
             s.artifact_id if isinstance(s, Artifact) else str(s)
             for s in (sources or [])
         ]
 
-        meta = RunMeta(
-            kind=kind,
-            pipeline=pipeline,
+        if extend is not None:
+            existing = self.get(extend)
+            if existing.partial:
+                raise DatalakeError(
+                    f"cannot extend a partial artifact: {extend}. "
+                    "Finish or deprecate it first."
+                )
+            meta = existing.meta
+            resolved_layer = existing.layer
+            out_dir = existing.path
+        else:
+            meta = RunMeta(
+                kind=kind,
+                pipeline=pipeline,
+                pipeline_version=pipeline_version,
+                pipeline_repo=pipeline_repo,
+                hyperparams=dict(hyperparams or {}),
+                sources=source_ids,
+                model_card=model_card,
+                verifier=verifier,
+            )
+            resolved_layer = layer or self.layer_for(kind)
+            out_dir = self.artifact_dir(resolved_layer, kind, meta.artifact_id)
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+        record = RunRecord(
+            run_start=utc_now_iso(),
             pipeline_version=pipeline_version,
             pipeline_commit=git_commit(repo_dir),
-            pipeline_repo=pipeline_repo,
-            hyperparams=dict(hyperparams or {}),
-            sources=source_ids,
-            model_card=model_card,
-            run_start=utc_now_iso(),
             partial=True,
             notes=notes,
         )
+        meta.runs.append(record)
 
-        resolved_layer = layer or self.layer_for(kind)
-        out_dir = self.artifact_dir(resolved_layer, kind, meta.artifact_id)
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        # Write the partial sidecar and register before yielding: if the
-        # process is killed hard (OOM, power loss) the artifact is already
-        # visible as an incomplete run rather than an unexplained directory.
+        # Persist the partial record before yielding: a hard kill leaves the
+        # artifact visible as an incomplete run, not an unexplained directory.
         write_sidecars(out_dir, meta, None)
         self._upsert(meta, resolved_layer, out_dir, file_hashes={})
 
-        handle = RunHandle(self, meta, out_dir, resolved_layer)
-        log.info("run start: %s -> %s", meta.artifact_id, out_dir)
+        handle = RunHandle(self, meta, record, out_dir, resolved_layer)
+        log.info(
+            "run start: %s (execution %d) -> %s",
+            meta.artifact_id, len(meta.runs), out_dir,
+        )
 
         try:
             yield handle
         except BaseException:
-            # Leave partial=1.  Refresh the sidecar so any note added during
-            # the run survives, then let the exception propagate.
             write_sidecars(out_dir, handle.meta, None)
             self._upsert(handle.meta, resolved_layer, out_dir, file_hashes={})
             log.error("run failed, left partial: %s", meta.artifact_id)
             raise
 
         file_hashes = handle.finalize(pattern=hash_pattern)
-        handle.meta.run_end = utc_now_iso()
-        handle.meta.partial = False
+        record.run_end = utc_now_iso()
+        record.partial = False
         write_sidecars(out_dir, handle.meta, file_hashes)
         self._upsert(handle.meta, resolved_layer, out_dir, file_hashes)
         log.info(
-            "run done: %s (%d files)", handle.meta.artifact_id, len(file_hashes)
+            "run done: %s (%d files, %d execution(s))",
+            handle.meta.artifact_id, len(file_hashes), len(handle.meta.runs),
         )
 
     # -- lookups -----------------------------------------------------------
 
     def _row_to_artifact(self, row: sqlite3.Row) -> Artifact:
-        card_json = row["model_card_json"]
-        meta = RunMeta(
-            kind=row["kind"],
-            pipeline=row["pipeline"],
-            pipeline_version=row["pipeline_version"],
-            pipeline_commit=row["pipeline_commit"],
-            pipeline_repo=row["pipeline_repo"],
-            hyperparams=json.loads(row["hyperparams_json"]),
-            sources=self._parents_of(row["artifact_id"]),
-            model_card=ModelCard.from_dict(json.loads(card_json)) if card_json else None,
-            run_start=row["run_start"],
-            run_end=row["run_end"],
-            partial=bool(row["partial"]),
-            deprecated=bool(row["deprecated"]),
-            deprecation_reason=row["deprecation_reason"],
-            notes=row["notes"],
-        )
+        meta = RunMeta.from_dict(json.loads(row["meta_json"]))
         hashes = {
             r["filename"]: r["digest"]
             for r in self._conn.execute(
@@ -407,9 +453,7 @@ class DatalakeIndex:
     ) -> Artifact:
         """Most recent complete, non-deprecated artifact of `kind`.
 
-        Raises DatalakeError when nothing matches, rather than returning None:
-        a pipeline that silently proceeds without its input is worse than one
-        that stops.
+        Raises DatalakeError when nothing matches, rather than returning None.
         """
         matches = self.list(kind, model=model, version=version, **filters)
         if not matches:
@@ -446,12 +490,8 @@ class DatalakeIndex:
     def descendants(self, artifact_id: str) -> list[str]:
         """All artifacts transitively downstream of this one.
 
-        This is the "what is now stale?" query: re-embed the corpus, pass the
-        old embedding artifact ID here, and get back every score, beta and
-        output built on it.
-
-        Cycles are impossible in a well-formed lineage graph but are guarded
-        against anyway, since a corrupted index should not hang a CLI.
+        This is the "what is now stale?" query.  Cycles are impossible in a
+        well-formed lineage graph but guarded against anyway.
         """
         seen: set[str] = set()
         frontier = [artifact_id]
@@ -480,19 +520,18 @@ class DatalakeIndex:
     def deprecate(self, artifact_id: str, reason: str) -> None:
         """Mark an artifact deprecated.
 
-        The files stay on disk and the ID stays resolvable via `get()`; only
-        `list()` and `latest()` stop returning it by default.  Nothing in the
-        datalake is ever deleted by this layer.
+        Files stay on disk and the ID stays resolvable via `get()`; only
+        `list()` and `latest()` stop returning it by default.  Nothing is ever
+        deleted by this layer.
         """
         artifact = self.get(artifact_id)
         artifact.meta.deprecated = True
         artifact.meta.deprecation_reason = reason
-        self._upsert(artifact.meta, artifact.layer, artifact.path, None)
-        # Keep the on-disk sidecars in step with the index.
         try:
             _, file_hashes = read_meta(artifact.path)
         except FileNotFoundError:
             file_hashes = {}
+        self._upsert(artifact.meta, artifact.layer, artifact.path, file_hashes)
         write_sidecars(artifact.path, artifact.meta, file_hashes)
         log.info("deprecated %s: %s", artifact_id, reason)
 
@@ -502,8 +541,8 @@ class DatalakeIndex:
         """Rebuild the index from the meta.json sidecars on disk.
 
         The index holds no information the sidecars lack, so this is always
-        safe: it is the recovery path after losing or corrupting index.db, and
-        the way to pick up artifacts copied in from another machine.
+        safe: the recovery path after losing index.db, and the way to pick up
+        artifacts copied from another machine.
 
         Returns the number of artifacts registered.
         """
@@ -543,7 +582,7 @@ class DatalakeIndex:
     ) -> str:
         """Register an artifact as a DuckDB view.
 
-        Lets notebooks and scripts query by kind rather than by path:
+        Lets notebooks query by kind rather than by path:
 
             dl.register(conn, "primitive_scores", alias="scores")
             conn.execute("SELECT * FROM scores WHERE DATE >= '2010-01-01'")

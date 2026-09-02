@@ -103,7 +103,7 @@ class TestSlugs:
         params = {f"param_{i}": f"value_{'x' * 50}_{i}" for i in range(20)}
         meta = RunMeta(
             kind="primitive_scores", pipeline=PIPELINE, pipeline_version=VERSION,
-            hyperparams=params, run_start="2026-09-01T12:00:00+00:00",
+            hyperparams=params, created="2026-09-01T12:00:00+00:00",
         )
         assert len(meta.artifact_id.encode()) < 255
 
@@ -116,20 +116,20 @@ class TestSlugs:
     def test_artifact_id_is_deterministic(self):
         kwargs = dict(
             kind="primitive_scores", pipeline=PIPELINE, pipeline_version=VERSION,
-            hyperparams={"tau": 0.2}, run_start="2026-09-01T12:00:00+00:00",
+            hyperparams={"tau": 0.2}, created="2026-09-01T12:00:00+00:00",
         )
         assert RunMeta(**kwargs).artifact_id == RunMeta(**kwargs).artifact_id
 
     def test_artifact_id_includes_model_when_present(self, card):
         meta = RunMeta(
             kind="headline_embeddings", pipeline=PIPELINE, pipeline_version=VERSION,
-            model_card=card, run_start="2026-09-01T12:00:00+00:00",
+            model_card=card, created="2026-09-01T12:00:00+00:00",
         )
         assert "ravenbert-1.2" in meta.artifact_id
 
     def test_artifact_id_differs_by_hyperparams(self):
         base = dict(kind="scores", pipeline=PIPELINE, pipeline_version=VERSION,
-                    run_start="2026-09-01T12:00:00+00:00")
+                    created="2026-09-01T12:00:00+00:00")
         a = RunMeta(**base, hyperparams={"tau": 0.2}).artifact_id
         b = RunMeta(**base, hyperparams={"tau": 0.3}).artifact_id
         assert a != b
@@ -218,7 +218,8 @@ class TestRun:
             (run.out_dir / "f.parquet").write_bytes(b"x")
 
         artifact = index.latest("k")
-        assert "311" in artifact.meta.notes
+        # note() writes to the execution's record, not the artifact-level notes
+        assert "311" in artifact.meta.runs[-1].notes
 
     def test_hyperparams_survive_roundtrip(self, index):
         artifact = _run_producing(index, "k", hyperparams={"tau": 0.2, "rho": 97.5})
@@ -493,14 +494,20 @@ class TestSidecars:
         assert len(hashes) == 2
 
     def test_readme_flags_partial_run(self):
-        meta = RunMeta(kind="k", pipeline=PIPELINE, pipeline_version=VERSION,
-                       partial=True)
+        from datalake.artifact import RunRecord
+        meta = RunMeta(kind="k", pipeline=PIPELINE, pipeline_version=VERSION)
+        meta.runs.append(RunRecord(run_start="2026-09-01T12:00:00+00:00",
+                                   pipeline_version=VERSION, partial=True))
+        assert meta.partial
         assert "INCOMPLETE" in render_readme(meta)
 
     def test_readme_flags_deprecation(self):
+        from datalake.artifact import RunRecord
         meta = RunMeta(kind="k", pipeline=PIPELINE, pipeline_version=VERSION,
-                       partial=False, deprecated=True,
-                       deprecation_reason="superseded by v2")
+                       deprecated=True, deprecation_reason="superseded by v2")
+        meta.runs.append(RunRecord(run_start="2026-09-01T12:00:00+00:00",
+                                   pipeline_version=VERSION, partial=False,
+                                   run_end="2026-09-01T13:00:00+00:00"))
         rendered = render_readme(meta)
         assert "DEPRECATED" in rendered
         assert "superseded by v2" in rendered
@@ -546,3 +553,141 @@ class TestHashing:
         digest, size = hash_file(path)
         assert size == 0
         assert len(digest) == 64
+
+
+# ---------------------------------------------------------------------------
+# RunRecord / multi-execution history
+# ---------------------------------------------------------------------------
+
+class TestRunRecords:
+    def test_fresh_run_has_one_record(self, index):
+        artifact = _run_producing(index, "k")
+        assert len(artifact.meta.runs) == 1
+
+    def test_record_has_commit_and_timestamps(self, index):
+        artifact = _run_producing(index, "k")
+        rec = artifact.meta.runs[0]
+        assert rec.run_start
+        assert rec.run_end is not None
+        assert not rec.partial
+
+    def test_record_produced_lists_outputs(self, index):
+        artifact = _run_producing(index, "k", n_files=3)
+        assert len(artifact.meta.runs[0].produced) == 3
+
+    def test_aggregate_produced_is_union(self, index):
+        artifact = _run_producing(index, "k", n_files=2)
+        assert set(artifact.meta.produced) == set(artifact.meta.runs[0].produced)
+
+    def test_created_frozen_stable_id(self, index):
+        """artifact_id derives from created, stable across executions."""
+        artifact = _run_producing(index, "k")
+        first_id = artifact.artifact_id
+        # extend it -- id must not change
+        with index.run(kind="k", pipeline=PIPELINE, pipeline_version=VERSION,
+                       extend=first_id) as run:
+            (run.out_dir / "extra.parquet").write_bytes(b"more")
+        assert index.get(first_id).artifact_id == first_id
+
+
+class TestExtend:
+    def test_extend_appends_record(self, index):
+        artifact = _run_producing(index, "k", n_files=1)
+        with index.run(kind="k", pipeline=PIPELINE, pipeline_version=VERSION,
+                       extend=artifact.artifact_id) as run:
+            (run.out_dir / "second.parquet").write_bytes(b"data2")
+
+        updated = index.get(artifact.artifact_id)
+        assert len(updated.meta.runs) == 2
+
+    def test_extend_accumulates_files(self, index):
+        artifact = _run_producing(index, "k", n_files=1)
+        with index.run(kind="k", pipeline=PIPELINE, pipeline_version=VERSION,
+                       extend=artifact.artifact_id) as run:
+            (run.out_dir / "second.parquet").write_bytes(b"data2")
+
+        updated = index.get(artifact.artifact_id)
+        assert len(updated.file_hashes) == 2
+
+    def test_cannot_extend_partial(self, index):
+        with pytest.raises(ValueError):
+            with index.run(kind="k", pipeline=PIPELINE, pipeline_version=VERSION):
+                raise ValueError("boom")
+        partial = index.list("k", include_partial=True)[0]
+
+        with pytest.raises(DatalakeError):
+            with index.run(kind="k", pipeline=PIPELINE, pipeline_version=VERSION,
+                           extend=partial.artifact_id) as run:
+                (run.out_dir / "x.parquet").write_bytes(b"x")
+
+    def test_extend_preserves_first_commit(self, index):
+        artifact = _run_producing(index, "k")
+        first_commit = artifact.meta.runs[0].pipeline_commit
+        with index.run(kind="k", pipeline=PIPELINE, pipeline_version=VERSION,
+                       extend=artifact.artifact_id) as run:
+            (run.out_dir / "e.parquet").write_bytes(b"e")
+
+        updated = index.get(artifact.artifact_id)
+        assert updated.meta.runs[0].pipeline_commit == first_commit
+
+
+class TestVerifierField:
+    def test_verifier_recorded(self, index):
+        with index.run(kind="k", pipeline=PIPELINE, pipeline_version=VERSION,
+                       verifier="my_verifier") as run:
+            (run.out_dir / "f.parquet").write_bytes(b"x")
+        artifact = index.latest("k")
+        assert artifact.meta.verifier == "my_verifier"
+
+    def test_verifier_survives_reindex(self, index):
+        with index.run(kind="k", pipeline=PIPELINE, pipeline_version=VERSION,
+                       verifier="my_verifier") as run:
+            (run.out_dir / "f.parquet").write_bytes(b"x")
+        index.reindex()
+        assert index.latest("k").meta.verifier == "my_verifier"
+
+    def test_content_verifier_flags_missing_entrypoint(self, index):
+        """An artifact declaring an uninstalled verifier is flagged."""
+        with index.run(kind="k", pipeline=PIPELINE, pipeline_version=VERSION,
+                       verifier="nonexistent_verifier") as run:
+            (run.out_dir / "f.parquet").write_bytes(b"x")
+
+        report = verify(index)
+        assert any(
+            "not installed" in f.message for f in report.warnings
+        )
+
+
+class TestMultiRunReindex:
+    def test_reindex_preserves_run_history(self, index):
+        artifact = _run_producing(index, "k")
+        with index.run(kind="k", pipeline=PIPELINE, pipeline_version=VERSION,
+                       extend=artifact.artifact_id) as run:
+            (run.out_dir / "e.parquet").write_bytes(b"e")
+
+        index.reindex()
+        assert len(index.get(artifact.artifact_id).meta.runs) == 2
+
+
+class TestProducedAttribution:
+    def test_extend_produced_is_only_new_files(self, index):
+        artifact = _run_producing(index, "k", n_files=2)
+        with index.run(kind="k", pipeline=PIPELINE, pipeline_version=VERSION,
+                       extend=artifact.artifact_id) as run:
+            (run.out_dir / "new1.parquet").write_bytes(b"a")
+            (run.out_dir / "new2.parquet").write_bytes(b"b")
+
+        updated = index.get(artifact.artifact_id)
+        # First execution produced 2, second produced only its own 2.
+        assert len(updated.meta.runs[0].produced) == 2
+        assert len(updated.meta.runs[1].produced) == 2
+        assert set(updated.meta.runs[1].produced) == {"new1.parquet", "new2.parquet"}
+
+    def test_aggregate_produced_covers_all(self, index):
+        artifact = _run_producing(index, "k", n_files=2)
+        with index.run(kind="k", pipeline=PIPELINE, pipeline_version=VERSION,
+                       extend=artifact.artifact_id) as run:
+            (run.out_dir / "new1.parquet").write_bytes(b"a")
+
+        updated = index.get(artifact.artifact_id)
+        assert len(updated.meta.produced) == 3
