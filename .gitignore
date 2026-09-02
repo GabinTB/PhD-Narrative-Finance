@@ -44,3 +44,6 @@ logs/
 # Specific to this project
 .claude/
 /content/latex/
+python/datalake/index.db
+index.db
+
