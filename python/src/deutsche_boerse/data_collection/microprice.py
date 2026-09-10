@@ -19,7 +19,6 @@ from pathlib import Path
 
 import polars as pl
 from a7 import A7Client
-
 from dbg_cdm.time_utils import (
     NANOS_PER_DAY,
     NANOS_PER_HOUR,

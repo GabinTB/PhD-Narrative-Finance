@@ -24,7 +24,7 @@ import numpy as np
 import polars as pl
 from pandas import Interval
 
-from deutsche_boerse.schema import HFT_ANALYTICS_SCHEMA, HFT_CLASSES
+from deutsche_boerse.schema import HFT_ANALYTICS_SCHEMA
 
 if TYPE_CHECKING:
     from datalake import Artifact, DatalakeIndex
@@ -51,10 +51,14 @@ def w2w_latency(
 
 
 def classify_latency(latency: int) -> str:
-    if latency in _NOISE: return "Noise"
-    if latency in _UFT:   return "UFT"
-    if latency in _HFT:   return "HFT"
-    if latency in _OTHER:  return "Other"
+    if latency in _NOISE:
+        return "Noise"
+    if latency in _UFT:
+        return "UFT"
+    if latency in _HFT:
+        return "HFT"
+    if latency in _OTHER:
+        return "Other"
     raise ValueError(f"unhandled latency: {latency}")
 
 
@@ -257,10 +261,11 @@ def run_hft_analytics(
     epsilon: int = 10,
     skip_missing: bool = True,
 ) -> "Artifact":
+    from dbg_cdm.hpt_utils import T1_TO_T3A_LATENCY, t9d_to_t3a_latency_min_ns
+
     from deutsche_boerse.data_collection.events import get_events
     from deutsche_boerse.data_collection.microprice import get_microprice
     from deutsche_boerse.data_collection.trades import get_trades
-    from dbg_cdm.hpt_utils import T1_TO_T3A_LATENCY, t9d_to_t3a_latency_min_ns
 
     hyperparams = {
         "mic":            mic,
@@ -282,9 +287,13 @@ def run_hft_analytics(
         n_days = 0
         for job in iter_jobs(mic, product, from_ccyymmdd, to_ccyymmdd, markout_period):
             try:
-                trades      = get_trades(job.mic, job.ccyymmdd)
-                events      = get_events(job.mic, job.ccyymmdd, job.market_segment_id, job.security_id)
-                microprices = get_microprice(job.mic, job.ccyymmdd, job.market_segment_id, job.security_id)
+                trades = get_trades(job.mic, job.ccyymmdd)
+                events = get_events(
+                    job.mic, job.ccyymmdd, job.market_segment_id, job.security_id
+                )
+                microprices = get_microprice(
+                    job.mic, job.ccyymmdd, job.market_segment_id, job.security_id
+                )
             except FileNotFoundError as exc:
                 if skip_missing:
                     log.warning("skip %s %d: %s", job.mic, job.ccyymmdd, exc)

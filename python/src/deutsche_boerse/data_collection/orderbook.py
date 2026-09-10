@@ -22,7 +22,6 @@ from pathlib import Path
 import pandas as pd
 import polars as pl
 import requests
-
 from dbg_cdm.a7_utils import (
     get_security_price_precision,
     get_tick_ladder,

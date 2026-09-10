@@ -20,7 +20,6 @@ import zipfile
 from pathlib import Path
 
 import polars as pl
-
 from dbg_cdm.a7_utils import partition_for_market_segment_id
 from dbg_cdm.datashop_file_api import retrieve_hptall_file
 from dbg_cdm.eobi_utils import PRICE_MULTIPLIER, VOLUME_MULTIPLIER
@@ -173,7 +172,7 @@ def get_events_range(
     Returns:
         Concatenated events DataFrame sorted by t_3a.
     """
-    from dbg_cdm.time_utils import daterange, today_ccyymmdd, SKIP_DATES
+    from dbg_cdm.time_utils import SKIP_DATES, daterange, today_ccyymmdd
 
     frames: list[pl.DataFrame] = []
     for ccyymmdd in daterange(from_ccyymmdd, to_ccyymmdd):
