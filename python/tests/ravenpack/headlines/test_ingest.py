@@ -15,14 +15,18 @@ import zipfile
 from pathlib import Path
 
 import pandas as pd
+import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from datalake import DatalakeError, DatalakeIndex
 from ravenpack.headlines.ingest import (
+    KIND,
     _dedup_stories,
     _to_arrow_table,
     ingest_range,
+    ingest_to_datalake,
 )
 from ravenpack.headlines.schema import (
     EMBEDDING_DIM,
@@ -103,16 +107,17 @@ class TestSchemas:
                 f"{col} should be scalar in STRUCTURED_SCHEMA, got {field.type}"
             )
 
-    def test_embedding_schema_extends_structured(self):
-        structured_names = set(STRUCTURED_SCHEMA.names)
-        embedding_names = set(EMBEDDING_SCHEMA.names)
-        assert structured_names < embedding_names
-        assert "EMBEDDING" in embedding_names
+    def test_embedding_schema_is_two_columns(self):
+        # The embedding parquet is a standalone file joined on RP_STORY_ID,
+        # not the structured schema plus a column.
+        assert list(EMBEDDING_SCHEMA.keys()) == ["RP_STORY_ID", "EMBEDDING"]
+        assert EMBEDDING_SCHEMA["RP_STORY_ID"] == pl.String
 
-    def test_embedding_field_is_fixed_size_list(self):
-        field = EMBEDDING_SCHEMA.field("EMBEDDING")
-        assert pa.types.is_fixed_size_list(field.type)
-        assert field.type.list_size == EMBEDDING_DIM
+    def test_embedding_field_is_float16_array(self):
+        emb = EMBEDDING_SCHEMA["EMBEDDING"]
+        assert isinstance(emb, pl.Array)
+        assert emb.inner == pl.Float16
+        assert emb.size == EMBEDDING_DIM
 
     def test_structured_polars_schema_names_match_arrow(self):
         assert list(STRUCTURED_SCHEMA_POLARS.keys()) == STRUCTURED_SCHEMA.names
@@ -357,9 +362,6 @@ class TestIngestRange:
 # Datalake integration
 # ---------------------------------------------------------------------------
 
-from datalake import DatalakeError, DatalakeIndex
-from ravenpack.headlines.ingest import KIND, ingest_to_datalake
-
 
 class TestIngestToDatalake:
     def test_produces_registered_artifact(self, tmp_path):
@@ -400,7 +402,7 @@ class TestIngestToDatalake:
             )
             assert len(artifact.file_hashes) == 2
 
-    def test_hyperparams_record_column_selection(self, tmp_path):
+    def test_run_notes_record_column_selection(self, tmp_path):
         raw_dir = tmp_path / "raw"
         raw_dir.mkdir()
         _make_zip(raw_dir, 2010, 1, _make_two_story_df())
@@ -409,8 +411,8 @@ class TestIngestToDatalake:
             artifact = ingest_to_datalake(
                 index, raw_dir, 2010, 2010, pipeline_version="v0.1.0",
             )
-            columns = artifact.meta.hyperparams["columns"]
-            assert "EVENT_SENTIMENT_SCORE" in columns
+            notes = artifact.meta.runs[0].notes
+            assert "EVENT_SENTIMENT_SCORE" in notes
 
     def test_empty_range_raises_and_leaves_partial(self, tmp_path):
         """No input data must fail loudly, not register an empty artifact."""

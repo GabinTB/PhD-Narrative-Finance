@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""Ingest RavenPack Annotations 1.0 zips into a datalake artifact.
+"""Embed RavenPack headlines with RavenBERT into a datalake artifact.
 
 Usage:
-    # Fresh run
-    python scripts/ingest_ravenpack.py --start-year 2000 --end-year 2025
+    # Fresh run -- reads the latest ravenpack_headlines artifact
+    python scripts/embed_headlines.py --start-year 2000 --end-year 2025
 
     # Resume a partial run -- all params inferred from the artifact
-    python scripts/ingest_ravenpack.py \\
-        --resume ravenpack_headlines__v0.1.0__end_year2025_start_year2000__20260901
+    python scripts/embed_headlines.py \\
+        --resume headline_embeddings__ravenbert-1.0__v0.1.0__..._20260909
 
-Resuming writes into the existing artifact directory, skipping months already
-written, and finalises the artifact on completion.
+The RavenBERT weights directory is always taken from
+$RAVENBERT_EMBEDDING_MODEL_PATH (no CLI flag).  Resuming writes into the existing
+artifact directory, skipping months already written, and finalises the artifact
+on completion.
 
 Artifacts are immutable once complete.  To supersede a finished artifact:
 
@@ -42,30 +44,35 @@ def main() -> int:
     )
     ap.add_argument("--env", default=".env")
     ap.add_argument("--datalake-root", help="overrides $DATALAKE_ROOT")
-    ap.add_argument("--raw-dir", help="overrides $RAW_DATA_PATH-derived location")
     ap.add_argument("-v", "--verbose", action="store_true")
 
     sub = ap.add_subparsers(dest="command", required=False)
 
-    # Fresh run subcommand
-    fresh = sub.add_parser("run", help="start a fresh ingest run")
-    fresh.add_argument("--start-year", type=int, required=True)
-    fresh.add_argument("--end-year", type=int, required=True)
+    fresh = sub.add_parser("run", help="start a fresh embedding run")
+    fresh.add_argument("--start-year", type=int)
+    fresh.add_argument("--end-year", type=int)
     fresh.add_argument("--pipeline-version", default=PIPELINE_VERSION)
-    fresh.add_argument("--raw-chunk-rows", type=int, default=2_000_000)
+    fresh.add_argument("--source-artifact", help="ravenpack_headlines artifact id")
+    fresh.add_argument("--device", help="torch device: cuda|mps|cpu (default: auto)")
+    fresh.add_argument("--batch-size", type=int, default=128)
+    fresh.add_argument("--write-chunk-rows", type=int, default=200_000)
     fresh.add_argument("--log-every", type=int, default=100_000)
 
-    # Resume subcommand
     resume = sub.add_parser("resume", help="resume a partial run")
     resume.add_argument("artifact_id", help="ID of the partial artifact to resume")
-    resume.add_argument("--raw-chunk-rows", type=int, default=2_000_000)
+    resume.add_argument("--device", help="torch device: cuda|mps|cpu (default: auto)")
+    resume.add_argument("--batch-size", type=int, default=128)
+    resume.add_argument("--write-chunk-rows", type=int, default=200_000)
     resume.add_argument("--log-every", type=int, default=100_000)
 
     # Backwards-compatible: no subcommand + --start-year/--end-year = fresh run
     ap.add_argument("--start-year", type=int)
     ap.add_argument("--end-year", type=int)
     ap.add_argument("--pipeline-version", default=PIPELINE_VERSION)
-    ap.add_argument("--raw-chunk-rows", type=int, default=2_000_000)
+    ap.add_argument("--source-artifact")
+    ap.add_argument("--device")
+    ap.add_argument("--batch-size", type=int, default=128)
+    ap.add_argument("--write-chunk-rows", type=int, default=200_000)
     ap.add_argument("--log-every", type=int, default=100_000)
     ap.add_argument("--resume", metavar="ARTIFACT_ID")
 
@@ -85,26 +92,27 @@ def main() -> int:
         log.error("DATALAKE_ROOT must be set (in .env, environment, or --datalake-root)")
         return 1
 
-    # Resolve raw_dir now -- resume will use the recorded one as fallback
-    raw_dir: Path | None = None
-    if args.raw_dir:
-        raw_dir = Path(args.raw_dir)
-    else:
-        raw_data_path = os.environ.get("RAW_DATA_PATH")
-        if raw_data_path:
-            raw_dir = Path(raw_data_path) / "RavenPack" / "headlines_edge_v1.0"
+    model_path_str = os.environ.get("RAVENBERT_EMBEDDING_MODEL_PATH")
+    if not model_path_str:
+        log.error("RAVENBERT_EMBEDDING_MODEL_PATH must be set (in .env or environment)")
+        return 1
+    model_path = Path(model_path_str)
+    if not model_path.is_dir():
+        log.error("RavenBERT model directory does not exist: %s", model_path)
+        return 1
 
     with DatalakeIndex(root) as index:
         if args.resume:
-            artifact = _resume(index, args.resume, raw_dir, args.raw_chunk_rows, args.log_every)
+            artifact = _resume(
+                index, args.resume, model_path,
+                args.device, args.batch_size, args.write_chunk_rows, args.log_every,
+            )
         elif args.start_year and args.end_year:
-            if raw_dir is None or not raw_dir.is_dir():
-                log.error("raw directory does not exist: %s", raw_dir)
-                return 1
             artifact = _fresh(
-                index, raw_dir,
-                args.start_year, args.end_year,
-                args.pipeline_version, args.raw_chunk_rows, args.log_every,
+                index, model_path,
+                args.start_year, args.end_year, args.pipeline_version,
+                args.source_artifact, args.device,
+                args.batch_size, args.write_chunk_rows, args.log_every,
             )
         else:
             ap.print_help()
@@ -119,26 +127,33 @@ def main() -> int:
     return 0
 
 
-def _fresh(index, raw_dir, start_year, end_year, pipeline_version, raw_chunk_rows, log_every):
-    from ravenpack.headlines.ingest import ingest_to_datalake
-    return ingest_to_datalake(
+def _fresh(
+    index, model_path, start_year, end_year, pipeline_version,
+    source_artifact, device, batch_size, write_chunk_rows, log_every,
+):
+    from ravenpack.headlines.embed import embed_to_datalake
+
+    return embed_to_datalake(
         index,
-        raw_dir=raw_dir,
+        model_path=model_path,
+        pipeline_version=pipeline_version,
+        source_artifact_id=source_artifact,
         start_year=start_year,
         end_year=end_year,
+        device=device,
         pipeline=PIPELINE,
-        pipeline_version=pipeline_version,
         pipeline_repo=PIPELINE_REPO,
-        raw_chunk_rows=raw_chunk_rows,
+        batch_size=batch_size,
+        write_chunk_rows=write_chunk_rows,
         log_every=log_every,
     )
 
 
-def _resume(index, artifact_id, raw_dir_override, raw_chunk_rows, log_every):
+def _resume(index, artifact_id, model_path, device, batch_size, write_chunk_rows, log_every):
     """Resume a partial run, inferring all params from the artifact metadata."""
     from datalake.artifact import utc_now_iso
     from datalake.meta import META_FILENAME, README_FILENAME, git_commit, hash_file, write_sidecars
-    from ravenpack.headlines.ingest import ingest_range
+    from ravenpack.headlines.embed import SOURCE_KIND, _load_model, embed_range
 
     try:
         artifact = index.get(artifact_id)
@@ -157,61 +172,52 @@ def _resume(index, artifact_id, raw_dir_override, raw_chunk_rows, log_every):
     recorded = artifact.meta.hyperparams
     start_year = recorded.get("start_year")
     end_year = recorded.get("end_year")
-
     if start_year is None or end_year is None:
-        log.error(
-            "artifact %s has no start_year/end_year in hyperparams.",
-            artifact_id,
-        )
+        log.error("artifact %s has no start_year/end_year in hyperparams.", artifact_id)
         return None
 
-    if raw_dir_override is not None and raw_dir_override.is_dir():
-        raw_dir = raw_dir_override
-        log.info("using raw_dir from CLI: %s", raw_dir)
-    else:
-        raw_data_path = os.environ.get("RAW_DATA_PATH")
-        if not raw_data_path:
-            log.error("RAW_DATA_PATH not set and no --raw-dir provided")
-            return None
-        raw_dir = Path(raw_data_path) / "RavenPack" / "headlines_edge_v1.0"
-        log.info("using raw_dir from environment: %s", raw_dir)
-
-    if not raw_dir.is_dir():
-        log.error("raw directory does not exist: %s", raw_dir)
+    # Resolve the source (structured headlines) artifact directory.
+    source_id = recorded.get("source_artifact")
+    try:
+        source = index.get(source_id) if source_id else index.latest(SOURCE_KIND)
+    except DatalakeError:
+        log.error("cannot resolve source artifact (%s) to resume from", source_id)
         return None
+    source_dir = source.path
 
     out_dir = artifact.path
     already_done = len(list(out_dir.glob("*.parquet")))
     expected_months = (end_year - start_year + 1) * 12
-    remaining = expected_months - already_done
-
     log.info(
-        "resuming %s | start_year=%d end_year=%d | %d/%d months done, %d remaining",
-        artifact_id, start_year, end_year, already_done, expected_months, remaining,
+        "resuming %s | start_year=%d end_year=%d | %d/%d months done | source=%s",
+        artifact_id, start_year, end_year, already_done, expected_months,
+        source.artifact_id,
     )
 
-    ingest_range(
-        raw_dir=raw_dir,
+    model = _load_model(model_path, device=device)
+    embed_range(
+        model,
+        source_dir=source_dir,
         out_dir=out_dir,
         start_year=start_year,
         end_year=end_year,
-        raw_chunk_rows=raw_chunk_rows,
+        batch_size=batch_size,
+        write_chunk_rows=write_chunk_rows,
         log_every=log_every,
         overwrite=False,
     )
 
     n_months = len(list(out_dir.glob("*.parquet")))
     if n_months == 0:
-        log.error("still no output after resume -- check raw_dir and year range")
+        log.error("still no output after resume -- check source dir and year range")
         return None
-
     if n_months < expected_months:
         log.warning(
-            "%d/%d months present -- some months may be missing from raw zips",
+            "%d/%d months present -- some source months may be missing",
             n_months, expected_months,
         )
 
-    # Hash with progress -- this runs over GDrive FUSE and takes several minutes.
+    # Hash with progress -- runs over GDrive FUSE and takes several minutes.
     _EXCLUDE = frozenset({META_FILENAME, README_FILENAME})
     parquet_files = sorted(
         p for p in out_dir.iterdir()
@@ -228,9 +234,9 @@ def _resume(index, artifact_id, raw_dir_override, raw_chunk_rows, log_every):
         if i % 20 == 0 or i == len(parquet_files):
             log.info("  hashed %d/%d files", i, len(parquet_files))
 
-    # Update the last RunRecord directly -- partial, run_end, pipeline_commit
-    # are fields on RunRecord, not on RunMeta (which exposes them as computed
-    # properties).  Setting them on RunMeta would be silently ignored.
+    # Update the last RunRecord directly -- partial, run_end, pipeline_commit,
+    # produced are fields on RunRecord, not RunMeta (which exposes them as
+    # computed properties).  Setting them on RunMeta would be silently ignored.
     last_record = artifact.meta.runs[-1]
     last_record.partial = False
     last_record.run_end = utc_now_iso()

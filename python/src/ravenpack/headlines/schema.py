@@ -10,8 +10,11 @@ Three layers:
                        RP_STORY_ID, entity-level columns collapsed to aligned
                        lists.  Derived deterministically from RAW_SCHEMA.
 
-  EMBEDDING_SCHEMA  -- output of the embedding pipeline: one row per
-                       RP_STORY_ID, adds a fixed-size float16 EMBEDDING column.
+  EMBEDDING_SCHEMA  -- output of the embedding pipeline (and of the archive
+                       migration): exactly two columns, RP_STORY_ID plus a
+                       fixed-size float16 EMBEDDING vector.  This is a separate
+                       parquet, joined back to the structured parquet on
+                       RP_STORY_ID -- the two are never merged into one file.
 
 Column-level notes
 ------------------
@@ -39,7 +42,6 @@ import pyarrow as pa
 # ---------------------------------------------------------------------------
 
 EMBEDDING_DIM: int = 384
-EMBEDDING_DTYPE_RAW: pa.DataType = pa.float16()
 
 # ---------------------------------------------------------------------------
 # Raw CSV schema (one row per entity-event detection)
@@ -130,16 +132,17 @@ STRUCTURED_SCHEMA_POLARS: pl.Schema = pl.Schema(
 )
 
 # ---------------------------------------------------------------------------
-# Embedding parquet schema (structured + EMBEDDING column)
+# Embedding parquet schema (one row per RP_STORY_ID, two columns only)
+#
+# Canonical output schema for every embedding artifact -- both the fresh
+# RavenBERT pipeline (embed.py) and the archive migration write exactly these
+# two columns and nothing else.  EMBEDDING is a fixed-size float16 vector;
+# polars round-trips pl.Array(pl.Float16, N) to arrow fixed_size_list<halffloat>.
 # ---------------------------------------------------------------------------
 
-EMBEDDING_SCHEMA: pa.Schema = STRUCTURED_SCHEMA.append(
-    pa.field("EMBEDDING", pa.list_(EMBEDDING_DTYPE_RAW, EMBEDDING_DIM))
-)
-
-EMBEDDING_SCHEMA_POLARS: pl.Schema = pl.Schema(
+EMBEDDING_SCHEMA: pl.Schema = pl.Schema(
     {
-        **STRUCTURED_SCHEMA_POLARS,
-        "EMBEDDING": pl.Array(pl.Float32, EMBEDDING_DIM),
+        "RP_STORY_ID": pl.String,
+        "EMBEDDING":   pl.Array(pl.Float16, EMBEDDING_DIM),
     }
 )

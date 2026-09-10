@@ -453,7 +453,7 @@ def ingest_to_datalake(
         # "raw_dir": str(raw_dir),
         # "columns": ",".join(RAW_COLUMNS),
     }
-    notes=f"raw_dir={raw_dir} columns={','.join(RAW_COLUMNS)}"
+    notes = f"raw_dir={raw_dir} columns={','.join(RAW_COLUMNS)}"
 
     with index.run(
         kind=KIND,
@@ -462,6 +462,7 @@ def ingest_to_datalake(
         pipeline_repo=pipeline_repo,
         repo_dir=repo_dir,
         hyperparams=hyperparams,
+        notes=notes,
         verifier=KIND,
         hash_pattern="*.parquet",
     ) as run:

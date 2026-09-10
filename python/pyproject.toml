@@ -37,6 +37,7 @@ datalake = "datalake.cli:main"
 [project.entry-points."narrative_finance.verifiers"]
 ravenpack_headlines = "ravenpack.headlines.ingest:verify_artifact"
 canonical_narratives = "ravenpack.headlines.ingest:verify_canonical"
+headline_embeddings = "ravenpack.headlines.embed:verify_artifact"
 
 [build-system]
 requires      = ["hatchling"]
