@@ -185,6 +185,28 @@ class TestDedupStories:
         # At least one value should be a float (nan or 0.5).
         assert any(isinstance(s, float) for s in scores)
 
+    def test_timestamp_utc_has_no_nulls(self):
+        """Regression: TIMESTAMP_UTC is the sort key, not a groupby key, and was
+        previously missing from the agg dict entirely -- pandas' dict-form .agg()
+        drops any column not listed, and the trailing .reindex(columns=df.columns)
+        silently refilled it as all-null rather than raising. That made every row
+        of the real ravenpack_headlines artifact carry a null TIMESTAMP_UTC.
+        """
+        df = _make_two_story_df()
+        out = _dedup_stories(df)
+        assert out["TIMESTAMP_UTC"].notna().all()
+        assert out["TIMESTAMP_UTC"].tolist() == [
+            "2010-01-05 08:00:00", "2010-01-05 09:00:00",
+        ]
+
+    def test_timestamp_utc_keeps_first_occurrence(self):
+        """Same first-occurrence convention as the other scalar columns."""
+        df = _make_raw_df(
+            TIMESTAMP_UTC=["2010-01-05 08:00:00", "2010-01-05 08:00:05"],
+        )
+        out = _dedup_stories(df)
+        assert out.iloc[0]["TIMESTAMP_UTC"] == "2010-01-05 08:00:00"
+
 
 # ---------------------------------------------------------------------------
 # _to_arrow_table tests

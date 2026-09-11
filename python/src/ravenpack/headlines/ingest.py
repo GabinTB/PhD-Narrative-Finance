@@ -88,6 +88,12 @@ def _dedup_stories(df: pd.DataFrame) -> pd.DataFrame:
 
     agg: dict[str, object] = {col: list for col in ENTITY_LIST_COLS}
     agg.update({col: "first" for col in SCALAR_COLS})
+    # TIMESTAMP_UTC is the sort key above but is excluded from SCALAR_COLS
+    # (it's one of the two explicit leading columns) -- pandas' dict-form
+    # .agg() drops any column not listed, and reindex() below would then
+    # silently fill it back in as all-null rather than raising. Aggregate it
+    # explicitly, taking the first (earliest, given the sort) timestamp.
+    agg["TIMESTAMP_UTC"] = "first"
 
     return (
         df.sort_values("TIMESTAMP_UTC")
