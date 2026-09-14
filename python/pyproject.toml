@@ -41,6 +41,7 @@ canonical_narratives = "ravenpack.headlines.ingest:verify_canonical"
 headline_embeddings = "ravenpack.headlines.embed:verify_artifact"
 mu_asof = "ravenpack.headlines.mu_asof:verify_artifact"
 taxonomy_embeddings = "narrative_scoring.descriptions:verify_artifact"
+primitive_scores = "narrative_scoring.scoring:verify_artifact"
 
 [build-system]
 requires      = ["hatchling"]
