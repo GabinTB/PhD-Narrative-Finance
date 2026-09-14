@@ -146,3 +146,21 @@ EMBEDDING_SCHEMA: pl.Schema = pl.Schema(
         "EMBEDDING":   pl.Array(pl.Float16, EMBEDDING_DIM),
     }
 )
+
+# ---------------------------------------------------------------------------
+# mu_asof parquet schema (one row per asof date)
+#
+# Output of the mu_asof pipeline (mu_asof.py): the per-day pooled mean
+# headline embedding, both raw (MU, for mean centering) and unit-normalized
+# (MU_HAT, for direction removal), plus the headline count contributing to
+# each day's estimate.
+# ---------------------------------------------------------------------------
+
+MU_ASOF_SCHEMA: pl.Schema = pl.Schema(
+    {
+        "DATE":    pl.Date,
+        "MU":      pl.Array(pl.Float32, EMBEDDING_DIM),
+        "MU_HAT":  pl.Array(pl.Float32, EMBEDDING_DIM),
+        "N":       pl.Int64,
+    }
+)
