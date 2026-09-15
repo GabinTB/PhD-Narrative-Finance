@@ -47,7 +47,6 @@ def main() -> int:
     ap.add_argument("--start", type=int, help="e.g. 20070101")
     ap.add_argument("--end", type=int, help="e.g. 20091231")
     ap.add_argument("--no-f0", action="store_true", help="disable the F0 null-model gate")
-    ap.add_argument("--no-garbage", action="store_true", help="disable the garbage-catcher layer")
     ap.add_argument("--alpha", type=float, default=0.01)
     ap.add_argument("--trim-frac", type=float, default=0.10)
     ap.add_argument("--rel-floor", type=float, default=0.65)
@@ -107,7 +106,6 @@ def _fresh(index, args):
         start=args.start,
         end=args.end,
         use_f0=not args.no_f0,
-        use_garbage=not args.no_garbage,
         alpha=args.alpha,
         trim_frac=args.trim_frac,
         rel_floor=args.rel_floor,
@@ -157,7 +155,6 @@ def _resume(index, artifact_id, *, chunk_size, threads):
 
     correction = Correction(hp.get("correction", "r2"))
     use_f0 = bool(hp.get("use_f0", True))
-    use_garbage = bool(hp.get("use_garbage", True))
 
     # Resolve source artifacts from recorded lineage, by kind.
     resolved = {}
@@ -187,7 +184,7 @@ def _resume(index, artifact_id, *, chunk_size, threads):
     import polars as pl
 
     mu_df = pl.read_parquet(mu_art.glob("*.parquet")) if mu_art is not None else None
-    D_tax, D_garbage, use_garbage = load_taxonomy_embeddings(tax_art, use_garbage)
+    D_tax = load_taxonomy_embeddings(tax_art)
 
     out_dir = artifact.path
     already_done = len(list(out_dir.glob("*.parquet")))
@@ -198,8 +195,8 @@ def _resume(index, artifact_id, *, chunk_size, threads):
 
     run_scoring_range(
         out_dir, headlines_art.path, embeddings_art.path, mu_df,
-        D_tax, D_garbage, correction, start, end,
-        use_f0=use_f0, use_garbage=use_garbage,
+        D_tax, correction, start, end,
+        use_f0=use_f0,
         alpha=hp.get("alpha", 0.01), trim_frac=hp.get("trim_frac", 0.10),
         rel_floor=hp.get("rel_floor", 0.65), null_delay=hp.get("null_delay", "1M"),
         chunk_size=chunk_size, threads=threads, skip_existing=True,

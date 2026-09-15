@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
-"""Embed a taxonomy version's primitive descriptions into a datalake artifact.
+"""Embed a named taxonomy's primitive descriptions into a datalake artifact.
 
 Usage:
     python scripts/embed_taxonomy.py \\
-        --taxonomy-version v4.3 --family evergreen --paraphrase-style headlined \\
+        --taxonomy-name Evergreen_v5 --paraphrase-style headline \\
         --pooling centroid --pipeline-version v0.1.0
 
 The RavenBERT weights directory is taken from $RAVENBERT_EMBEDDING_MODEL_PATH.
-The taxonomy root defaults to $RAW_DATA_PATH/Evergreen_Taxonomy, except
---family ravenpack which defaults to $RAW_DATA_PATH/RavenPack_Taxonomy;
-override either with --taxonomy-root (needed for e.g. a vendor taxonomy
-nested under Evergreen_Taxonomy, such as --family vendor --taxonomy-version
-Vendor/RavenPack). --family is just the CSV/JSONL filename prefix
-({family}_taxonomy.csv etc) -- any string is accepted, not just
-evergreen/ravenpack.
+The taxonomy root defaults to $RAW_DATA_PATH/Narrative_Taxonomy (the
+monorepo of named taxonomies -- see narrative_scoring/taxonomy.py); override
+with --taxonomy-root. --list lists every taxonomy name found there and exits.
 
 Artifacts are immutable once complete.  To supersede a finished artifact:
 
@@ -32,13 +28,9 @@ from dotenv import find_dotenv, load_dotenv
 from datalake import DatalakeIndex
 
 PIPELINE_VERSION = "v0.1.0"
+NARRATIVE_TAXONOMY_DIRNAME = "Narrative_Taxonomy"
 
 log = logging.getLogger(__name__)
-
-_TAXONOMY_ROOT_DIRNAME = {
-    "evergreen": "Evergreen_Taxonomy",
-    "ravenpack": "RavenPack_Taxonomy",
-}
 
 
 def main() -> int:
@@ -48,18 +40,14 @@ def main() -> int:
     )
     ap.add_argument("--env", default=".env")
     ap.add_argument("--datalake-root", help="overrides $DATALAKE_ROOT")
-    ap.add_argument("--taxonomy-version", required=True, help='e.g. "v4.3" or "Vendor/RavenPack"')
-    ap.add_argument(
-        "--family", default="evergreen",
-        help='CSV/JSONL filename prefix, e.g. "evergreen", "ravenpack", "vendor"',
-    )
+    ap.add_argument("--taxonomy-name", help='e.g. "Evergreen_v5"')
     ap.add_argument(
         "--taxonomy-root",
-        help="overrides the default $RAW_DATA_PATH/{Evergreen,RavenPack}_Taxonomy root",
+        help=f"overrides the default $RAW_DATA_PATH/{NARRATIVE_TAXONOMY_DIRNAME} root",
     )
-    ap.add_argument("--paraphrase-style", choices=["pure", "headlined"], default="headlined")
+    ap.add_argument("--list", action="store_true", help="list taxonomy names found and exit")
+    ap.add_argument("--paraphrase-style", choices=["semantic", "headline"], default="headline")
     ap.add_argument("--pooling", choices=["centroid", "max", "median"], default="centroid")
-    ap.add_argument("--no-garbage", action="store_true", help="skip the garbage catcher")
     ap.add_argument("--device", help="torch device: cuda|mps|cpu (default: auto)")
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--pipeline-version", default=PIPELINE_VERSION)
@@ -76,6 +64,29 @@ def main() -> int:
     if args.env != ".env":
         load_dotenv(args.env, override=True)
 
+    if args.taxonomy_root:
+        taxonomy_root = Path(args.taxonomy_root)
+    else:
+        raw_data_path_str = os.environ.get("RAW_DATA_PATH")
+        if not raw_data_path_str:
+            log.error("RAW_DATA_PATH must be set (in .env or environment) or pass --taxonomy-root")
+            return 1
+        taxonomy_root = Path(raw_data_path_str) / NARRATIVE_TAXONOMY_DIRNAME
+    if not taxonomy_root.is_dir():
+        log.error("taxonomy root does not exist: %s", taxonomy_root)
+        return 1
+
+    from narrative_scoring.taxonomy import list_taxonomies
+
+    if args.list:
+        for name in list_taxonomies(taxonomy_root):
+            print(name)
+        return 0
+
+    if not args.taxonomy_name:
+        log.error("--taxonomy-name is required (or pass --list to see available names)")
+        return 1
+
     root = args.datalake_root or os.environ.get("DATALAKE_ROOT")
     if not root:
         log.error("DATALAKE_ROOT must be set (in .env, environment, or --datalake-root)")
@@ -90,20 +101,6 @@ def main() -> int:
         log.error("RavenBERT model directory does not exist: %s", model_path)
         return 1
 
-    if args.taxonomy_root:
-        taxonomy_root = Path(args.taxonomy_root)
-    else:
-        raw_data_path_str = os.environ.get("RAW_DATA_PATH")
-        if not raw_data_path_str:
-            log.error("RAW_DATA_PATH must be set (in .env or environment) or pass --taxonomy-root")
-            return 1
-        taxonomy_root = Path(raw_data_path_str) / _TAXONOMY_ROOT_DIRNAME.get(
-            args.family, "Evergreen_Taxonomy"
-        )
-    if not taxonomy_root.is_dir():
-        log.error("taxonomy root does not exist: %s", taxonomy_root)
-        return 1
-
     from narrative_scoring.descriptions import PoolingMode, embed_taxonomy_to_datalake
 
     with DatalakeIndex(root) as index:
@@ -111,12 +108,10 @@ def main() -> int:
             index,
             raw_data_path=taxonomy_root,
             model_path=model_path,
-            taxonomy_version=args.taxonomy_version,
+            taxonomy_name=args.taxonomy_name,
             pipeline_version=args.pipeline_version,
-            family=args.family,
             paraphrase_style=args.paraphrase_style,
             pooling=PoolingMode(args.pooling),
-            include_garbage=not args.no_garbage,
             device=args.device,
             batch_size=args.batch_size,
         )

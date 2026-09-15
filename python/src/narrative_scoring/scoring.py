@@ -12,11 +12,10 @@ Per calendar day:
   4. Compute S = X_corr @ D_corr.T.  For MAX/MEDIAN pooling, D_corr is
      (n_prim, K, 384) -- reshape to (n_prim*K, 384), score, reshape back to
      (n_head, n_prim, K), pool over the last axis.
-  5. If the garbage layer is enabled, compute S_garbage the same way and
-     apply the rejection mask.
-  6. If the F0 layer is enabled, apply the gate using tau for that day's
+  5. If the F0 layer is enabled, apply the gate using tau for that day's
      source (falling back to a pooled tau when a source is unseen or thin).
-  7. Aggregate to daily primitive intensity:
+     F0 is the sole rejection layer -- there is no garbage-catcher layer.
+  6. Aggregate to daily primitive intensity:
 
         INTENSITY = mean of retained (non-zero) scores for that primitive
                     across that day's headlines
@@ -33,7 +32,6 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -45,7 +43,6 @@ import pyarrow.parquet as pq
 
 from narrative_scoring.corrections import Correction, apply_correction
 from narrative_scoring.descriptions import DescriptionEmbeddings, PoolingMode, from_frame
-from narrative_scoring.garbage import apply_garbage_filter
 from narrative_scoring.null_model import (
     ReservoirPool,
     apply_gate,
@@ -198,39 +195,31 @@ def score_day(
     day_df: pl.DataFrame,           # RP_STORY_ID, TIMESTAMP_UTC, SOURCE_NAME, EMBEDDING
     date: Any,
     D_tax: DescriptionEmbeddings,
-    D_garbage: DescriptionEmbeddings | None,
     correction: Correction,
     mu: np.ndarray | None,
     mu_hat: np.ndarray | None,
     *,
     use_f0: bool,
-    use_garbage: bool,
     tau_by_source: dict[str, float] | None = None,
     fallback_tau: float | None = None,
     rel_floor: float = 0.65,
     trim_frac: float = 0.10,
     chunk_size: int = 50_000,
-) -> tuple[pl.DataFrame, list[np.ndarray], list[str], int]:
+) -> tuple[pl.DataFrame, list[np.ndarray], list[str]]:
     """Score one calendar day of headlines.
 
-    Returns (daily stats frame, per-chunk trimmed-null-draws-by-source-ready
-    raw taxonomy score chunks [pre-gate], per-chunk sources, n_garbage_rejected).
-    The raw score chunks + sources are handed back so the caller can feed
-    trimmed draws into the lagged null pool for future days.
+    Returns (daily stats frame, per-chunk raw taxonomy score chunks
+    [pre-gate], per-chunk sources). The raw score chunks + sources are
+    handed back so the caller can feed trimmed draws into the lagged null
+    pool for future days.
     """
     primitives = D_tax.primitives
     D_tax_corr = _correct_descriptions(D_tax.vectors, D_tax.mode, correction, mu, mu_hat)
-    D_g_corr = (
-        _correct_descriptions(D_garbage.vectors, D_garbage.mode, correction, mu, mu_hat)
-        if (use_garbage and D_garbage is not None)
-        else None
-    )
 
     n_rows = day_df.height
     gated_chunks: list[np.ndarray] = []
     raw_chunks: list[np.ndarray] = []
     source_chunks: list[str] = []
-    n_garbage_rejected = 0
 
     for start in range(0, max(n_rows, 1), chunk_size):
         if start >= n_rows:
@@ -244,25 +233,16 @@ def score_day(
         sources = chunk["SOURCE_NAME"].to_list()
         source_chunks.extend(sources)
 
-        reject = np.zeros(S.shape[0], dtype=bool)
-        if use_garbage and D_g_corr is not None:
-            S_g = score_chunk(X_corr, D_g_corr, D_garbage.mode)
-            reject, _ = apply_garbage_filter(S, S_g)
-            n_garbage_rejected += int(reject.sum())
-
         S_gated = S.copy()
-        S_gated[reject] = 0.0
-
         if use_f0:
             S_gated = gate_with_source_tau(
                 S_gated, sources, tau_by_source or {}, fallback_tau or 0.0, rel_floor
             )
-            S_gated[reject] = 0.0  # a garbage-rejected row stays rejected
 
         gated_chunks.append(S_gated)
 
     stats = daily_stats(gated_chunks, primitives, date)
-    return stats, raw_chunks, source_chunks, n_garbage_rejected
+    return stats, raw_chunks, source_chunks
 
 
 # ---------------------------------------------------------------------------
@@ -304,38 +284,17 @@ def load_month(headlines_path: Path, embeddings_path: Path, threads: int = 8) ->
 # Datalake-aware entry point
 # ---------------------------------------------------------------------------
 
-@dataclass
-class ScoringConfig:
-    taxonomy_version: str
-    family: str = "evergreen"
-    paraphrase_style: str = "headlined"
-    pooling: PoolingMode = PoolingMode.CENTROID
-    correction: Correction = Correction.R2
-    use_f0: bool = True
-    use_garbage: bool = True
-    alpha: float = 0.01
-    trim_frac: float = 0.10
-    rel_floor: float = 0.65
-    null_delay: str = "1M"
-    null_cap: int = 5_000_000
-    chunk_size: int = 50_000
-    start: int = 20070101
-    end: int = 20091231
-
-
 def run_scoring_range(
     out_dir: Path,
     headlines_dir: Path,
     embeddings_dir: Path,
     mu_df: pl.DataFrame | None,
     D_tax: DescriptionEmbeddings,
-    D_garbage: DescriptionEmbeddings | None,
     correction: Correction,
     start: int,
     end: int,
     *,
     use_f0: bool = True,
-    use_garbage: bool = True,
     alpha: float = 0.01,
     trim_frac: float = 0.10,
     rel_floor: float = 0.65,
@@ -414,9 +373,9 @@ def run_scoring_range(
                     if draws.size:
                         tau_by_source[src] = compute_tau(draws, n_eff, alpha=alpha)
 
-            stats, raw_chunks, source_chunks, _n_rejected = score_day(
-                day_df, d, D_tax, D_garbage, correction, mu, mu_hat,
-                use_f0=use_f0, use_garbage=use_garbage,
+            stats, raw_chunks, source_chunks = score_day(
+                day_df, d, D_tax, correction, mu, mu_hat,
+                use_f0=use_f0,
                 tau_by_source=tau_by_source, fallback_tau=fallback_tau,
                 rel_floor=rel_floor, trim_frac=trim_frac, chunk_size=chunk_size,
             )
@@ -453,23 +412,12 @@ def run_scoring_range(
     return last_n_eff
 
 
-def load_taxonomy_embeddings(
-    tax_art: "Artifact", use_garbage: bool
-) -> tuple[DescriptionEmbeddings, DescriptionEmbeddings | None, bool]:
-    """Load taxonomy.parquet (+ garbage.parquet, if requested and present)."""
+def load_taxonomy_embeddings(tax_art: "Artifact") -> DescriptionEmbeddings:
+    """Load taxonomy.parquet."""
     hp_tax = tax_art.meta.hyperparams
-    D_tax = from_frame(
+    return from_frame(
         pl.read_parquet(tax_art.path / "taxonomy.parquet"), PoolingMode(hp_tax["pooling"])
     )
-    D_garbage = None
-    if use_garbage and (tax_art.path / "garbage.parquet").is_file():
-        D_garbage = from_frame(
-            pl.read_parquet(tax_art.path / "garbage.parquet"), PoolingMode(hp_tax["pooling"])
-        )
-    elif use_garbage:
-        log.warning("use_garbage=True but taxonomy_embeddings has no garbage.parquet; disabling")
-        use_garbage = False
-    return D_tax, D_garbage, use_garbage
 
 
 def score_headlines_to_datalake(
@@ -481,7 +429,6 @@ def score_headlines_to_datalake(
     start: int = 20070101,
     end: int = 20091231,
     use_f0: bool = True,
-    use_garbage: bool = True,
     alpha: float = 0.01,
     trim_frac: float = 0.10,
     rel_floor: float = 0.65,
@@ -493,7 +440,7 @@ def score_headlines_to_datalake(
     repo_dir: Path | None = None,
     threads: int = 8,
 ) -> "Artifact":
-    """Score every headline in [start, end] against a taxonomy version.
+    """Score every headline in [start, end] against a named taxonomy.
 
     Resolves ravenpack_headlines / headline_embeddings / mu_asof / the given
     taxonomy_embeddings artifact and delegates the day-by-day work to
@@ -510,16 +457,14 @@ def score_headlines_to_datalake(
     mu_art = index.latest(SOURCE_MU_ASOF_KIND) if correction is not Correction.RAW else None
     mu_df = pl.read_parquet(mu_art.glob("*.parquet")) if mu_art is not None else None
 
-    D_tax, D_garbage, use_garbage = load_taxonomy_embeddings(tax_art, use_garbage)
+    D_tax = load_taxonomy_embeddings(tax_art)
 
     hyperparams: dict[str, Any] = {
-        "taxonomy_version": hp_tax.get("taxonomy_version"),
-        "family": hp_tax.get("family"),
+        "taxonomy_name": hp_tax.get("taxonomy_name"),
         "paraphrase_style": hp_tax.get("paraphrase_style"),
         "pooling": hp_tax.get("pooling"),
         "correction": correction.value,
         "use_f0": use_f0,
-        "use_garbage": use_garbage,
         "alpha": alpha,
         "trim_frac": trim_frac,
         "rel_floor": rel_floor,
@@ -544,8 +489,8 @@ def score_headlines_to_datalake(
     ) as run:
         run_scoring_range(
             run.out_dir, headlines_art.path, embeddings_art.path, mu_df,
-            D_tax, D_garbage, correction, start, end,
-            use_f0=use_f0, use_garbage=use_garbage, alpha=alpha,
+            D_tax, correction, start, end,
+            use_f0=use_f0, alpha=alpha,
             trim_frac=trim_frac, rel_floor=rel_floor, null_delay=null_delay,
             null_cap=null_cap, chunk_size=chunk_size, threads=threads,
             skip_existing=False,
@@ -647,7 +592,7 @@ def verify_artifact(artifact: "Artifact") -> "list[Finding]":
     Registered as the ``primitive_scores`` entry point. Checks: one parquet
     per month in the declared range; schema match; INTENSITY in [-1, 1];
     SUPPORT >= 0; null_model.json present with a finite tau/n_eff; the
-    primitive set matching the taxonomy version recorded in hyperparams.
+    primitive set matching the taxonomy name recorded in hyperparams.
     """
     from datalake.verify import Finding, Severity
 
@@ -657,10 +602,10 @@ def verify_artifact(artifact: "Artifact") -> "list[Finding]":
     start = hp.get("start")
     end = hp.get("end")
 
-    if not hp.get("taxonomy_version"):
+    if not hp.get("taxonomy_name"):
         findings.append(Finding(
             Severity.ERROR, aid,
-            "hyperparams missing taxonomy_version; primitive set cannot be verified",
+            "hyperparams missing taxonomy_name; primitive set cannot be verified",
         ))
 
     if start is None or end is None:

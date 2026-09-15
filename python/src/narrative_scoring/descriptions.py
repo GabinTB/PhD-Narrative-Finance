@@ -170,20 +170,19 @@ def embed_taxonomy_to_datalake(
     index: Any,
     raw_data_path: Path,
     model_path: Path,
-    taxonomy_version: str,
+    taxonomy_name: str,
     pipeline_version: str,
     *,
-    family: str = "evergreen",
-    paraphrase_style: str = "headlined",
+    paraphrase_style: str = "headline",
     pooling: PoolingMode = PoolingMode.CENTROID,
-    include_garbage: bool = True,
+    base_schema: list[str] | None = None,
     device: str | None = None,
     pipeline: str = PIPELINE,
     pipeline_repo: str | None = PIPELINE_REPO,
     repo_dir: Path | None = None,
     batch_size: int = 256,
 ) -> Any:
-    """Embed one taxonomy version's descriptions into a taxonomy_embeddings artifact.
+    """Embed one named taxonomy's descriptions into a taxonomy_embeddings artifact.
 
     The taxonomy CSV/JSONL files live in raw/, outside the datalake, so this
     artifact has no lineage sources; the taxonomy directory path and a
@@ -195,34 +194,23 @@ def embed_taxonomy_to_datalake(
     from ravenpack.headlines.embed import build_model_card, model_dir_sha256
 
     tv = load_taxonomy(
-        raw_data_path, taxonomy_version, family=family, paraphrase_style=paraphrase_style
+        raw_data_path, taxonomy_name,
+        paraphrase_style=paraphrase_style, base_schema=base_schema,
     )
-    if include_garbage and not tv.has_garbage:
-        log.warning(
-            "include_garbage=True but %r %r has no garbage-catching taxonomy; disabling",
-            family, taxonomy_version,
-        )
-        include_garbage = False
 
     log.info("hashing RavenBERT model directory %s ...", model_path)
     weights_sha256 = model_dir_sha256(model_path)
     card = build_model_card(model_path, weights_sha256)
 
-    input_files = [tv.csv_path, tv.jsonl_path("pure"), tv.jsonl_path("headlined")]
-    if include_garbage:
-        input_files += [
-            tv.garbage_csv_path, tv.garbage_jsonl_path("pure"), tv.garbage_jsonl_path("headlined"),
-        ]
+    input_files = [tv.csv_path, tv.jsonl_path("semantic"), tv.jsonl_path("headline")]
     file_digests = {
         p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in input_files if p.exists()
     }
 
     hyperparams: dict[str, Any] = {
-        "taxonomy_version": taxonomy_version,
-        "family": family,
+        "taxonomy_name": taxonomy_name,
         "paraphrase_style": paraphrase_style,
         "pooling": pooling.value,
-        "include_garbage": include_garbage,
     }
     notes = (
         f"taxonomy_dir={tv.path} " + " ".join(f"{k}={v[:12]}" for k, v in file_digests.items())
@@ -254,17 +242,7 @@ def embed_taxonomy_to_datalake(
         )
         _write_parquet_atomic(to_frame(desc), run.out_dir / "taxonomy.parquet")
 
-        if include_garbage:
-            gc_primitives = sorted(tv.garbage_paraphrases().keys())
-            log.info(
-                "embedding %d garbage primitives (%s pooling)...", len(gc_primitives), pooling.value
-            )
-            gc_desc = embed_descriptions(
-                model, tv.garbage_paraphrases(), gc_primitives, pooling, batch_size=batch_size
-            )
-            _write_parquet_atomic(to_frame(gc_desc), run.out_dir / "garbage.parquet")
-
-        run.note(f"{len(primitives)} taxonomy primitives, include_garbage={include_garbage}")
+        run.note(f"{len(primitives)} taxonomy primitives")
 
     return index.get(run.artifact_id)
 
@@ -278,7 +256,6 @@ def verify_artifact(artifact: "Artifact") -> "list[Finding]":
 
     Registered as the ``taxonomy_embeddings`` entry point. Checks:
       - taxonomy.parquet is present, readable, non-empty, schema-matching
-      - garbage.parquet is present when hyperparams declare include_garbage
       - CENTROID rows are unit-norm within float32 tolerance
     """
     from datalake.verify import Finding, Severity
@@ -293,16 +270,6 @@ def verify_artifact(artifact: "Artifact") -> "list[Finding]":
         findings.append(Finding(Severity.ERROR, aid, "taxonomy.parquet missing"))
     else:
         findings.extend(_check_embeddings_file(aid, tax_path, pooling, "taxonomy.parquet"))
-
-    if hp.get("include_garbage"):
-        gc_path = artifact.path / "garbage.parquet"
-        if not gc_path.is_file():
-            findings.append(Finding(
-                Severity.ERROR, aid,
-                "garbage.parquet missing but include_garbage=True in hyperparams",
-            ))
-        else:
-            findings.extend(_check_embeddings_file(aid, gc_path, pooling, "garbage.parquet"))
 
     return findings
 

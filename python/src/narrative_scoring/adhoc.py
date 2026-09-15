@@ -5,8 +5,8 @@ lagged, per-day, per-source expanding null pool and a correction that is
 re-resolved from mu_asof every single day. That is the right design for a
 committed datalake artifact spanning decades, but it is overkill for a
 one-off notebook comparing a handful of scoring configurations (corrections,
-pooling modes, paraphrase styles, F0/garbage toggles) over a single
-historical window (e.g. the GFC or Covid crash).
+pooling modes, paraphrase styles) over a single historical window (e.g. the
+GFC or Covid crash).
 
 This module implements a deliberately simplified harness for that use case,
 built on the SAME tested primitives as the production path
@@ -174,9 +174,9 @@ def calibrate_null_model(
             d = dt[0] if isinstance(dt, tuple) else dt
             if d < calib_start or d > calib_end:
                 continue
-            _, raw_chunks, _, _ = score_day(
-                day_df, d, D_tax, None, correction, mu, mu_hat,
-                use_f0=False, use_garbage=False, chunk_size=chunk_size,
+            _, raw_chunks, _ = score_day(
+                day_df, d, D_tax, correction, mu, mu_hat,
+                use_f0=False, chunk_size=chunk_size,
             )
             for S in raw_chunks:
                 pool.add(trim_null_draws_batch(S, trim_frac=trim_frac).ravel())
@@ -202,7 +202,6 @@ def calibrate_null_model(
 class ScoringResult:
     scores: pl.DataFrame           # concatenated PRIMITIVE_SCORES_SCHEMA over the window
     n_days: int
-    n_garbage_rejected: int
     config: dict[str, Any] = field(default_factory=dict)
 
 
@@ -210,7 +209,6 @@ def score_window(
     headlines_dir: Path,
     embeddings_dir: Path,
     D_tax: DescriptionEmbeddings,
-    D_garbage: DescriptionEmbeddings | None,
     correction: Correction,
     mu: np.ndarray | None,
     mu_hat: np.ndarray | None,
@@ -219,7 +217,6 @@ def score_window(
     start: date,
     end: date,
     use_f0: bool = True,
-    use_garbage: bool = True,
     rel_floor: float = 0.65,
     trim_frac: float = 0.10,
     chunk_size: int = 50_000,
@@ -232,13 +229,8 @@ def score_window(
     as score_day's ``fallback_tau`` with an empty per-source override) --
     see the module docstring for why that is a valid simplification here.
     """
-    if use_garbage and D_garbage is None:
-        log.warning("use_garbage=True but D_garbage is None; disabling garbage layer")
-        use_garbage = False
-
     monthly: list[pl.DataFrame] = []
     n_days = 0
-    n_garbage_rejected = 0
 
     for y, m in _month_range(start, end):
         name = f"{y}-{m:02d}.parquet"
@@ -255,23 +247,20 @@ def score_window(
             d = dt[0] if isinstance(dt, tuple) else dt
             if d < start or d > end:
                 continue
-            stats, _, _, n_rej = score_day(
-                day_df, d, D_tax, D_garbage, correction, mu, mu_hat,
-                use_f0=use_f0, use_garbage=use_garbage,
+            stats, _, _ = score_day(
+                day_df, d, D_tax, correction, mu, mu_hat,
+                use_f0=use_f0,
                 tau_by_source={}, fallback_tau=tau, rel_floor=rel_floor,
                 trim_frac=trim_frac, chunk_size=chunk_size,
             )
             monthly.append(stats)
-            n_garbage_rejected += n_rej
             n_days += 1
 
     if not monthly:
         raise RuntimeError(f"no headlines found in [{start}, {end}]")
 
     scores = pl.concat(monthly)
-    return ScoringResult(
-        scores=scores, n_days=n_days, n_garbage_rejected=n_garbage_rejected, config=config or {}
-    )
+    return ScoringResult(scores=scores, n_days=n_days, config=config or {})
 
 
 def summarize(result: ScoringResult) -> dict[str, Any]:
@@ -287,5 +276,4 @@ def summarize(result: ScoringResult) -> dict[str, Any]:
         "mean_intensity_active": active["INTENSITY"].mean() if active.height else 0.0,
         "mean_support_active": active["SUPPORT"].mean() if active.height else 0.0,
         "mean_peak_active": active["PEAK"].mean() if active.height else 0.0,
-        "n_garbage_rejected": result.n_garbage_rejected,
     }

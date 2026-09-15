@@ -1,8 +1,27 @@
-"""Taxonomy abstraction over evergreen and RavenPack primitive taxonomies.
+"""Taxonomy abstraction over the Narrative_Taxonomy monorepo.
 
-Both taxonomy families share a physical column schema.  This module maps
-those physical columns onto a canonical 4-level hierarchy so the rest of the
-pipeline never has to know which family it is working with:
+Taxonomies live flat, by name, directly under one root directory
+(``RAW_DATA_PATH/Narrative_Taxonomy``), each as three files:
+
+    {name}_taxonomy.authored.csv                        (required -- the ONLY csv ever read)
+    {name}-primitive_semantic_paraphrases.jsonl          (required)
+    {name}-primitive_headline_paraphrases.jsonl          (required)
+
+A sibling ``{name}_taxonomy.csv`` (no ``.authored``) may exist alongside the
+authored one -- it is a generated skeleton with ``DISPLAY_NAME``/
+``DESCRIPTION`` blank, produced before authoring, and this module never
+reads it. A taxonomy is *complete* exactly when the three files above exist
+and cross-validate (see ``validate()``); a ``Legacy/`` subdirectory of the
+root holds deprecated material this module never looks at.
+
+Every taxonomy is treated as a RavenPack-schema child: ``primitives()``
+always returns the full ``RAVENPACK_BASE_SCHEMA`` column set (missing ones
+null-filled, never an error) plus whatever extra columns the source CSV
+carries (e.g. ``OBSERVABILITY_CHANNEL``, ``POLARITY``), verbatim-named.
+Pass a custom, extended ``base_schema`` (e.g. ``RAVENPACK_BASE_SCHEMA +
+["MY_COL"]``) to widen what's guaranteed present.
+
+Column mapping onto the canonical 4-level hierarchy:
 
     reservoir   <- TOPIC
     dimension   <- GROUP
@@ -10,33 +29,17 @@ pipeline never has to know which family it is working with:
     primitive   <- DISPLAY_NAME
     description <- DESCRIPTION
 
-RavenPack CSVs additionally carry a ROLE column (entity role); it plays no
-part in the hierarchy but is carried through as metadata rather than dropped.
+JSONL records are keyed by their ``display_name`` field for the CSV join --
+NOT by ``id`` (an opaque per-record hash, not the primitive name).
 
-A taxonomy VERSION directory holds three required files and three optional
-ones (the garbage catcher -- some taxonomies, e.g. vendor-supplied ones,
-ship without one):
-
-    {family}_taxonomy.csv
-    {family}_taxonomy_primitive_paraphrases.jsonl               (pure)
-    {family}_taxonomy_primitive_paraphrases-headlined.jsonl     (headlined)
-    garbage-catching_taxonomy.csv                                  [optional]
-    garbage-catching_taxonomy_primitive_paraphrases.jsonl          [optional]
-    garbage-catching_taxonomy_primitive_paraphrases-headlined.jsonl [optional]
-
-The garbage catcher is optional as a *set*: if ``garbage-catching_taxonomy.csv``
-is absent, the whole garbage catcher is treated as absent (``has_garbage``
-is False) and none of its checks run; if it is present, all three garbage
-files are required and validated exactly as the primary taxonomy's are.
-
-``load_taxonomy`` validates every file present before handing back a
+``load_taxonomy`` validates all three files before handing back a
 ``TaxonomyVersion``; ``TaxonomyError`` lists every problem found, not just
 the first.
 """
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -54,15 +57,26 @@ CANONICAL_COLUMNS: dict[str, str] = {
     "description": "DESCRIPTION",
 }
 
-_REQUIRED_PHYSICAL = {"TOPIC", "GROUP", "DISPLAY_NAME", "DESCRIPTION"}
+_CORE_REQUIRED = {"TOPIC", "GROUP", "DISPLAY_NAME", "DESCRIPTION"}
+
+# The reference RavenPack taxonomy schema (Legacy/Vendor/RavenPack/vendor_taxonomy.csv).
+# Every taxonomy is normalized to carry at least these columns -- missing ones
+# are added as null, never an error. Import and extend this to require more:
+#   base_schema = RAVENPACK_BASE_SCHEMA + ["MY_EXTRA_COL"]
+RAVENPACK_BASE_SCHEMA: list[str] = [
+    "TOPIC", "GROUP", "TYPE", "SUB_TYPE", "ROLE", "CATEGORY",
+    "DISPLAY_NAME", "DESCRIPTION", "SCHEDULED", "VALID_ENTITY_TYPES", "TAGS",
+]
+
+PARAPHRASE_STYLES = ("semantic", "headline")
 
 
 class TaxonomyError(ValueError):
-    """Raised when a taxonomy version fails structural validation."""
+    """Raised when a taxonomy fails structural validation."""
 
 
 # ---------------------------------------------------------------------------
-# JSONL helpers
+# File readers
 # ---------------------------------------------------------------------------
 
 def _read_taxonomy_csv(path: Path) -> pl.DataFrame:
@@ -72,36 +86,45 @@ def _read_taxonomy_csv(path: Path) -> pl.DataFrame:
     (like a SCHEDULED flag) that mix True/False with sentinel values such as
     "UNDEFINED" -- polars' schema inference samples the first N rows, guesses
     bool, then raises a parse error deep into the file. Since only a handful
-    of known string columns are ever selected (see _canonicalize), inference
-    buys nothing and turning it off makes every vendor taxonomy load
-    regardless of what its other columns contain.
+    of known columns are ever selected (see _canonicalize), inference buys
+    nothing and turning it off makes every taxonomy load regardless of what
+    its other columns contain.
     """
     return pl.read_csv(path, infer_schema_length=0)
 
 
-def _read_jsonl(path: Path) -> dict[str, dict[str, Any]]:
-    """primitive id -> its JSONL record ({"id", "master", "paraphrases"})."""
-    out: dict[str, dict[str, Any]] = {}
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    """Parse a paraphrases JSONL into its raw list of records.
+
+    Each record carries at least {"id", "display_name", "master",
+    "paraphrases"} -- "id" is an opaque per-record hash, NOT usable as a
+    join key; use _index_by_display_name for that.
+    """
+    records: list[dict[str, Any]] = []
     for line in path.read_text().splitlines():
         line = line.strip()
         if not line:
             continue
-        rec = json.loads(line)
-        out[rec["id"]] = rec
-    return out
+        records.append(json.loads(line))
+    return records
+
+
+def _index_by_display_name(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {rec["display_name"]: rec for rec in records if "display_name" in rec}
 
 
 # ---------------------------------------------------------------------------
 # Canonicalization
 # ---------------------------------------------------------------------------
 
-def _canonicalize(df: pl.DataFrame) -> pl.DataFrame:
+def _canonicalize(df: pl.DataFrame, base_schema: list[str]) -> pl.DataFrame:
     """Map a physical taxonomy CSV frame onto the canonical hierarchy.
 
     Constructs CATEGORY from TYPE + "-" + SUB_TYPE when CATEGORY itself is
-    not already a column.  ROLE, when present, is carried through unchanged
-    (RavenPack garbage catcher only) rather than dropped or folded into the
-    hierarchy.
+    not already a column. Every column in base_schema not already present
+    is added as an all-null String column ("mandatory, even if empty");
+    columns beyond base_schema present in the source are carried through
+    verbatim as extra metadata rather than dropped.
     """
     if "CATEGORY" not in df.columns:
         if not {"TYPE", "SUB_TYPE"}.issubset(df.columns):
@@ -112,23 +135,26 @@ def _canonicalize(df: pl.DataFrame) -> pl.DataFrame:
             (pl.col("TYPE") + "-" + pl.col("SUB_TYPE")).alias("CATEGORY")
         )
 
-    missing = (_REQUIRED_PHYSICAL | {"CATEGORY"}) - set(df.columns)
-    if missing:
-        raise TaxonomyError(f"taxonomy frame missing required column(s): {sorted(missing)}")
+    missing_core = (_CORE_REQUIRED | {"CATEGORY"}) - set(df.columns)
+    if missing_core:
+        raise TaxonomyError(f"taxonomy frame missing required column(s): {sorted(missing_core)}")
 
-    keep = ["TOPIC", "GROUP", "CATEGORY", "DISPLAY_NAME", "DESCRIPTION"]
-    if "ROLE" in df.columns:
-        keep.append("ROLE")
+    for col in base_schema:
+        if col not in df.columns:
+            df = df.with_columns(pl.lit(None, dtype=pl.String).alias(col))
 
-    return df.select(keep).rename(
-        {
-            "TOPIC": "reservoir",
-            "GROUP": "dimension",
-            "CATEGORY": "narrative",
-            "DISPLAY_NAME": "primitive",
-            "DESCRIPTION": "description",
-        }
-    )
+    rename_map = {
+        "TOPIC": "reservoir",
+        "GROUP": "dimension",
+        "CATEGORY": "narrative",
+        "DISPLAY_NAME": "primitive",
+        "DESCRIPTION": "description",
+    }
+    ordered_baseline = [c for c in base_schema if c not in rename_map]
+    extra_cols = [c for c in df.columns if c not in base_schema and c not in rename_map]
+    keep = list(rename_map.keys()) + ordered_baseline + extra_cols
+
+    return df.select(keep).rename(rename_map)
 
 
 # ---------------------------------------------------------------------------
@@ -137,94 +163,44 @@ def _canonicalize(df: pl.DataFrame) -> pl.DataFrame:
 
 @dataclass
 class TaxonomyVersion:
-    """One versioned taxonomy directory: primitives, paraphrases, garbage catcher."""
+    """One named taxonomy in the Narrative_Taxonomy monorepo."""
 
-    version: str
-    path: Path
-    family: str = "evergreen"
-    paraphrase_style: str = "headlined"
+    name: str                     # e.g. "Evergreen_v5"
+    path: Path                    # the Narrative_Taxonomy root (flat, no per-taxonomy subdir)
+    paraphrase_style: str = "headline"    # "semantic" | "headline"
+    base_schema: list[str] = field(default_factory=lambda: list(RAVENPACK_BASE_SCHEMA))
 
     # -- file layout ---------------------------------------------------
 
-    def _csv_path(self, prefix: str) -> Path:
-        return self.path / f"{prefix}_taxonomy.csv"
-
-    def _jsonl_path(self, prefix: str, style: str) -> Path:
-        suffix = "" if style == "pure" else "-headlined"
-        return self.path / f"{prefix}_taxonomy_primitive_paraphrases{suffix}.jsonl"
-
     @property
     def csv_path(self) -> Path:
-        return self._csv_path(self.family)
-
-    @property
-    def garbage_csv_path(self) -> Path:
-        return self._csv_path("garbage-catching")
+        return self.path / f"{self.name}_taxonomy.authored.csv"
 
     def jsonl_path(self, style: str | None = None) -> Path:
-        return self._jsonl_path(self.family, style or self.paraphrase_style)
+        style = style or self.paraphrase_style
+        return self.path / f"{self.name}-primitive_{style}_paraphrases.jsonl"
 
-    def garbage_jsonl_path(self, style: str | None = None) -> Path:
-        return self._jsonl_path("garbage-catching", style or self.paraphrase_style)
-
-    @property
-    def has_garbage(self) -> bool:
-        """Whether this taxonomy version ships a garbage catcher at all.
-
-        Detected from the CSV's presence alone (the JSONLs are required to
-        follow if the CSV is there -- see validate()); some taxonomies, e.g.
-        vendor-supplied ones, are shipped without any garbage catcher.
-        """
-        return self.garbage_csv_path.exists()
-
-    def _require_garbage(self) -> None:
-        if not self.has_garbage:
-            raise TaxonomyError(
-                f"{self.family!r} {self.version!r} at {self.path} has no garbage-catching "
-                "taxonomy (garbage-catching_taxonomy.csv not found); check has_garbage first"
-            )
-
-    # -- canonical frames ------------------------------------------------
+    # -- canonical frame ------------------------------------------------
 
     def primitives(self) -> pl.DataFrame:
-        """Canonical frame: reservoir, dimension, narrative, primitive, description."""
-        return _canonicalize(_read_taxonomy_csv(self.csv_path))
-
-    def garbage_primitives(self) -> pl.DataFrame:
-        """Same canonical frame for the garbage catcher. Raises if has_garbage is False."""
-        self._require_garbage()
-        return _canonicalize(_read_taxonomy_csv(self.garbage_csv_path))
+        """Canonical frame: reservoir, dimension, narrative, primitive, description,
+        plus every base_schema column (null-filled if absent) and any extras."""
+        return _canonicalize(_read_taxonomy_csv(self.csv_path), self.base_schema)
 
     # -- paraphrases / masters -------------------------------------------
 
     def paraphrases(self) -> dict[str, list[str]]:
         """primitive -> [paraphrase, ...]. Reads the style selected at load time."""
         return {
-            pid: rec["paraphrases"]
-            for pid, rec in _read_jsonl(self.jsonl_path()).items()
+            name: rec["paraphrases"]
+            for name, rec in _index_by_display_name(_read_jsonl(self.jsonl_path())).items()
         }
 
     def masters(self) -> dict[str, str]:
         """primitive -> master description from the JSONL (not the CSV DESCRIPTION)."""
         return {
-            pid: rec["master"]
-            for pid, rec in _read_jsonl(self.jsonl_path()).items()
-        }
-
-    def garbage_paraphrases(self) -> dict[str, list[str]]:
-        """Raises if has_garbage is False."""
-        self._require_garbage()
-        return {
-            pid: rec["paraphrases"]
-            for pid, rec in _read_jsonl(self.garbage_jsonl_path()).items()
-        }
-
-    def garbage_masters(self) -> dict[str, str]:
-        """Raises if has_garbage is False."""
-        self._require_garbage()
-        return {
-            pid: rec["master"]
-            for pid, rec in _read_jsonl(self.garbage_jsonl_path()).items()
+            name: rec["master"]
+            for name, rec in _index_by_display_name(_read_jsonl(self.jsonl_path())).items()
         }
 
     # -- K ----------------------------------------------------------------
@@ -242,126 +218,123 @@ class TaxonomyVersion:
     def validate(self) -> list[str]:
         """Return a list of error strings; empty means valid.
 
-        Checks: unique primitives; non-empty descriptions; CSV<->JSONL
-        bijection for the taxonomy (pure and headlined styles), and for the
-        garbage catcher too IF one is present (has_garbage -- entirely
-        skipped otherwise, e.g. vendor taxonomies that ship without one);
-        constant K within each file (K may differ between taxonomy and
-        garbage -- that is legal); no primitive-name overlap between taxonomy
-        and garbage; every JSONL entry has a non-empty 'master'.
+        Checks: the authored CSV exists and is readable; DISPLAY_NAME and
+        DESCRIPTION are both required non-empty (that's what "authored"
+        means); unique primitives; both semantic and headline paraphrase
+        JSONLs exist, CSV<->JSONL bijection (by display_name), constant K
+        per file, every JSONL entry has a non-empty 'master'.
         """
         errors: list[str] = []
 
+        if not self.csv_path.exists():
+            return [f"authored taxonomy CSV missing: {self.csv_path.name}"]
         try:
             tax_csv = _read_taxonomy_csv(self.csv_path)
         except (FileNotFoundError, pl.exceptions.PolarsError) as exc:
             return [f"cannot read taxonomy CSV ({self.csv_path.name}): {exc}"]
 
-        has_garbage = self.has_garbage
-        gc_csv: pl.DataFrame | None = None
-        if has_garbage:
-            try:
-                gc_csv = _read_taxonomy_csv(self.garbage_csv_path)
-            except (FileNotFoundError, pl.exceptions.PolarsError) as exc:
-                return [f"cannot read garbage CSV ({self.garbage_csv_path.name}): {exc}"]
-
         for col in ("DISPLAY_NAME", "DESCRIPTION"):
             if col not in tax_csv.columns:
                 errors.append(f"taxonomy CSV missing column: {col}")
-        if has_garbage and "DISPLAY_NAME" not in gc_csv.columns:
-            errors.append("garbage CSV missing DISPLAY_NAME column")
-
         if "DISPLAY_NAME" not in tax_csv.columns:
-            return errors  # nothing further can be checked without primitive IDs
-        if has_garbage and "DISPLAY_NAME" not in gc_csv.columns:
-            return errors
+            return errors  # nothing further can be checked without primitive names
 
-        tax_ids = tax_csv["DISPLAY_NAME"].to_list()
-        if len(tax_ids) != len(set(tax_ids)):
+        tax_names = tax_csv["DISPLAY_NAME"].to_list()
+        if len(tax_names) != len(set(tax_names)):
             errors.append("taxonomy CSV has duplicate DISPLAY_NAME values")
 
-        gc_ids: list[str] = []
-        if has_garbage:
-            gc_ids = gc_csv["DISPLAY_NAME"].to_list()
-            if len(gc_ids) != len(set(gc_ids)):
-                errors.append("garbage CSV has duplicate DISPLAY_NAME values")
+        empty_names = tax_csv.filter(
+            pl.col("DISPLAY_NAME").is_null() | (pl.col("DISPLAY_NAME") == "")
+        )
+        if len(empty_names) > 0:
+            errors.append(f"taxonomy CSV has {len(empty_names)} empty DISPLAY_NAME value(s)")
 
         if "DESCRIPTION" in tax_csv.columns:
-            empty = tax_csv.filter(
+            empty_desc = tax_csv.filter(
                 pl.col("DESCRIPTION").is_null() | (pl.col("DESCRIPTION") == "")
             )
-            if len(empty) > 0:
+            if len(empty_desc) > 0:
                 errors.append(
-                    f"taxonomy CSV has {len(empty)} empty DESCRIPTION value(s): "
-                    f"{empty['DISPLAY_NAME'].to_list()[:5]}"
+                    f"taxonomy CSV has {len(empty_desc)} empty DESCRIPTION value(s): "
+                    f"{empty_desc['DISPLAY_NAME'].to_list()[:5]}"
                 )
 
-        tax_set = set(tax_ids)
-        gc_set = set(gc_ids)
+        tax_set = set(tax_names)
 
-        jsonl_specs = [
-            ("taxonomy pure", self.jsonl_path("pure"), tax_set),
-            ("taxonomy headlined", self.jsonl_path("headlined"), tax_set),
-        ]
-        if has_garbage:
-            jsonl_specs += [
-                ("garbage pure", self.garbage_jsonl_path("pure"), gc_set),
-                ("garbage headlined", self.garbage_jsonl_path("headlined"), gc_set),
-            ]
-        parsed: dict[str, dict[str, dict[str, Any]]] = {}
-        for name, path, csv_set in jsonl_specs:
+        for style in PARAPHRASE_STYLES:
+            path = self.jsonl_path(style)
             if not path.exists():
-                errors.append(f"{name} JSONL file missing: {path.name}")
+                errors.append(f"{style} paraphrases JSONL file missing: {path.name}")
                 continue
             try:
-                data = _read_jsonl(path)
+                records = _read_jsonl(path)
             except (json.JSONDecodeError, KeyError) as exc:
-                errors.append(f"{name} JSONL unreadable: {exc}")
+                errors.append(f"{style} paraphrases JSONL unreadable: {exc}")
                 continue
-            parsed[name] = data
-            keys = set(data.keys())
-            if keys != csv_set:
-                missing = csv_set - keys
-                extra = keys - csv_set
+
+            display_names = [r.get("display_name") for r in records]
+            if len(display_names) != len(set(display_names)):
+                errors.append(f"{style} paraphrases JSONL has duplicate display_name entries")
+
+            keys = set(display_names)
+            if keys != tax_set:
+                missing = tax_set - keys
+                extra = keys - tax_set
                 errors.append(
-                    f"{name} JSONL mismatch with CSV: missing={len(missing)}, extra={len(extra)}"
+                    f"{style} paraphrases JSONL mismatch with CSV: "
+                    f"missing={len(missing)}, extra={len(extra)}"
                 )
 
-        for name, data in parsed.items():
-            ks = {len(v.get("paraphrases", [])) for v in data.values()}
+            ks = {len(r.get("paraphrases", [])) for r in records}
             if len(ks) > 1:
-                errors.append(f"{name}: inconsistent paraphrase counts (K): {sorted(ks)}")
+                errors.append(
+                    f"{style} paraphrases: inconsistent paraphrase counts (K): {sorted(ks)}"
+                )
 
-            missing_master = [pid for pid, v in data.items() if not v.get("master")]
+            missing_master = [r.get("display_name") for r in records if not r.get("master")]
             if missing_master:
-                errors.append(f"{name}: {len(missing_master)} entries missing 'master'")
-
-        overlap = tax_set & gc_set
-        if overlap:
-            errors.append(
-                f"{len(overlap)} DISPLAY_NAME value(s) appear in both taxonomy and garbage: "
-                f"{sorted(overlap)[:5]}"
-            )
+                errors.append(
+                    f"{style} paraphrases: {len(missing_master)} entries missing 'master'"
+                )
 
         return errors
 
 
 def load_taxonomy(
     root: Path,
-    version: str,
+    name: str,
     *,
-    family: str = "evergreen",
-    paraphrase_style: str = "headlined",
+    paraphrase_style: str = "headline",
+    base_schema: list[str] | None = None,
 ) -> TaxonomyVersion:
-    """Load and validate. Raises TaxonomyError listing all problems if invalid."""
-    path = Path(root) / version
+    """Load and validate. Raises TaxonomyError listing all problems if invalid.
+
+    ``root`` is the Narrative_Taxonomy directory itself (taxonomies live
+    flat, by name, directly under it -- no per-taxonomy subdirectory).
+    """
     tv = TaxonomyVersion(
-        version=version, path=path, family=family, paraphrase_style=paraphrase_style
+        name=name,
+        path=Path(root),
+        paraphrase_style=paraphrase_style,
+        base_schema=list(base_schema) if base_schema is not None else list(RAVENPACK_BASE_SCHEMA),
     )
     errors = tv.validate()
     if errors:
         detail = "\n".join(f"  - {e}" for e in errors)
-        raise TaxonomyError(
-            f"taxonomy {family!r} {version!r} at {path} failed validation:\n{detail}"
-        )
+        raise TaxonomyError(f"taxonomy {name!r} at {tv.path} failed validation:\n{detail}")
     return tv
+
+
+def list_taxonomies(root: Path) -> list[str]:
+    """Names of every complete-or-not taxonomy directly under root (never Legacy/).
+
+    A name is discovered from `{name}_taxonomy.authored.csv`; call
+    load_taxonomy(root, name) to validate a given one before using it.
+    """
+    root = Path(root)
+    suffix = "_taxonomy.authored.csv"
+    return sorted(
+        p.name[: -len(suffix)]
+        for p in root.glob(f"*{suffix}")
+        if p.is_file()
+    )
