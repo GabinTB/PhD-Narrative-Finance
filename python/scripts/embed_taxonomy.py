@@ -6,9 +6,14 @@ Usage:
         --taxonomy-version v4.3 --family evergreen --paraphrase-style headlined \\
         --pooling centroid --pipeline-version v0.1.0
 
-The RavenBERT weights directory is taken from $RAVENBERT_EMBEDDING_MODEL_PATH
-and the taxonomy root from $RAW_DATA_PATH/Evergreen_Taxonomy (evergreen) or
-$RAW_DATA_PATH/RavenPack_Taxonomy (ravenpack) -- no CLI flag for either.
+The RavenBERT weights directory is taken from $RAVENBERT_EMBEDDING_MODEL_PATH.
+The taxonomy root defaults to $RAW_DATA_PATH/Evergreen_Taxonomy, except
+--family ravenpack which defaults to $RAW_DATA_PATH/RavenPack_Taxonomy;
+override either with --taxonomy-root (needed for e.g. a vendor taxonomy
+nested under Evergreen_Taxonomy, such as --family vendor --taxonomy-version
+Vendor/RavenPack). --family is just the CSV/JSONL filename prefix
+({family}_taxonomy.csv etc) -- any string is accepted, not just
+evergreen/ravenpack.
 
 Artifacts are immutable once complete.  To supersede a finished artifact:
 
@@ -43,8 +48,15 @@ def main() -> int:
     )
     ap.add_argument("--env", default=".env")
     ap.add_argument("--datalake-root", help="overrides $DATALAKE_ROOT")
-    ap.add_argument("--taxonomy-version", required=True, help='e.g. "v4.3"')
-    ap.add_argument("--family", choices=["evergreen", "ravenpack"], default="evergreen")
+    ap.add_argument("--taxonomy-version", required=True, help='e.g. "v4.3" or "Vendor/RavenPack"')
+    ap.add_argument(
+        "--family", default="evergreen",
+        help='CSV/JSONL filename prefix, e.g. "evergreen", "ravenpack", "vendor"',
+    )
+    ap.add_argument(
+        "--taxonomy-root",
+        help="overrides the default $RAW_DATA_PATH/{Evergreen,RavenPack}_Taxonomy root",
+    )
     ap.add_argument("--paraphrase-style", choices=["pure", "headlined"], default="headlined")
     ap.add_argument("--pooling", choices=["centroid", "max", "median"], default="centroid")
     ap.add_argument("--no-garbage", action="store_true", help="skip the garbage catcher")
@@ -78,11 +90,16 @@ def main() -> int:
         log.error("RavenBERT model directory does not exist: %s", model_path)
         return 1
 
-    raw_data_path_str = os.environ.get("RAW_DATA_PATH")
-    if not raw_data_path_str:
-        log.error("RAW_DATA_PATH must be set (in .env or environment)")
-        return 1
-    taxonomy_root = Path(raw_data_path_str) / _TAXONOMY_ROOT_DIRNAME[args.family]
+    if args.taxonomy_root:
+        taxonomy_root = Path(args.taxonomy_root)
+    else:
+        raw_data_path_str = os.environ.get("RAW_DATA_PATH")
+        if not raw_data_path_str:
+            log.error("RAW_DATA_PATH must be set (in .env or environment) or pass --taxonomy-root")
+            return 1
+        taxonomy_root = Path(raw_data_path_str) / _TAXONOMY_ROOT_DIRNAME.get(
+            args.family, "Evergreen_Taxonomy"
+        )
     if not taxonomy_root.is_dir():
         log.error("taxonomy root does not exist: %s", taxonomy_root)
         return 1
