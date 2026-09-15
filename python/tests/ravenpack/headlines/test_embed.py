@@ -26,6 +26,7 @@ import pytest
 from ravenpack.headlines.embed import (
     embed_month,
     embed_range,
+    load_embedding_model,
     model_dir_sha256,
     verify_artifact,
 )
@@ -280,6 +281,37 @@ class TestModelDirSha256:
         (tmp_path / "empty").mkdir()
         with pytest.raises(FileNotFoundError):
             model_dir_sha256(tmp_path / "empty")
+
+
+# ---------------------------------------------------------------------------
+# load_embedding_model
+# ---------------------------------------------------------------------------
+
+
+class TestLoadEmbeddingModel:
+    def test_device_embedx_returns_remote_model_without_loading_ravenbert(
+        self, tmp_path: Path, monkeypatch
+    ):
+        import sys
+
+        monkeypatch.setenv("EMBEDX_BASE_URL", "http://10.10.10.2:8477/v1")
+        monkeypatch.setenv("EMBEDX_MODEL", "/models/rb")
+
+        # Poison ravenbert's model loader: if load_embedding_model's embedx
+        # branch ever reached it, this would raise -- proving it does not.
+        class _Poisoned:
+            def from_path(self, *a, **kw):
+                raise AssertionError("device='embedx' must never load ravenbert locally")
+
+        fake_module = SimpleNamespace(EmbeddingModel=_Poisoned())
+        monkeypatch.setitem(sys.modules, "ravenbert.embedding.model", fake_module)
+
+        from ravenpack.headlines.embedx_client import RemoteEmbeddingModel
+
+        model = load_embedding_model(tmp_path, device="embedx")
+        assert isinstance(model, RemoteEmbeddingModel)
+        assert model.base_url == "http://10.10.10.2:8477/v1"
+        assert model.model == "/models/rb"
 
 
 # ---------------------------------------------------------------------------

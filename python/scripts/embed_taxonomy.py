@@ -48,7 +48,11 @@ def main() -> int:
     ap.add_argument("--list", action="store_true", help="list taxonomy names found and exit")
     ap.add_argument("--paraphrase-style", choices=["semantic", "headline"], default="headline")
     ap.add_argument("--pooling", choices=["centroid", "max", "median"], default="centroid")
-    ap.add_argument("--device", help="torch device: cuda|mps|cpu (default: auto)")
+    ap.add_argument(
+        "--device",
+        help="torch device: cuda|mps|cpu (default: auto), or 'embedx' to dispatch to a "
+        "remote embedx server (see .env EMBEDX_BASE_URL/EMBEDX_MODEL)",
+    )
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--pipeline-version", default=PIPELINE_VERSION)
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -100,6 +104,12 @@ def main() -> int:
     if not model_path.is_dir():
         log.error("RavenBERT model directory does not exist: %s", model_path)
         return 1
+
+    if args.device == "embedx":
+        for var in ("EMBEDX_BASE_URL", "EMBEDX_MODEL"):
+            if not os.environ.get(var):
+                log.error("%s must be set (in .env or environment) for --device embedx", var)
+                return 1
 
     from narrative_scoring.descriptions import PoolingMode, embed_taxonomy_to_datalake
 

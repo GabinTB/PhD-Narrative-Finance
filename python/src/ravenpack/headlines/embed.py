@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -121,9 +122,24 @@ def model_dir_sha256(model_path: Path, *, log_every: int = 20) -> str:
     return h.hexdigest()
 
 
-def build_model_card(model_path: Path, weights_sha256: str) -> "ModelCard":
-    """RavenBERT embedding model card, shared by the pipeline and the migration."""
+def build_model_card(
+    model_path: Path, weights_sha256: str, *, backend_note: str | None = None
+) -> "ModelCard":
+    """RavenBERT embedding model card, shared by the pipeline and the migration.
+
+    backend_note is appended to notes when the run used a non-local backend
+    (e.g. "embedded via embedx at http://10.10.10.2:8477/v1") -- the weights
+    hash always describes the LOCAL model_path mirror regardless of backend
+    (see embedx_client.py's docstring on this assumption).
+    """
     from datalake import ModelCard
+
+    notes = (
+        f"Local weights dir: {Path(model_path).name}. Output vectors are "
+        "L2-normalized float32 from RavenBERT, stored as float16."
+    )
+    if backend_note:
+        notes = f"{notes} {backend_note}"
 
     return ModelCard(
         model_id=MODEL_ID,
@@ -135,10 +151,7 @@ def build_model_card(model_path: Path, weights_sha256: str) -> "ModelCard":
         dim=EMBEDDING_DIM,
         pooling="cls",
         trained_on="RavenPack headlines",
-        notes=(
-            f"Local weights dir: {Path(model_path).name}. Output vectors are "
-            "L2-normalized float32 from RavenBERT, stored as float16."
-        ),
+        notes=notes,
     )
 
 
@@ -146,8 +159,21 @@ def build_model_card(model_path: Path, weights_sha256: str) -> "ModelCard":
 # Model loading
 # ---------------------------------------------------------------------------
 
-def _load_model(model_path: Path, device: str | None = None) -> Any:
-    """Load the RavenBERT embedding model once.  Imported lazily (pulls torch)."""
+def load_embedding_model(model_path: Path, device: str | None = None) -> Any:
+    """Load the RavenBERT embedding model, locally or via a remote embedx server.
+
+    device="embedx" dispatches to RemoteEmbeddingModel.from_env() (see
+    embedx_client.py) instead of loading torch/ravenbert locally at all --
+    any other value (None, "cuda", "mps", "cpu") loads RavenBERT in-process
+    as before. The ravenbert import stays lazy and conditional on this
+    branch so --device embedx needs no GPU stack installed locally.
+    """
+    if device == "embedx":
+        from ravenpack.headlines.embedx_client import RemoteEmbeddingModel
+
+        log.info("using remote embedx backend (device=embedx)")
+        return RemoteEmbeddingModel.from_env()
+
     from ravenbert.embedding.model import EmbeddingModel
 
     log.info("loading RavenBERT embedding model from %s (device=%s)", model_path, device)
@@ -380,7 +406,11 @@ def embed_to_datalake(
 
     log.info("hashing RavenBERT model directory %s ...", model_path)
     weights_sha256 = model_dir_sha256(model_path)
-    card = build_model_card(model_path, weights_sha256)
+    backend_note = (
+        f"embedded via embedx at {os.environ.get('EMBEDX_BASE_URL', '?')}"
+        if device == "embedx" else None
+    )
+    card = build_model_card(model_path, weights_sha256, backend_note=backend_note)
 
     # Keep hyperparams minimal -- they feed the artifact_id slug.  batch_size and
     # the source artifact id go into the run notes instead (mirrors
@@ -404,7 +434,7 @@ def embed_to_datalake(
         verifier=KIND,
         hash_pattern="*.parquet",
     ) as run:
-        model = _load_model(model_path, device=device)
+        model = load_embedding_model(model_path, device=device)
         embed_range(
             model,
             source_dir=src.path,

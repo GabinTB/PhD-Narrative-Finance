@@ -34,6 +34,11 @@ PIPELINE = "PhD-Narrative-Finance"
 PIPELINE_REPO = "https://github.com/GabinTB/PhD-Narrative-Finance"
 PIPELINE_VERSION = "v0.1.0"
 
+_DEVICE_HELP = (
+    "torch device: cuda|mps|cpu (default: auto), or 'embedx' to dispatch to a "
+    "remote embedx server (see .env EMBEDX_BASE_URL/EMBEDX_MODEL)"
+)
+
 log = logging.getLogger(__name__)
 
 
@@ -53,14 +58,14 @@ def main() -> int:
     fresh.add_argument("--end-year", type=int)
     fresh.add_argument("--pipeline-version", default=PIPELINE_VERSION)
     fresh.add_argument("--source-artifact", help="ravenpack_headlines artifact id")
-    fresh.add_argument("--device", help="torch device: cuda|mps|cpu (default: auto)")
+    fresh.add_argument("--device", help=_DEVICE_HELP)
     fresh.add_argument("--batch-size", type=int, default=128)
     fresh.add_argument("--write-chunk-rows", type=int, default=200_000)
     fresh.add_argument("--log-every", type=int, default=100_000)
 
     resume = sub.add_parser("resume", help="resume a partial run")
     resume.add_argument("artifact_id", help="ID of the partial artifact to resume")
-    resume.add_argument("--device", help="torch device: cuda|mps|cpu (default: auto)")
+    resume.add_argument("--device", help=_DEVICE_HELP)
     resume.add_argument("--batch-size", type=int, default=128)
     resume.add_argument("--write-chunk-rows", type=int, default=200_000)
     resume.add_argument("--log-every", type=int, default=100_000)
@@ -70,7 +75,7 @@ def main() -> int:
     ap.add_argument("--end-year", type=int)
     ap.add_argument("--pipeline-version", default=PIPELINE_VERSION)
     ap.add_argument("--source-artifact")
-    ap.add_argument("--device")
+    ap.add_argument("--device", help=_DEVICE_HELP)
     ap.add_argument("--batch-size", type=int, default=128)
     ap.add_argument("--write-chunk-rows", type=int, default=200_000)
     ap.add_argument("--log-every", type=int, default=100_000)
@@ -100,6 +105,12 @@ def main() -> int:
     if not model_path.is_dir():
         log.error("RavenBERT model directory does not exist: %s", model_path)
         return 1
+
+    if args.device == "embedx":
+        for var in ("EMBEDX_BASE_URL", "EMBEDX_MODEL"):
+            if not os.environ.get(var):
+                log.error("%s must be set (in .env or environment) for --device embedx", var)
+                return 1
 
     with DatalakeIndex(root) as index:
         if args.resume:
@@ -153,7 +164,7 @@ def _resume(index, artifact_id, model_path, device, batch_size, write_chunk_rows
     """Resume a partial run, inferring all params from the artifact metadata."""
     from datalake.artifact import utc_now_iso
     from datalake.meta import META_FILENAME, README_FILENAME, git_commit, hash_file, write_sidecars
-    from ravenpack.headlines.embed import SOURCE_KIND, _load_model, embed_range
+    from ravenpack.headlines.embed import SOURCE_KIND, embed_range, load_embedding_model
 
     try:
         artifact = index.get(artifact_id)
@@ -194,7 +205,7 @@ def _resume(index, artifact_id, model_path, device, batch_size, write_chunk_rows
         source.artifact_id,
     )
 
-    model = _load_model(model_path, device=device)
+    model = load_embedding_model(model_path, device=device)
     embed_range(
         model,
         source_dir=source_dir,

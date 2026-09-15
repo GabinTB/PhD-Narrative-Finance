@@ -16,6 +16,7 @@ retained and pooling happens at score time (see scoring.score_chunk).
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -200,7 +201,11 @@ def embed_taxonomy_to_datalake(
 
     log.info("hashing RavenBERT model directory %s ...", model_path)
     weights_sha256 = model_dir_sha256(model_path)
-    card = build_model_card(model_path, weights_sha256)
+    backend_note = (
+        f"embedded via embedx at {os.environ.get('EMBEDX_BASE_URL', '?')}"
+        if device == "embedx" else None
+    )
+    card = build_model_card(model_path, weights_sha256, backend_note=backend_note)
 
     input_files = [tv.csv_path, tv.jsonl_path("semantic"), tv.jsonl_path("headline")]
     file_digests = {
@@ -229,9 +234,9 @@ def embed_taxonomy_to_datalake(
         verifier=KIND,
         hash_pattern="*.parquet",
     ) as run:
-        from ravenbert.embedding.model import EmbeddingModel
+        from ravenpack.headlines.embed import load_embedding_model
 
-        model = EmbeddingModel.from_path(str(model_path), device=device)
+        model = load_embedding_model(model_path, device=device)
 
         primitives = sorted(tv.paraphrases().keys())
         log.info(
