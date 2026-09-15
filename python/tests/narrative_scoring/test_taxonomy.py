@@ -33,6 +33,7 @@ def _write_taxonomy_version(
     gc_k: int | None = None,
     with_role: bool = False,
     use_type_subtype: bool = False,
+    no_garbage: bool = False,
 ) -> Path:
     primitives = primitives or ["prim_a", "prim_b", "prim_c"]
     garbage_primitives = garbage_primitives or ["gc_a", "gc_b"]
@@ -58,7 +59,10 @@ def _write_taxonomy_version(
         return pl.DataFrame(data)
 
     _csv_df(primitives, role=with_role).write_csv(vdir / f"{family}_taxonomy.csv")
-    _csv_df(garbage_primitives, role=with_role).write_csv(vdir / "garbage-catching_taxonomy.csv")
+    if not no_garbage:
+        _csv_df(garbage_primitives, role=with_role).write_csv(
+            vdir / "garbage-catching_taxonomy.csv"
+        )
 
     for style in ("pure", "headlined"):
         suffix = "" if style == "pure" else "-headlined"
@@ -73,17 +77,18 @@ def _write_taxonomy_version(
                 for p in primitives
             ],
         )
-        _write_jsonl(
-            vdir / f"garbage-catching_taxonomy_primitive_paraphrases{suffix}.jsonl",
-            [
-                {
-                    "id": p,
-                    "master": f"master {style} {p}",
-                    "paraphrases": [f"{p} para {i}" for i in range(gc_k)],
-                }
-                for p in garbage_primitives
-            ],
-        )
+        if not no_garbage:
+            _write_jsonl(
+                vdir / f"garbage-catching_taxonomy_primitive_paraphrases{suffix}.jsonl",
+                [
+                    {
+                        "id": p,
+                        "master": f"master {style} {p}",
+                        "paraphrases": [f"{p} para {i}" for i in range(gc_k)],
+                    }
+                    for p in garbage_primitives
+                ],
+            )
 
     return vdir
 
@@ -194,3 +199,49 @@ class TestValidation:
         _write_taxonomy_version(tmp_path, "v1", k=2, gc_k=5)
         tv = load_taxonomy(tmp_path, "v1")  # must not raise
         assert tv.validate() == []
+
+
+class TestNoGarbage:
+    """Vendor taxonomies (e.g. RavenPack's own) may ship without a garbage catcher."""
+
+    def test_has_garbage_false_when_csv_absent(self, tmp_path: Path):
+        _write_taxonomy_version(tmp_path, "v1", family="vendor", no_garbage=True)
+        tv = load_taxonomy(tmp_path, "v1", family="vendor")  # must not raise
+        assert tv.has_garbage is False
+        assert tv.validate() == []
+
+    def test_has_garbage_true_when_csv_present(self, tmp_path: Path):
+        _write_taxonomy_version(tmp_path, "v1")
+        tv = load_taxonomy(tmp_path, "v1")
+        assert tv.has_garbage is True
+
+    def test_garbage_accessors_raise_clearly_when_absent(self, tmp_path: Path):
+        _write_taxonomy_version(tmp_path, "v1", family="vendor", no_garbage=True)
+        tv = load_taxonomy(tmp_path, "v1", family="vendor")
+        with pytest.raises(TaxonomyError, match="has no garbage-catching taxonomy"):
+            tv.garbage_primitives()
+        with pytest.raises(TaxonomyError, match="has no garbage-catching taxonomy"):
+            tv.garbage_paraphrases()
+        with pytest.raises(TaxonomyError, match="has no garbage-catching taxonomy"):
+            tv.garbage_masters()
+
+    def test_duplicate_and_empty_description_still_checked_without_garbage(self, tmp_path: Path):
+        vdir = _write_taxonomy_version(tmp_path, "v1", family="vendor", no_garbage=True)
+        df = pl.read_csv(vdir / "vendor_taxonomy.csv")
+        df = df.with_columns(
+            pl.when(pl.col("DISPLAY_NAME") == "prim_a")
+            .then(pl.lit(""))
+            .otherwise(pl.col("DESCRIPTION"))
+            .alias("DESCRIPTION")
+        )
+        df.write_csv(vdir / "vendor_taxonomy.csv")
+        with pytest.raises(TaxonomyError, match="empty DESCRIPTION"):
+            load_taxonomy(tmp_path, "v1", family="vendor")
+
+    def test_partial_garbage_files_still_fail_validation(self, tmp_path: Path):
+        # CSV present but a JSONL missing -> has_garbage=True, so it's a real error,
+        # not silently treated as "no garbage catcher".
+        vdir = _write_taxonomy_version(tmp_path, "v1")
+        (vdir / "garbage-catching_taxonomy_primitive_paraphrases.jsonl").unlink()
+        with pytest.raises(TaxonomyError, match="garbage pure JSONL file missing"):
+            load_taxonomy(tmp_path, "v1")

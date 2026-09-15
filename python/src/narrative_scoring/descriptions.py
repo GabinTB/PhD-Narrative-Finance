@@ -197,6 +197,12 @@ def embed_taxonomy_to_datalake(
     tv = load_taxonomy(
         raw_data_path, taxonomy_version, family=family, paraphrase_style=paraphrase_style
     )
+    if include_garbage and not tv.has_garbage:
+        log.warning(
+            "include_garbage=True but %r %r has no garbage-catching taxonomy; disabling",
+            family, taxonomy_version,
+        )
+        include_garbage = False
 
     log.info("hashing RavenBERT model directory %s ...", model_path)
     weights_sha256 = model_dir_sha256(model_path)

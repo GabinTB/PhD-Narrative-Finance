@@ -13,17 +13,25 @@ pipeline never has to know which family it is working with:
 RavenPack CSVs additionally carry a ROLE column (entity role); it plays no
 part in the hierarchy but is carried through as metadata rather than dropped.
 
-A taxonomy VERSION directory holds six files:
+A taxonomy VERSION directory holds three required files and three optional
+ones (the garbage catcher -- some taxonomies, e.g. vendor-supplied ones,
+ship without one):
 
     {family}_taxonomy.csv
     {family}_taxonomy_primitive_paraphrases.jsonl               (pure)
     {family}_taxonomy_primitive_paraphrases-headlined.jsonl     (headlined)
-    garbage-catching_taxonomy.csv
-    garbage-catching_taxonomy_primitive_paraphrases.jsonl
-    garbage-catching_taxonomy_primitive_paraphrases-headlined.jsonl
+    garbage-catching_taxonomy.csv                                  [optional]
+    garbage-catching_taxonomy_primitive_paraphrases.jsonl          [optional]
+    garbage-catching_taxonomy_primitive_paraphrases-headlined.jsonl [optional]
 
-``load_taxonomy`` validates all six before handing back a ``TaxonomyVersion``;
-``TaxonomyError`` lists every problem found, not just the first.
+The garbage catcher is optional as a *set*: if ``garbage-catching_taxonomy.csv``
+is absent, the whole garbage catcher is treated as absent (``has_garbage``
+is False) and none of its checks run; if it is present, all three garbage
+files are required and validated exactly as the primary taxonomy's are.
+
+``load_taxonomy`` validates every file present before handing back a
+``TaxonomyVersion``; ``TaxonomyError`` lists every problem found, not just
+the first.
 """
 from __future__ import annotations
 
@@ -159,6 +167,23 @@ class TaxonomyVersion:
     def garbage_jsonl_path(self, style: str | None = None) -> Path:
         return self._jsonl_path("garbage-catching", style or self.paraphrase_style)
 
+    @property
+    def has_garbage(self) -> bool:
+        """Whether this taxonomy version ships a garbage catcher at all.
+
+        Detected from the CSV's presence alone (the JSONLs are required to
+        follow if the CSV is there -- see validate()); some taxonomies, e.g.
+        vendor-supplied ones, are shipped without any garbage catcher.
+        """
+        return self.garbage_csv_path.exists()
+
+    def _require_garbage(self) -> None:
+        if not self.has_garbage:
+            raise TaxonomyError(
+                f"{self.family!r} {self.version!r} at {self.path} has no garbage-catching "
+                "taxonomy (garbage-catching_taxonomy.csv not found); check has_garbage first"
+            )
+
     # -- canonical frames ------------------------------------------------
 
     def primitives(self) -> pl.DataFrame:
@@ -166,7 +191,8 @@ class TaxonomyVersion:
         return _canonicalize(_read_taxonomy_csv(self.csv_path))
 
     def garbage_primitives(self) -> pl.DataFrame:
-        """Same canonical frame for the garbage catcher."""
+        """Same canonical frame for the garbage catcher. Raises if has_garbage is False."""
+        self._require_garbage()
         return _canonicalize(_read_taxonomy_csv(self.garbage_csv_path))
 
     # -- paraphrases / masters -------------------------------------------
@@ -186,12 +212,16 @@ class TaxonomyVersion:
         }
 
     def garbage_paraphrases(self) -> dict[str, list[str]]:
+        """Raises if has_garbage is False."""
+        self._require_garbage()
         return {
             pid: rec["paraphrases"]
             for pid, rec in _read_jsonl(self.garbage_jsonl_path()).items()
         }
 
     def garbage_masters(self) -> dict[str, str]:
+        """Raises if has_garbage is False."""
+        self._require_garbage()
         return {
             pid: rec["master"]
             for pid, rec in _read_jsonl(self.garbage_jsonl_path()).items()
@@ -213,7 +243,9 @@ class TaxonomyVersion:
         """Return a list of error strings; empty means valid.
 
         Checks: unique primitives; non-empty descriptions; CSV<->JSONL
-        bijection for both taxonomy and garbage (pure and headlined styles);
+        bijection for the taxonomy (pure and headlined styles), and for the
+        garbage catcher too IF one is present (has_garbage -- entirely
+        skipped otherwise, e.g. vendor taxonomies that ship without one);
         constant K within each file (K may differ between taxonomy and
         garbage -- that is legal); no primitive-name overlap between taxonomy
         and garbage; every JSONL entry has a non-empty 'master'.
@@ -224,26 +256,35 @@ class TaxonomyVersion:
             tax_csv = _read_taxonomy_csv(self.csv_path)
         except (FileNotFoundError, pl.exceptions.PolarsError) as exc:
             return [f"cannot read taxonomy CSV ({self.csv_path.name}): {exc}"]
-        try:
-            gc_csv = _read_taxonomy_csv(self.garbage_csv_path)
-        except (FileNotFoundError, pl.exceptions.PolarsError) as exc:
-            return [f"cannot read garbage CSV ({self.garbage_csv_path.name}): {exc}"]
+
+        has_garbage = self.has_garbage
+        gc_csv: pl.DataFrame | None = None
+        if has_garbage:
+            try:
+                gc_csv = _read_taxonomy_csv(self.garbage_csv_path)
+            except (FileNotFoundError, pl.exceptions.PolarsError) as exc:
+                return [f"cannot read garbage CSV ({self.garbage_csv_path.name}): {exc}"]
 
         for col in ("DISPLAY_NAME", "DESCRIPTION"):
             if col not in tax_csv.columns:
                 errors.append(f"taxonomy CSV missing column: {col}")
-        if "DISPLAY_NAME" not in gc_csv.columns:
+        if has_garbage and "DISPLAY_NAME" not in gc_csv.columns:
             errors.append("garbage CSV missing DISPLAY_NAME column")
 
-        if "DISPLAY_NAME" not in tax_csv.columns or "DISPLAY_NAME" not in gc_csv.columns:
+        if "DISPLAY_NAME" not in tax_csv.columns:
             return errors  # nothing further can be checked without primitive IDs
+        if has_garbage and "DISPLAY_NAME" not in gc_csv.columns:
+            return errors
 
         tax_ids = tax_csv["DISPLAY_NAME"].to_list()
         if len(tax_ids) != len(set(tax_ids)):
             errors.append("taxonomy CSV has duplicate DISPLAY_NAME values")
-        gc_ids = gc_csv["DISPLAY_NAME"].to_list()
-        if len(gc_ids) != len(set(gc_ids)):
-            errors.append("garbage CSV has duplicate DISPLAY_NAME values")
+
+        gc_ids: list[str] = []
+        if has_garbage:
+            gc_ids = gc_csv["DISPLAY_NAME"].to_list()
+            if len(gc_ids) != len(set(gc_ids)):
+                errors.append("garbage CSV has duplicate DISPLAY_NAME values")
 
         if "DESCRIPTION" in tax_csv.columns:
             empty = tax_csv.filter(
@@ -261,9 +302,12 @@ class TaxonomyVersion:
         jsonl_specs = [
             ("taxonomy pure", self.jsonl_path("pure"), tax_set),
             ("taxonomy headlined", self.jsonl_path("headlined"), tax_set),
-            ("garbage pure", self.garbage_jsonl_path("pure"), gc_set),
-            ("garbage headlined", self.garbage_jsonl_path("headlined"), gc_set),
         ]
+        if has_garbage:
+            jsonl_specs += [
+                ("garbage pure", self.garbage_jsonl_path("pure"), gc_set),
+                ("garbage headlined", self.garbage_jsonl_path("headlined"), gc_set),
+            ]
         parsed: dict[str, dict[str, dict[str, Any]]] = {}
         for name, path, csv_set in jsonl_specs:
             if not path.exists():
