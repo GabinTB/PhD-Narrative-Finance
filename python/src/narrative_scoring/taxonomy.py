@@ -57,6 +57,20 @@ class TaxonomyError(ValueError):
 # JSONL helpers
 # ---------------------------------------------------------------------------
 
+def _read_taxonomy_csv(path: Path) -> pl.DataFrame:
+    """Read a taxonomy CSV with every column as String, no dtype inference.
+
+    Vendor taxonomy CSVs (e.g. RavenPack's own) carry columns we never use
+    (like a SCHEDULED flag) that mix True/False with sentinel values such as
+    "UNDEFINED" -- polars' schema inference samples the first N rows, guesses
+    bool, then raises a parse error deep into the file. Since only a handful
+    of known string columns are ever selected (see _canonicalize), inference
+    buys nothing and turning it off makes every vendor taxonomy load
+    regardless of what its other columns contain.
+    """
+    return pl.read_csv(path, infer_schema_length=0)
+
+
 def _read_jsonl(path: Path) -> dict[str, dict[str, Any]]:
     """primitive id -> its JSONL record ({"id", "master", "paraphrases"})."""
     out: dict[str, dict[str, Any]] = {}
@@ -149,11 +163,11 @@ class TaxonomyVersion:
 
     def primitives(self) -> pl.DataFrame:
         """Canonical frame: reservoir, dimension, narrative, primitive, description."""
-        return _canonicalize(pl.read_csv(self.csv_path))
+        return _canonicalize(_read_taxonomy_csv(self.csv_path))
 
     def garbage_primitives(self) -> pl.DataFrame:
         """Same canonical frame for the garbage catcher."""
-        return _canonicalize(pl.read_csv(self.garbage_csv_path))
+        return _canonicalize(_read_taxonomy_csv(self.garbage_csv_path))
 
     # -- paraphrases / masters -------------------------------------------
 
@@ -207,11 +221,11 @@ class TaxonomyVersion:
         errors: list[str] = []
 
         try:
-            tax_csv = pl.read_csv(self.csv_path)
+            tax_csv = _read_taxonomy_csv(self.csv_path)
         except (FileNotFoundError, pl.exceptions.PolarsError) as exc:
             return [f"cannot read taxonomy CSV ({self.csv_path.name}): {exc}"]
         try:
-            gc_csv = pl.read_csv(self.garbage_csv_path)
+            gc_csv = _read_taxonomy_csv(self.garbage_csv_path)
         except (FileNotFoundError, pl.exceptions.PolarsError) as exc:
             return [f"cannot read garbage CSV ({self.garbage_csv_path.name}): {exc}"]
 
