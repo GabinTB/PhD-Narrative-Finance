@@ -30,6 +30,7 @@ dependencies = [
     "openai>=2.44.0",
     "duckdb[parquet]>=1.5.5",
     "mfe-toolbox>=0.1.2",
+    "wrds>=3.1.6",
 ]
 
 [project.scripts]
@@ -54,6 +55,7 @@ packages = [
     "src/narrative_scoring",
     "src/narrative_asset_pricing",
     "src/edgar_tools",
+    "src/wrds_client",
 ]
 
 [tool.uv]
