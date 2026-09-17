@@ -36,12 +36,15 @@ def fetch_query_artifact(
     pipeline_repo: str | None = None,
     repo_dir: Path | None = None,
     date_cols: list[str] | None = None,
+    params: dict[str, Any] | None = None,
 ) -> Artifact:
     """Run `sql` against WRDS and register the result as one artifact.
 
     `sql` is recorded as a hyperparam (merged with any caller-supplied
     `hyperparams`) so the artifact's identity and provenance capture exactly
-    what was queried.
+    what was queried.  Row-selecting values (secids, date ranges, ...) should
+    be passed via `params` and referenced in `sql` as `%(name)s` rather than
+    string-interpolated into `sql` directly.
 
     Args:
         index:             Datalake index to register the artifact in.
@@ -56,6 +59,7 @@ def fetch_query_artifact(
         pipeline_repo:      URL of the producing repo.
         repo_dir:           Directory to read the git SHA from (default cwd).
         date_cols:          Columns to parse as dates (passed to raw_sql).
+        params:             Bind parameters for `%(name)s` placeholders in `sql`.
 
     Returns:
         The completed Artifact.
@@ -73,7 +77,7 @@ def fetch_query_artifact(
         notes=notes,
         hash_pattern="*.parquet",
     ) as run:
-        df = client.raw_sql(sql, date_cols=date_cols)
+        df = client.raw_sql(sql, date_cols=date_cols, params=params)
         df.to_parquet(run.out_dir / "data.parquet", index=False)
         run.note(f"{len(df)} rows fetched")
 

@@ -64,7 +64,24 @@ def test_fetch_query_artifact_registers_and_writes_parquet(index: DatalakeIndex)
     written = pd.read_parquet(files[0])
     pd.testing.assert_frame_equal(written, _df())
     assert artifact.meta.hyperparams["sql"] == sql
-    assert client.raw_sql_calls == [{"sql": sql, "date_cols": None}]
+    assert client.raw_sql_calls == [{"sql": sql, "date_cols": None, "params": None}]
+
+
+def test_fetch_query_artifact_forwards_params(index: DatalakeIndex) -> None:
+    client = StubWRDSClient(_df())
+    sql = "select secid, close from optionm.secprd where secid in %(secids)s"
+    fetch_query_artifact(
+        index,
+        client,
+        sql,
+        kind="optionm_secprd",
+        pipeline=PIPELINE,
+        pipeline_version=VERSION,
+        params={"secids": (101, 102)},
+    )
+    assert client.raw_sql_calls == [
+        {"sql": sql, "date_cols": None, "params": {"secids": (101, 102)}}
+    ]
 
 
 def test_fetch_query_artifact_merges_extra_hyperparams(index: DatalakeIndex) -> None:

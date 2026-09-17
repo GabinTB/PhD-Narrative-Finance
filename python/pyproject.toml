@@ -56,10 +56,17 @@ packages = [
     "src/narrative_asset_pricing",
     "src/edgar_tools",
     "src/wrds_client",
+    "src/universe",
 ]
 
 [tool.uv]
 package = true
+# wrds pins pandas<2.3, sqlalchemy<2.1, and ipython<=9.8.0, all older than
+# versions already in use here. Override so wrds resolves at its latest
+# release (3.5.0, which adds proper wrds_password kwarg support -- needed to
+# authenticate from .env without an interactive prompt) instead of being
+# dragged down to a much older version to satisfy stale pins.
+override-dependencies = ["pandas>=2.2", "sqlalchemy>=2", "ipython>=9"]
 
 [tool.uv.sources]
 ravenbert = { git = "ssh://git@github.com/GabinTB/RavenBERT.git" }
