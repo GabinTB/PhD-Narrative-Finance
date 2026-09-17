@@ -45,5 +45,5 @@ logs/
 .claude/
 /content/latex/
 python/datalake/index.db
-index.db
+python/doc/*
 

@@ -26,6 +26,7 @@ dependencies = [
     "httpx>=0.27",
     "rols>=0.4.0",
     "pyhofa>=0.2.0",
+    "ravenpackapi>=1.1.6",
     "ravenbert",
     "openai>=2.44.0",
     "duckdb[parquet]>=1.5.5",
