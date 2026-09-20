@@ -51,7 +51,7 @@ from narrative_scoring.null_model import (
     compute_tau,
     trim_null_draws_batch,
 )
-from narrative_scoring.schema import PRIMITIVE_SCORES_SCHEMA
+from narrative_scoring.schema import EMBEDDING_DIM, PRIMITIVE_SCORES_SCHEMA
 
 if TYPE_CHECKING:
     from datalake import Artifact, DatalakeIndex
@@ -162,14 +162,20 @@ def gate_with_source_tau(
     fallback_tau: float,
     rel_floor: float = 0.65,
 ) -> np.ndarray:
-    """Per-row F0 gate, tau resolved per headline's source (grouped, not looped)."""
-    out = np.zeros_like(S)
-    sources_arr = np.asarray(sources)
-    for src in set(sources):
-        mask = sources_arr == src
-        tau = tau_by_source.get(src, fallback_tau)
-        out[mask] = apply_gate(S[mask], tau, rel_floor)
-    return out
+    """Per-row F0 gate, tau resolved per headline's source.
+
+    tau is looked up once per distinct source and broadcast to a per-row
+    column, so the gate touches S once instead of once per source.
+    """
+    uniq, inverse = np.unique(np.asarray(sources), return_inverse=True)
+    tau_per_source = np.array(
+        [tau_by_source.get(src, fallback_tau) for src in uniq], dtype=S.dtype
+    )
+    tau_rows = tau_per_source[inverse][:, None]
+
+    s_max = S.max(axis=1, keepdims=True)
+    kept = np.where(S >= rel_floor * s_max, S, 0.0)
+    return np.where(s_max >= tau_rows, kept, 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +231,7 @@ def score_day(
         if start >= n_rows:
             break
         chunk = day_df.slice(start, chunk_size)
-        X = np.asarray(chunk["EMBEDDING"].to_list(), dtype=np.float32)
+        X = chunk["EMBEDDING"].to_numpy().astype(np.float32, copy=False)
         X_corr, _ = apply_correction(X, correction, mu=mu, mu_hat=mu_hat)
 
         S = score_chunk(X_corr, D_tax_corr, D_tax.mode)
@@ -263,10 +269,17 @@ def resolve_mu(mu_asof_df: pl.DataFrame, date: Any) -> tuple[np.ndarray, np.ndar
 # ---------------------------------------------------------------------------
 
 def load_month(headlines_path: Path, embeddings_path: Path, threads: int = 8) -> pl.DataFrame:
-    """RP_STORY_ID, TIMESTAMP_UTC, SOURCE_NAME, EMBEDDING for one month, joined."""
+    """RP_STORY_ID, TIMESTAMP_UTC, SOURCE_NAME, EMBEDDING for one month, joined.
+
+    EMBEDDING comes back from DuckDB as List(Float32) and is cast to the
+    fixed-size Array(Float32, EMBEDDING_DIM), so callers get a contiguous
+    (n, EMBEDDING_DIM) buffer from ``.to_numpy()`` instead of paying a
+    per-element Python round trip through ``.to_list()``.
+    """
     conn = duckdb.connect()
     try:
         conn.execute(f"PRAGMA threads={threads}")
+        conn.execute("SET enable_progress_bar=false")
         df = conn.sql(
             f"""
             SELECT h.RP_STORY_ID, h.TIMESTAMP_UTC, h.SOURCE_NAME, e.EMBEDDING
@@ -277,7 +290,7 @@ def load_month(headlines_path: Path, embeddings_path: Path, threads: int = 8) ->
         ).pl()
     finally:
         conn.close()
-    return df
+    return df.with_columns(pl.col("EMBEDDING").list.to_array(EMBEDDING_DIM))
 
 
 # ---------------------------------------------------------------------------

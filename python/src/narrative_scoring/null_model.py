@@ -146,24 +146,10 @@ def build_null(
     regardless of stream length, while remaining an unbiased sample of the
     full stream.
     """
-    rng = np.random.default_rng(seed)
-    reservoir = np.empty(cap, dtype=np.float64)
-    n_filled = 0
-    n_seen = 0
-
+    pool = ReservoirPool(cap=cap, seed=seed)
     for s in scores_iter:
-        draws = trim_null_draws(np.asarray(s), trim_frac=trim_frac)
-        for v in draws:
-            if n_filled < cap:
-                reservoir[n_filled] = v
-                n_filled += 1
-            else:
-                j = rng.integers(0, n_seen + 1)
-                if j < cap:
-                    reservoir[j] = v
-            n_seen += 1
-
-    return reservoir[:n_filled]
+        pool.add(trim_null_draws(np.asarray(s), trim_frac=trim_frac))
+    return pool.draws
 
 
 class ReservoirPool:
@@ -173,30 +159,58 @@ class ReservoirPool:
     fed batches of trimmed draws day by day (rather than a single
     ``scores_iter`` pass), while remaining an unbiased sample of everything
     ever added.
+
+    Keyed (priority) reservoir sampling: every element ever added draws an iid
+    Uniform(0,1) key, and the reservoir is always the ``cap`` elements with the
+    largest keys.  Because the keys are iid, the retained set is a uniformly
+    random ``cap``-subset of the whole stream -- the same guarantee as the
+    classic sequential Algorithm R, but a batch merges with vectorized numpy
+    instead of one ``rng.integers()`` call per scalar.  That per-scalar loop was
+    the dominant cost of the whole pipeline at realistic scale: one month of
+    headlines yields ~3.6e8 trimmed draws, ~15s per day of Python-level RNG
+    calls versus ~0.2s for the batch merge below.
+
+    Two facts make the batched form exact rather than an approximation:
+
+      - ``top_cap(A | B) == top_cap(top_cap(A) | B)`` when ``|A| >= cap``, so
+        merging batch-by-batch matches one pass over the concatenated stream.
+      - Once the reservoir is full, an incoming key below its minimum key is
+        dominated by ``cap`` elements already held, so it cannot enter the
+        top ``cap`` and is discarded without materializing it.
     """
 
     def __init__(self, cap: int = 5_000_000, seed: int = 0):
         self.cap = cap
         self._rng = np.random.default_rng(seed)
-        self._reservoir = np.empty(cap, dtype=np.float64)
+        self._reservoir = np.empty(0, dtype=np.float64)
+        self._keys = np.empty(0, dtype=np.float64)
         self.n_filled = 0
         self.n_seen = 0
 
     def add(self, values: np.ndarray) -> None:
         values = np.asarray(values, dtype=np.float64).ravel()
-        for v in values:
-            if self.n_filled < self.cap:
-                self._reservoir[self.n_filled] = v
-                self.n_filled += 1
-            else:
-                j = self._rng.integers(0, self.n_seen + 1)
-                if j < self.cap:
-                    self._reservoir[j] = v
-            self.n_seen += 1
+        n_new = values.shape[0]
+        if n_new == 0:
+            return
+        self.n_seen += n_new
+
+        keys = self._rng.random(n_new)
+        if self.n_filled >= self.cap:
+            survived = keys > self._keys.min()
+            values, keys = values[survived], keys[survived]
+
+        values = np.concatenate([self._reservoir, values])
+        keys = np.concatenate([self._keys, keys])
+        if values.shape[0] > self.cap:
+            top = np.argpartition(keys, -self.cap)[-self.cap:]
+            values, keys = values[top], keys[top]
+
+        self._reservoir, self._keys = values, keys
+        self.n_filled = values.shape[0]
 
     @property
     def draws(self) -> np.ndarray:
-        return self._reservoir[: self.n_filled]
+        return self._reservoir
 
 
 # ---------------------------------------------------------------------------
