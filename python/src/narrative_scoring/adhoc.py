@@ -34,11 +34,13 @@ scoring.score_headlines_to_datalake is for.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
+import pickle
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import polars as pl
@@ -113,6 +115,35 @@ def as_pooling(desc: DescriptionEmbeddings, mode: PoolingMode) -> DescriptionEmb
     )
 
 
+# ---------------------------------------------------------------------------
+# Notebook-local disk cache (NOT a datalake artifact -- no lineage, no
+# verifier, no hashing of upstream data beyond whatever the caller passes in
+# ``params``). Meant to survive kernel restarts for a single notebook's
+# repeated substudy reruns; delete ``cache_dir`` to force a clean recompute
+# (e.g. after changing calibrate_null_model/score_window's logic).
+# ---------------------------------------------------------------------------
+
+def cache_path(cache_dir: Path, kind: str, **params: Any) -> Path:
+    """Deterministic cache file path for a (kind, params) combination."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    key = "|".join(f"{k}={v}" for k, v in sorted(params.items()))
+    digest = hashlib.blake2b(key.encode(), digest_size=8).hexdigest()
+    return cache_dir / f"{kind}__{digest}.pkl"
+
+
+def load_or_compute(path: Path, compute: Callable[[], Any]) -> Any:
+    """Pickle-cache ``compute()``'s result at ``path``."""
+    if path.exists():
+        log.info("cache hit: %s", path.name)
+        with path.open("rb") as f:
+            return pickle.load(f)
+    result = compute()
+    with path.open("wb") as f:
+        pickle.dump(result, f)
+    log.info("cached: %s", path.name)
+    return result
+
+
 def _month_range(start: date, end: date) -> list[tuple[int, int]]:
     months = []
     y, m = start.year, start.month
@@ -159,7 +190,12 @@ def calibrate_null_model(
 
     pool = ReservoirPool(cap=cap, seed=seed)
     n_days = 0
-    for y, m in _month_range(calib_start, calib_end):
+    months = _month_range(calib_start, calib_end)
+    log.info(
+        "null calibration (%s): %d month(s) in [%s, %s]",
+        correction.value, len(months), calib_start, calib_end,
+    )
+    for i, (y, m) in enumerate(months, 1):
         name = f"{y}-{m:02d}.parquet"
         hl_path, emb_path = headlines_dir / name, embeddings_dir / name
         if not hl_path.exists() or not emb_path.exists():
@@ -170,6 +206,7 @@ def calibrate_null_model(
         month_df = month_df.with_columns(
             pl.col("TIMESTAMP_UTC").str.slice(0, 10).str.to_date().alias("_DATE")
         )
+        month_days = 0
         for dt, day_df in month_df.group_by("_DATE", maintain_order=True):
             d = dt[0] if isinstance(dt, tuple) else dt
             if d < calib_start or d > calib_end:
@@ -181,6 +218,11 @@ def calibrate_null_model(
             for S in raw_chunks:
                 pool.add(trim_null_draws_batch(S, trim_frac=trim_frac).ravel())
             n_days += 1
+            month_days += 1
+        log.info(
+            "null calibration (%s) [%d/%d] %s: %d day(s), pool %d/%d draws (%d seen)",
+            correction.value, i, len(months), name, month_days, pool.n_filled, pool.cap, pool.n_seen,
+        )
 
     if pool.n_filled == 0:
         raise RuntimeError(
@@ -232,7 +274,10 @@ def score_window(
     monthly: list[pl.DataFrame] = []
     n_days = 0
 
-    for y, m in _month_range(start, end):
+    months = _month_range(start, end)
+    config_label = ", ".join(f"{k}={v}" for k, v in (config or {}).items()) or correction.value
+    log.info("scoring (%s): %d month(s) in [%s, %s]", config_label, len(months), start, end)
+    for i, (y, m) in enumerate(months, 1):
         name = f"{y}-{m:02d}.parquet"
         hl_path, emb_path = headlines_dir / name, embeddings_dir / name
         if not hl_path.exists() or not emb_path.exists():
@@ -243,6 +288,7 @@ def score_window(
         month_df = month_df.with_columns(
             pl.col("TIMESTAMP_UTC").str.slice(0, 10).str.to_date().alias("_DATE")
         )
+        month_days = 0
         for dt, day_df in month_df.group_by("_DATE", maintain_order=True):
             d = dt[0] if isinstance(dt, tuple) else dt
             if d < start or d > end:
@@ -255,6 +301,11 @@ def score_window(
             )
             monthly.append(stats)
             n_days += 1
+            month_days += 1
+        log.info(
+            "scoring (%s) [%d/%d] %s: %d day(s) (%d total so far)",
+            config_label, i, len(months), name, month_days, n_days,
+        )
 
     if not monthly:
         raise RuntimeError(f"no headlines found in [{start}, {end}]")
