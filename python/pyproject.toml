@@ -4,13 +4,14 @@ version = "0.1.0"
 description = "Narrative finance: NLP-driven signals for systematic investments"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 authors = [{name = "Gabin Taibi"}]
 
 dependencies = [
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
     "numpy>=1.26",
+    "ray>=2.58.0",
     "pandas>=2.0",
     "polars>=0.20",
     "pyarrow>=14.0",

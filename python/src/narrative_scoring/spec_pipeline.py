@@ -34,10 +34,12 @@ import hashlib
 import json
 import logging
 from dataclasses import asdict, dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
+import queue
+import threading
 
 import duckdb
 import numpy as np
@@ -51,6 +53,7 @@ from narrative_scoring.null_model import (
     compute_tau,
     trim_null_draws_batch,
 )
+from narrative_scoring._kernels import HAVE_FUSED, gate_aggregate_rowwise
 from narrative_scoring.schema import EMBEDDING_DIM
 
 log = logging.getLogger(__name__)
@@ -428,14 +431,50 @@ def _to_text_major(vectors: np.ndarray, n_texts: int) -> np.ndarray:
 
 def l2_normalise(X: np.ndarray) -> np.ndarray:
     """Step 1's L2 normalisation, applied to every embedding on both sides."""
-    norms = np.linalg.norm(X, axis=1, keepdims=True)
-    return (X / np.where(norms < 1e-12, 1.0, norms)).astype(np.float32)
+    X = np.asarray(X, dtype=np.float32)
+    norms = np.sqrt(np.einsum("ij,ij->i", X, X, dtype=np.float32))
+    np.maximum(norms, 1e-12, out=norms)
+    return X / norms[:, None]
+
+
+_DEGENERATE_NORM_TOL = 1e-6   # same tolerance as corrections._renormalize_rows
 
 
 def apply_mode(X: np.ndarray, mode: Correction, mu: np.ndarray | None, mu_hat: np.ndarray | None) -> np.ndarray:
-    """Step 1's raw / R1 / R2, then renormalise. Same mu/u on both sides."""
-    out, _ = apply_correction(X, mode, mu=mu, mu_hat=mu_hat)
-    return l2_normalise(out)
+    """Step 1 in full: L2-normalise, apply raw / R1 / R2, renormalise.
+
+    Same mu / u on both sides -- callers pass headlines and primitive texts
+    through this one function. A row that the transform collapses to ~0
+    (norm < 1e-6, i.e. it was almost entirely the mean component) is zeroed
+    and stays zero, exactly as corrections._renormalize_rows does; it can
+    then never clear the F0 floor.
+
+    This replaces the previous l2_normalise -> apply_correction ->
+    l2_normalise chain (three normalisations, a zeros_like and a masked
+    divide per block, ~25% of the MEAN-arm block) with two norms and in-place
+    division. The arithmetic is the same; only redundant roundings are gone.
+    """
+    X = l2_normalise(X)
+    if mode is Correction.RAW:
+        return X
+    if mode is Correction.R1:
+        if mu is None:
+            raise ValueError("R1 requires mu")
+        X = X - np.asarray(mu, dtype=np.float32)[None, :]
+    elif mode is Correction.R2:
+        if mu_hat is None:
+            raise ValueError("R2 requires mu_hat")
+        u = np.asarray(mu_hat, dtype=np.float32)
+        X = X - (X @ u)[:, None] * u[None, :]
+    else:
+        raise ValueError(f"unknown mode: {mode!r}")
+    norms = np.sqrt(np.einsum("ij,ij->i", X, X, dtype=np.float32))
+    degenerate = norms < _DEGENERATE_NORM_TOL
+    np.maximum(norms, 1e-12, out=norms)
+    X /= norms[:, None]
+    if degenerate.any():
+        X[degenerate] = 0.0
+    return X
 
 
 # ---------------------------------------------------------------------------
@@ -581,6 +620,12 @@ class _DayAccumulator:
         starts = np.flatnonzero(np.r_[True, nid_s[1:] != nid_s[:-1]])
         np.maximum.at(self.peak, nid_s[starts], np.maximum.reduceat(val_s, starts))
 
+    def add_arrays(self, count: np.ndarray, total: np.ndarray, peak: np.ndarray) -> None:
+        """Fold in accumulators the fused kernel already reduced across threads."""
+        self.count += count
+        self.total += total
+        np.maximum(self.peak, peak, out=self.peak)
+
     def frame(self, nodes: pl.DataFrame, day: date) -> pl.DataFrame:
         has = self.count > 0
         return nodes.with_columns(
@@ -688,6 +733,39 @@ def _stream_month(
         conn.close()
 
 
+_EPOCH = date(1970, 1, 1)
+
+
+def _prefetch(iterator: Iterator[Any], depth: int = 2) -> Iterator[Any]:
+    """Run an iterator on a background thread with a bounded queue.
+
+    DuckDB releases the GIL while producing batches, so the next month's
+    join + Arrow->polars conversion overlaps with scoring the current batch
+    instead of stalling it (~30% of a MEAN-arm block was spent waiting here).
+    Exceptions on the producer propagate to the consumer.
+    """
+    q: queue.Queue = queue.Queue(maxsize=depth)
+    done = object()
+
+    def run() -> None:
+        try:
+            for item in iterator:
+                q.put(item)
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the consumer side
+            q.put(exc)
+        finally:
+            q.put(done)
+
+    threading.Thread(target=run, daemon=True, name="stream-prefetch").start()
+    while True:
+        item = q.get()
+        if item is done:
+            return
+        if isinstance(item, BaseException):
+            raise item
+        yield item
+
+
 def _months(start: date, end: date) -> list[tuple[int, int]]:
     out, y, m = [], start.year, start.month
     while (y, m) <= (end.year, end.month):
@@ -717,9 +795,14 @@ def calibrate_tau(
     cap: int = 2_000_000, batch_size: int = 50_000, score_block: int = 8_192,
     threads: int = 8, seed: int = 0, duckdb_memory_limit: str = "6GB",
     temp_directory: str | None = "/tmp/duckdb_spill",
+    scorer: Callable[[np.ndarray], np.ndarray] | None = None,
 ) -> tuple[float, float, float, int]:
     """F0 tau for one (mode, pooling). Thresholds do not transfer across either
-    axis, so this is refit per combination (spec check 7)."""
+    axis, so this is refit per combination (spec check 7).
+
+    ``scorer`` optionally replaces steps 1-2 (embeddings block -> pooled
+    primitive scores), e.g. with ``gpu_scoring.GpuScorer.score``; the default
+    is the CPU path and is unchanged."""
     P_scoring = build_scoring_matrix(P, table, cfg, mu, mu_hat)
     reps = (
         P_scoring if cfg.paraphrase_pooling is PoolRule.MEAN
@@ -740,8 +823,11 @@ def calibrate_tau(
         ):
             X = batch["EMBEDDING"].to_numpy()
             for i in range(0, X.shape[0], score_block):
-                H = apply_mode(l2_normalise(X[i:i + score_block]), cfg.mode, mu, mu_hat)
-                S = primitive_scores(H, P_scoring, table, cfg.paraphrase_pooling)
+                if scorer is None:
+                    H = apply_mode(X[i:i + score_block], cfg.mode, mu, mu_hat)
+                    S = primitive_scores(H, P_scoring, table, cfg.paraphrase_pooling)
+                else:
+                    S = scorer(X[i:i + score_block])
                 pool.add(trim_null_draws_batch(S, trim_frac=cfg.trim_frac).ravel())
                 del H, S
             del X, batch
@@ -767,6 +853,28 @@ class _VariantState:
         self.narr: dict[date, _DayAccumulator] = {}
         self.prim: dict[date, _DayAccumulator] = {}
         self.acct = NaNAccounting()
+
+    def add_kernel_block(self, day: date, n_head: int, n_scores: int,
+                         count: np.ndarray, total: np.ndarray, peak: np.ndarray,
+                         n_unassigned: int, n_kept: int, n_floored: int) -> None:
+        """Same bookkeeping as add_block, for the fused-kernel path.
+
+        The kernel returns per-narrative accumulators directly, so the sparse
+        triplets never materialize. primitive_daily is unavailable on this path
+        by construction -- it is diagnostics only (ruling R1) and the numpy path
+        remains available when it is wanted.
+        """
+        a = self.acct
+        a.n_scores += n_scores
+        a.n_nan_f0 += n_floored
+        a.n_nan_pct += n_scores - n_floored - n_kept
+        a.n_headlines += n_head
+        a.n_unassigned += n_unassigned
+
+        na = self.narr.setdefault(day, _DayAccumulator(self.n_narr))
+        na.n_headlines += n_head
+        na.n_unassigned += n_unassigned
+        na.add_arrays(count, total, peak)
 
     def add_block(self, day: date, n_head: int, rows: np.ndarray, cols: np.ndarray,
                   vals: np.ndarray, keep: np.ndarray, n_floored: int, n_scores: int,
@@ -794,6 +902,59 @@ class _VariantState:
             pa.add_groups(c.astype(np.int64), v.astype(np.float32), self.n_prim)
 
 
+
+def _assemble_results(
+    state: dict[str, "_VariantState"], variants: list[GateVariant], table: PrimitiveTable,
+    cfg: ScoringConfig, tau: float, n_eff: float, mu_norm: float,
+    keep_primitive_daily: bool, peak_rss: float, start: date, end: date,
+) -> dict[str, SpecResult]:
+    """Turn per-variant accumulators into SpecResults (the day x narrative table).
+
+    Shared by score_grid and the Ray hybrid driver, so a panel assembled from
+    remote partial accumulators is built by exactly the same code.
+    """
+    nodes = table.narrative_frame.select(
+        ["reservoir", "dimension", "narrative", "pole", "narrative_key", "n_primitives"])
+    prim_nodes = table.frame.select(
+        ["reservoir", "dimension", "narrative", "pole", "sub_mechanism",
+         "observability_channel", "primitive"])
+
+    out: dict[str, SpecResult] = {}
+    for v in variants:
+        st = state[v.key]
+        if not st.narr:
+            raise RuntimeError(f"no headlines in [{start}, {end}] for variant {v.key}")
+        ordered = sorted(st.narr)
+        md = RunMetadata(
+            mode=cfg.mode.value, mu_norm=mu_norm, tau=float(tau), n_eff=float(n_eff),
+            q=(v.q if v.legacy_rel_floor is None else float("nan")),
+            percentile_axis=(v.axis.value if v.legacy_rel_floor is None else "n/a"),
+            paraphrase_pooling=cfg.paraphrase_pooling.value,
+            narrative_agg=cfg.narrative_agg.value,
+            taxonomy_sha1=table.taxonomy_sha1, paraphrase_sha1=table.paraphrase_sha1,
+            alpha=cfg.alpha, trim_frac=cfg.trim_frac, include_master=cfg.include_master,
+            legacy_rel_floor=v.legacy_rel_floor,
+            n_primitive_texts=len(table.texts), k_paraphrases=table.k_paraphrases,
+        )
+        out[v.key] = SpecResult(
+            narrative_daily=pl.concat([st.narr[d].frame(nodes, d) for d in ordered]).select(
+                ["DATE", "reservoir", "dimension", "narrative", "pole",
+                 "SUPPORT", "INTENSITY", "TOTAL", "PEAK", "narrative_key", "n_primitives"]),
+            primitive_daily=(
+                pl.concat([st.prim[d].frame(prim_nodes, d) for d in ordered])
+                if (keep_primitive_daily and st.prim) else None
+            ),
+            metadata=md, nan_accounting=st.acct.to_dict(),
+            day_diagnostics=pl.DataFrame([{
+                "DATE": d, "n_headlines": st.narr[d].n_headlines,
+                "n_unassigned": st.narr[d].n_unassigned,
+                "unassigned_share": st.narr[d].n_unassigned / max(st.narr[d].n_headlines, 1),
+                "narratives_touched": int((st.narr[d].count > 0).sum()),
+            } for d in ordered]),
+            n_days=len(ordered), peak_rss_gb=peak_rss, variant=v.key,
+        )
+    return out
+
 def score_grid(
     headlines_dir: Path, embeddings_dir: Path, P: np.ndarray, table: PrimitiveTable,
     cfg: ScoringConfig, mu: np.ndarray | None, mu_hat: np.ndarray | None,
@@ -802,6 +963,8 @@ def score_grid(
     keep_primitive_daily: bool = True, batch_size: int = 50_000, score_block: int = 8_192,
     threads: int = 8, duckdb_memory_limit: str = "6GB",
     temp_directory: str | None = "/tmp/duckdb_spill", rss_budget_gb: float | None = 30.0,
+    use_fused_kernel: bool | None = None,
+    scorer: Callable[[np.ndarray], np.ndarray] | None = None,
 ) -> dict[str, SpecResult]:
     """Run steps 1-5 once per (mode, pooling) and emit EVERY (q, axis) variant.
 
@@ -818,9 +981,43 @@ def score_grid(
     prim_to_narr = table.primitive_to_narrative
     n_narr, n_prim = table.narrative_frame.height, table.n_primitives
 
+    if use_fused_kernel is None:
+        # The kernel returns narrative accumulators already reduced, so it
+        # cannot also produce the primitive-grain panel. That panel is
+        # diagnostics only (ruling R1), so asking for it selects the numpy path
+        # rather than silently yielding an empty one.
+        use_fused_kernel = HAVE_FUSED and not keep_primitive_daily
+    elif use_fused_kernel:
+        if not HAVE_FUSED:
+            raise RuntimeError(
+                "use_fused_kernel=True but the compiled kernel is unavailable; "
+                "build it with `python -m narrative_scoring._kernels.build`"
+            )
+        if keep_primitive_daily:
+            raise ValueError(
+                "use_fused_kernel=True is incompatible with keep_primitive_daily=True: "
+                "the kernel reduces to narrative grain in-pass. Set one or the other."
+            )
+
     row_variants = [v for v in variants if v.legacy_rel_floor is None and v.axis is PctAxis.ROW_WISE]
     global_variants = [v for v in variants if v.legacy_rel_floor is None and v.axis is PctAxis.GLOBAL]
     legacy_variants = [v for v in variants if v.legacy_rel_floor is not None]
+
+    row_qs = np.array([v.q for v in row_variants], dtype=np.float64)
+
+    # The F0 floor is applied in the SCORE's precision. tau arrives as a Python
+    # float; under NEP 50 numpy would cast it to float32 anyway for `S >= tau`,
+    # but the compiled kernel would otherwise compare in double, and the two
+    # disagree on any score exactly equal to float32(tau) whenever tau rounds
+    # down (0.1697 does; 0.2705 happens not to). Casting once here makes both
+    # paths compare float32 against float32, explicitly, with no reliance on
+    # promotion rules. Recorded as-applied in RunMetadata.tau.
+    tau = float(np.float32(tau))
+    log.info(
+        "scoring path: %s (%d row-wise, %d global, %d legacy variant(s))",
+        "fused kernel" if use_fused_kernel else "numpy",
+        len(row_variants), len(global_variants), len(legacy_variants),
+    )
 
     state = {
         v.key: _VariantState(n_narr, n_prim, keep_primitive_daily, prim_to_narr, cfg.narrative_agg)
@@ -836,30 +1033,62 @@ def score_grid(
             continue
         buffered: dict[date, list[tuple]] = {}
 
-        for batch in _stream_month(
+        for batch in _prefetch(_stream_month(
             hl, emb, batch_size=batch_size, threads=threads,
             duckdb_memory_limit=duckdb_memory_limit, temp_directory=temp_directory,
             day_lo=start, day_hi=end,
-        ):
-            days = batch["TIMESTAMP_UTC"].str.slice(0, 10).str.to_date().to_list()
-            day_ord = np.fromiter((d.toordinal() for d in days), dtype=np.int64, count=len(days))
-            X = batch["EMBEDDING"].to_numpy()
+        )):
+            # Days since epoch straight from polars (no per-row Python), then
+            # one stable argsort so each day is a contiguous slice instead of a
+            # full-length boolean mask per day.
+            day_ord = (batch["TIMESTAMP_UTC"].str.slice(0, 10).str.to_date()
+                       .cast(pl.Int32).to_numpy())
+            order = np.argsort(day_ord, kind="stable")
+            day_ord = day_ord[order]
+            X = batch["EMBEDDING"].to_numpy()[order]
+            starts = np.flatnonzero(np.r_[True, day_ord[1:] != day_ord[:-1]])
+            ends = np.r_[starts[1:], day_ord.shape[0]]
 
-            for ordv in np.unique(day_ord):
-                day = date.fromordinal(int(ordv))
-                Xi = X[day_ord == ordv]
+            for a, b_ in zip(starts, ends):
+                day = _EPOCH + timedelta(days=int(day_ord[a]))
+                Xi = X[a:b_]
                 for i in range(0, Xi.shape[0], score_block):
-                    H = apply_mode(l2_normalise(Xi[i:i + score_block]), cfg.mode, mu, mu_hat)
-                    S = primitive_scores(H, P_scoring, table, cfg.paraphrase_pooling)
+                    if scorer is None:
+                        H = apply_mode(Xi[i:i + score_block], cfg.mode, mu, mu_hat)
+                        S = primitive_scores(H, P_scoring, table, cfg.paraphrase_pooling)
+                    else:
+                        S = scorer(Xi[i:i + score_block])   # e.g. GPU steps 1-2
                     n_head, n_scores = S.shape[0], S.size
                     offset = day_rows.get(day, 0)
-                    rows, cols, vals, n_floored, n_surv = survivors(S, tau)
+                    # The fused kernel does steps 3-5 for every row-wise q in one
+                    # pass (28.7x the numpy chain, measured). It returns the
+                    # narrative accumulators already reduced, so the sparse
+                    # triplets are only built when something else needs them:
+                    # the global axis, the legacy arm, or primitive_daily.
+                    need_triplets = (
+                        bool(global_variants) or bool(legacy_variants)
+                        or keep_primitive_daily or not use_fused_kernel
+                    )
+                    rows = cols = vals = n_surv = None
+                    n_floored = 0
+                    if need_triplets:
+                        rows, cols, vals, n_floored, n_surv = survivors(S, tau)
 
-                    for v in row_variants:
-                        thr = kth_largest_threshold(S, n_surv, v.q)
-                        state[v.key].add_block(
-                            day, n_head, rows, cols, vals, vals >= thr[rows],
-                            n_floored, n_scores, offset)
+                    if use_fused_kernel and row_variants:
+                        kres = gate_aggregate_rowwise(
+                            np.ascontiguousarray(S), float(tau), row_qs,
+                            prim_to_narr, n_narr, cfg.narrative_agg is AggRule.MEDIAN,
+                            threads,
+                        )
+                        for v, (kc, kt, kp, kunass, kkept, kfl) in zip(row_variants, kres):
+                            state[v.key].add_kernel_block(
+                                day, n_head, n_scores, kc, kt, kp, kunass, kkept, kfl)
+                    else:
+                        for v in row_variants:
+                            thr = kth_largest_threshold(S, n_surv, v.q)
+                            state[v.key].add_block(
+                                day, n_head, rows, cols, vals, vals >= thr[rows],
+                                n_floored, n_scores, offset)
 
                     for v in legacy_variants:
                         s_max = S.max(axis=1, keepdims=True)
@@ -898,45 +1127,8 @@ def score_grid(
         log.info("scored %s [%s/%s] RSS %.2f GB", name, cfg.mode.value,
                  cfg.paraphrase_pooling.value, current)
 
-    nodes = table.narrative_frame.select(
-        ["reservoir", "dimension", "narrative", "pole", "narrative_key", "n_primitives"])
-    prim_nodes = table.frame.select(
-        ["reservoir", "dimension", "narrative", "pole", "sub_mechanism",
-         "observability_channel", "primitive"])
-
-    out: dict[str, SpecResult] = {}
-    for v in variants:
-        st = state[v.key]
-        if not st.narr:
-            raise RuntimeError(f"no headlines in [{start}, {end}] for variant {v.key}")
-        ordered = sorted(st.narr)
-        md = RunMetadata(
-            mode=cfg.mode.value, mu_norm=mu_norm, tau=float(tau), n_eff=float(n_eff),
-            q=(v.q if v.legacy_rel_floor is None else float("nan")),
-            percentile_axis=(v.axis.value if v.legacy_rel_floor is None else "n/a"),
-            paraphrase_pooling=cfg.paraphrase_pooling.value,
-            narrative_agg=cfg.narrative_agg.value,
-            taxonomy_sha1=table.taxonomy_sha1, paraphrase_sha1=table.paraphrase_sha1,
-            alpha=cfg.alpha, trim_frac=cfg.trim_frac, include_master=cfg.include_master,
-            legacy_rel_floor=v.legacy_rel_floor,
-            n_primitive_texts=len(table.texts), k_paraphrases=table.k_paraphrases,
-        )
-        out[v.key] = SpecResult(
-            narrative_daily=pl.concat([st.narr[d].frame(nodes, d) for d in ordered]).select(
-                ["DATE", "reservoir", "dimension", "narrative", "pole",
-                 "SUPPORT", "INTENSITY", "TOTAL", "PEAK", "narrative_key", "n_primitives"]),
-            primitive_daily=(pl.concat([st.prim[d].frame(prim_nodes, d) for d in ordered])
-                             if keep_primitive_daily else None),
-            metadata=md, nan_accounting=st.acct.to_dict(),
-            day_diagnostics=pl.DataFrame([{
-                "DATE": d, "n_headlines": st.narr[d].n_headlines,
-                "n_unassigned": st.narr[d].n_unassigned,
-                "unassigned_share": st.narr[d].n_unassigned / max(st.narr[d].n_headlines, 1),
-                "narratives_touched": int((st.narr[d].count > 0).sum()),
-            } for d in ordered]),
-            n_days=len(ordered), peak_rss_gb=peak_rss, variant=v.key,
-        )
-    return out
+    return _assemble_results(state, variants, table, cfg, tau, n_eff, mu_norm,
+                             keep_primitive_daily, peak_rss, start, end)
 
 
 def summarize(result: SpecResult, extra: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -960,11 +1152,13 @@ def summarize(result: SpecResult, extra: dict[str, Any] | None = None) -> dict[s
     row["mean_intensity_present"] = float(nd["INTENSITY"].drop_nulls().mean() or float("nan"))
     row["narrative_day_rows"] = nd.height
     row["peak_rss_gb"] = result.peak_rss_gb
-    if result.primitive_daily is not None:
-        row["retained_per_headline"] = (
-            float(result.primitive_daily["SUPPORT"].sum())
-            / max(float(diag["n_headlines"].sum()), 1.0)
-        )
+    # Kept (headline, primitive) pairs per headline, from the NaN accounting so
+    # it is available on the fused-kernel path too, which does not build the
+    # primitive-grain panel.
+    acct = result.nan_accounting
+    row["retained_per_headline"] = (
+        acct["share_surviving"] * acct["n_scores"] / max(acct["n_headlines"], 1)
+    )
     row.update(extra or {})
     return row
 

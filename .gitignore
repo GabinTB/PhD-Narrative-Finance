@@ -38,6 +38,9 @@ logs/
 .pytest_cache/
 .ruff_cache/
 
+# Notebook-local disk caches (narrative_scoring.adhoc.cache_path/load_or_compute)
+python/development/narrative_scoring/cache_*/
+
 # Datalake
 # TODO
 
@@ -47,3 +50,10 @@ logs/
 python/datalake/index.db
 python/doc/*
 
+
+# Compiled scoring kernel (built out-of-band: python -m narrative_scoring._kernels.build)
+python/src/narrative_scoring/_kernels/*.so
+python/src/narrative_scoring/_kernels/*.c
+python/src/narrative_scoring/_kernels/*.cpp
+python/src/narrative_scoring/_kernels/build/
+python/build/
