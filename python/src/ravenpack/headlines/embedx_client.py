@@ -48,7 +48,7 @@ class RemoteEmbeddingModel:
 
     Exposes the same ``.encode(texts, batch_size=..., show_progress_bar=...)``
     -> ``np.ndarray`` interface so every caller of the local model (embed.py,
-    narrative_scoring/descriptions.py) works unmodified.
+    narrative_scoring/primitives.py) works unmodified.
     """
 
     def __init__(

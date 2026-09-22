@@ -1,0 +1,165 @@
+"""Command-line entry points for the production scorer.
+
+    uv run python -m narrative_scoring.jobs score    --from 2004-01-01 --to 2004-12-31
+    uv run python -m narrative_scoring.jobs tau-asof [--window 5Y | expanding] [--today ...]
+    uv run python -m narrative_scoring.jobs mark-temp <artifact_id> [...]
+
+``score`` is the one scoring path: it replays the live loop over the dates
+in order (monthly tau_asof job, then the days), enforcing the 1-month delay
+of the mu/tau providers and feeding the f0_monthly_partitions family. A
+start before earliest data + 2 months is shifted forward with a warning.
+``tau-asof`` runs the monthly job on its own (e.g. from a cron at month close).
+``mark-temp`` tags agent-created artifacts TEMP and deprecates them (never deletes).
+
+Paths come from the environment (.env): DATALAKE_ROOT (where the scorer's
+families are written; a sandbox root for agent runs), DATALAKE_UPSTREAM_ROOT
+(optional; where headlines / embeddings / mu_asof are read from when they are
+not under DATALAKE_ROOT), RAW_DATA_PATH, CACHE_PATH.
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+from datetime import date
+from pathlib import Path
+
+from narrative_scoring.config import (
+    ParaphraseStyle,
+    PoolRule,
+    ScoringConfig,
+    SentimentSplit,
+    default_pooling,
+)
+from narrative_scoring.corrections import Correction
+
+log = logging.getLogger("narrative_scoring.jobs")
+
+
+def _env(name: str) -> Path:
+    v = os.environ.get(name)
+    if not v:
+        raise SystemExit(f"{name} is not set (see .env)")
+    return Path(v)
+
+
+def _config(args: argparse.Namespace) -> ScoringConfig:
+    style = ParaphraseStyle(args.style)
+    pooling = PoolRule(args.pooling) if args.pooling else default_pooling(style)
+    return ScoringConfig(
+        mode=Correction(args.mode), paraphrase_style=style, paraphrase_pooling=pooling,
+        q=args.q, jump_cut=args.jump_cut, sentiment_split=SentimentSplit(args.split),
+        min_month_draws=args.min_month_draws, gap_alert_threshold=args.gap_alert_threshold,
+        label=args.label,
+    )
+
+
+def _indexes(args: argparse.Namespace):
+    from datalake import DatalakeIndex
+
+    dl = DatalakeIndex(_env("DATALAKE_ROOT"))
+    up = os.environ.get("DATALAKE_UPSTREAM_ROOT")
+    upstream = DatalakeIndex(up, create=False) if up else dl
+    return dl, upstream
+
+
+def _table_and_embeddings(args: argparse.Namespace):
+    from narrative_scoring.primitives import embed_primitive_texts, load_primitive_table
+
+    root = _env("RAW_DATA_PATH") / "Narrative_Taxonomy"
+    table = load_primitive_table(root, args.taxonomy, args.style)
+    cache = (Path(args.embedding_cache) if args.embedding_cache
+             else _env("CACHE_PATH") / "narrative_scoring")
+    return table, embed_primitive_texts(table, cache, device=args.device)
+
+
+def cmd_score(args: argparse.Namespace) -> int:
+    from narrative_scoring.artifacts import headline_source, score_range_to_datalake
+
+    dl, upstream = _indexes(args)
+    config = _config(args)
+    table, P = _table_and_embeddings(args)
+    source = headline_source(upstream, chunk_size=args.chunk_size, threads=args.threads)
+    summary = score_range_to_datalake(
+        dl, date.fromisoformat(args.start), date.fromisoformat(args.end), config,
+        table=table, P=P, upstream=upstream, source=source, window=args.window,
+        seed=args.seed, threads=args.threads, rss_budget_gb=args.rss_budget_gb,
+        temp=args.temp, label=args.label)
+    for k in ("start", "end", "n_days_scored", "n_days_null_only", "peak_rss_gb",
+              "months_finalised", "narrative_daily_id", "day_diagnostics_id",
+              "partitions_id", "tau_asof_id"):
+        print(f"{k}={summary[k]}")
+    return 0
+
+
+def cmd_tau_asof(args: argparse.Namespace) -> int:
+    from narrative_scoring.artifacts import build_tau_asof
+
+    dl, upstream = _indexes(args)
+    config = _config(args)
+    table, P = _table_and_embeddings(args)
+    art = build_tau_asof(dl, config, table, P, upstream=upstream, window=args.window,
+                         seed=args.seed, rebuild=args.rebuild, temp=args.temp,
+                         today=date.fromisoformat(args.today) if args.today else None)
+    print(art.artifact_id if art else "no partition old enough yet")
+    return 0
+
+
+def cmd_mark_temp(args: argparse.Namespace) -> int:
+    from narrative_scoring.artifacts import mark_temp_deprecated
+
+    dl, _ = _indexes(args)
+    for aid in args.artifact_ids:
+        art = mark_temp_deprecated(dl, aid, args.reason)
+        print(f"{art.artifact_id}: deprecated={art.deprecated} "
+              f"agent_created={art.meta.hyperparams.get('agent_created')}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    from dotenv import find_dotenv, load_dotenv
+
+    load_dotenv(find_dotenv(usecwd=True))
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--taxonomy", default="Evergreen_v5")
+    common.add_argument("--style", default="headline", choices=[s.value for s in ParaphraseStyle])
+    common.add_argument("--mode", default="r2", choices=[m.value for m in Correction])
+    common.add_argument("--pooling", default=None, choices=[p.value for p in PoolRule])
+    common.add_argument("--q", type=float, default=0.99)
+    common.add_argument("--jump-cut", action="store_true")
+    common.add_argument("--split", default="none", choices=[s.value for s in SentimentSplit])
+    common.add_argument("--min-month-draws", type=int, default=20_000_000)
+    common.add_argument("--gap-alert-threshold", type=float, default=0.05)
+    common.add_argument("--label", default="")
+    common.add_argument("--device", default="embedx")
+    common.add_argument("--embedding-cache", default=None)
+    common.add_argument("--threads", type=int, default=8)
+    common.add_argument("--chunk-size", type=int, default=8_192)
+    common.add_argument("--rss-budget-gb", type=float, default=30.0)
+    common.add_argument("--window", default="5Y")
+    common.add_argument("--seed", type=int, default=0)
+    common.add_argument("--temp", action="store_true",
+                        help="mark everything registered as agent-created / TEMP")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("score", parents=[common])
+    p.add_argument("--from", dest="start", required=True)
+    p.add_argument("--to", dest="end", required=True)
+    p.set_defaults(fn=cmd_score)
+    p = sub.add_parser("tau-asof", parents=[common])
+    p.add_argument("--rebuild", action="store_true")
+    p.add_argument("--today", default=None)
+    p.set_defaults(fn=cmd_tau_asof)
+    p = sub.add_parser("mark-temp")
+    p.add_argument("artifact_ids", nargs="+")
+    p.add_argument("--reason", default="superseded by owner run")
+    p.set_defaults(fn=cmd_mark_temp)
+    args = ap.parse_args(argv)
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

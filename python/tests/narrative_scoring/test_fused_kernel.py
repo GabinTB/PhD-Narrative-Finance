@@ -18,7 +18,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from narrative_scoring._kernels import HAVE_FUSED, gate_aggregate_rowwise
+pytest.skip(
+    "Ray/GPU track suspended; canonical scorer is narrative_scoring.pipeline.score_dates",
+    allow_module_level=True,
+)
+from narrative_scoring._kernels import HAVE_FUSED, gate_aggregate_rowwise  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not HAVE_FUSED, reason="fused kernel not built")
 

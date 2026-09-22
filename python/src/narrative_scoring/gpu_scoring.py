@@ -22,7 +22,10 @@ import numpy as np
 
 from narrative_scoring.corrections import Correction
 from narrative_scoring.schema import EMBEDDING_DIM
-from narrative_scoring.spec_pipeline import PoolRule, _DEGENERATE_NORM_TOL
+
+# The spec_pipeline module this track was built on has been removed.
+raise NotImplementedError("Ray/GPU track suspended; canonical scorer is "
+                          "narrative_scoring.pipeline.score_dates")
 
 
 def _torch():

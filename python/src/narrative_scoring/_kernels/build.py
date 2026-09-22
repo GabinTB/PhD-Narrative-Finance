@@ -1,4 +1,4 @@
-"""Build the fused scoring kernel in place.
+"""Build the compiled scoring kernels in place.
 
     uv run python -m narrative_scoring._kernels.build
 
@@ -30,9 +30,9 @@ def _openmp_available(cc: str) -> bool:
 
 def main() -> int:
     try:
+        import numpy as np
         from Cython.Build import cythonize
         from setuptools import Extension, setup
-        import numpy as np
     except ImportError as exc:
         print(f"cannot build: {exc}", file=sys.stderr)
         return 1
@@ -54,19 +54,22 @@ def main() -> int:
     else:
         print("OpenMP not available; building single-threaded", file=sys.stderr)
 
-    ext = Extension(
-        "narrative_scoring._kernels.fused_gate",
-        sources=[str(HERE / "fused_gate.pyx")],
-        include_dirs=[np.get_include()],
-        language="c++",
-        extra_compile_args=flags + ["-std=c++17"],
-        extra_link_args=link,
-        define_macros=[("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")],
-    )
+    exts = [
+        Extension(
+            f"narrative_scoring._kernels.{stem}",
+            sources=[str(HERE / f"{stem}.pyx")],
+            include_dirs=[np.get_include()],
+            language="c++",
+            extra_compile_args=flags + ["-std=c++17"],
+            extra_link_args=link,
+            define_macros=[("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")],
+        )
+        for stem in ("select_aggregate", "fused_gate")
+    ]
     sys.argv = [sys.argv[0], "build_ext", "--inplace"]
     setup(
         name="narrative_scoring_kernels",
-        ext_modules=cythonize([ext], language_level=3, quiet=True),
+        ext_modules=cythonize(exts, language_level=3, quiet=True),
         script_args=["build_ext", "--inplace"],
         options={"build_ext": {"build_lib": str(HERE.parent.parent)}},
     )

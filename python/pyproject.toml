@@ -43,8 +43,10 @@ ravenpack_headlines = "ravenpack.headlines.ingest:verify_artifact"
 canonical_narratives = "ravenpack.headlines.ingest:verify_canonical"
 headline_embeddings = "ravenpack.headlines.embed:verify_artifact"
 mu_asof = "ravenpack.headlines.mu_asof:verify_artifact"
-taxonomy_embeddings = "narrative_scoring.descriptions:verify_artifact"
-primitive_scores = "narrative_scoring.scoring:verify_artifact"
+f0_monthly_partitions = "narrative_scoring.artifacts:verify_partitions"
+tau_asof = "narrative_scoring.artifacts:verify_tau_asof"
+narrative_daily = "narrative_scoring.artifacts:verify_narrative_daily"
+day_diagnostics = "narrative_scoring.artifacts:verify_day_diagnostics"
 
 [build-system]
 requires      = ["hatchling"]

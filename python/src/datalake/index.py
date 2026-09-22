@@ -535,6 +535,25 @@ class DatalakeIndex:
         write_sidecars(artifact.path, artifact.meta, file_hashes)
         log.info("deprecated %s: %s", artifact_id, reason)
 
+    def annotate(self, artifact_id: str, notes: str) -> Artifact:
+        """Append a note to an existing artifact's metadata (sidecars + index row rewritten).
+
+        Only ``notes`` can be added after the fact: the artifact id is derived
+        from the hyperparameters, so those are frozen at creation. Files are
+        never touched.
+        """
+        artifact = self.get(artifact_id)
+        artifact.meta.notes = (
+            f"{artifact.meta.notes} {notes}".strip() if artifact.meta.notes else notes
+        )
+        try:
+            _, file_hashes = read_meta(artifact.path)
+        except FileNotFoundError:
+            file_hashes = {}
+        self._upsert(artifact.meta, artifact.layer, artifact.path, file_hashes)
+        write_sidecars(artifact.path, artifact.meta, file_hashes)
+        return self.get(artifact_id)
+
     # -- reindex -----------------------------------------------------------
 
     def reindex(self) -> int:

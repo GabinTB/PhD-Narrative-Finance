@@ -57,3 +57,5 @@ Once this step is completed, the environment is ready to use.
 Some notebooks or chapter-specific experiments may rely on additional libraries that are not part of the core codebase. These dependencies are installed locally within the corresponding notebooks or scripts when needed and are intentionally not included in the global requirements to keep the core environment minimal and stable.
 
 After initializing the development environment, you can directly run the code, scripts, and notebooks in this repository.
+
+Note: the v1 narrative-scoring notebooks under `python/development/narrative_scoring/` reference modules that were removed when the canonical scorer (`narrative_scoring.pipeline`) replaced them; they are retained as experiments only and are not expected to run.

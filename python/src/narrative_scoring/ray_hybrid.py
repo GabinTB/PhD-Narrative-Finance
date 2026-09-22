@@ -44,7 +44,9 @@ from typing import Any, Iterator
 import numpy as np
 import polars as pl
 
-from narrative_scoring import spec_pipeline as sp
+# The spec_pipeline module this track was built on has been removed.
+raise NotImplementedError("Ray/GPU track suspended; canonical scorer is "
+                          "narrative_scoring.pipeline.score_dates")
 from narrative_scoring.corrections import Correction
 
 log = logging.getLogger(__name__)

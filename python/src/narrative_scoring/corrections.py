@@ -78,3 +78,53 @@ def apply_correction(
         return _renormalize_rows(X_tilde)
 
     raise ValueError(f"unknown correction: {correction!r}")
+
+
+def l2_normalise(X: np.ndarray) -> np.ndarray:
+    """Row-wise L2 normalisation to float32. Never mutates its input.
+
+    A zero row stays zero (its norm is clamped to 1e-12 rather than divided
+    through), so no NaN can be produced here.
+    """
+    X = np.asarray(X, dtype=np.float32)
+    norms = np.sqrt(np.einsum("ij,ij->i", X, X, dtype=np.float32))
+    np.maximum(norms, 1e-12, out=norms)
+    return X / norms[:, None]
+
+
+def apply_mode(
+    X: np.ndarray,
+    mode: Correction,
+    mu: np.ndarray | None,
+    mu_hat: np.ndarray | None,
+) -> np.ndarray:
+    """Step 1 in full: L2-normalise, apply raw / R1 / R2, renormalise.
+
+    This is the scoring hot path's version of :func:`apply_correction`: same
+    arithmetic and the same degenerate-row rule (a row whose corrected norm is
+    below 1e-6 is zeroed, so it can never clear the F0 floor), but with two
+    norm passes instead of three and no intermediate copies. ``X`` is never
+    mutated. Callers apply it to headlines and to primitive texts with the
+    SAME ``mu``/``mu_hat`` (the consistency rule in this module's docstring).
+    """
+    X = l2_normalise(X)
+    if mode is Correction.RAW:
+        return X
+    if mode is Correction.R1:
+        if mu is None:
+            raise ValueError("R1 correction requires mu")
+        X = X - np.asarray(mu, dtype=np.float32)[None, :]
+    elif mode is Correction.R2:
+        if mu_hat is None:
+            raise ValueError("R2 correction requires mu_hat")
+        u = np.asarray(mu_hat, dtype=np.float32)
+        X = X - (X @ u)[:, None] * u[None, :]
+    else:
+        raise ValueError(f"unknown correction: {mode!r}")
+    norms = np.sqrt(np.einsum("ij,ij->i", X, X, dtype=np.float32))
+    degenerate = norms < _DEGENERATE_NORM_TOL
+    np.maximum(norms, 1e-12, out=norms)
+    X /= norms[:, None]
+    if degenerate.any():
+        X[degenerate] = 0.0
+    return X
