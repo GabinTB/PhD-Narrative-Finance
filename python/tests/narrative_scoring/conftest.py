@@ -16,7 +16,8 @@ TAX_NAME = "Toy_v1"
 
 
 def _path_id(row: dict[str, str]) -> str:
-    return hashlib.sha1("/".join(row[c] for c in PATH_FIELDS).encode()).hexdigest()
+    """The authoring notebook's id: sha1 of the fixed 7-field path, missing field = ""."""
+    return hashlib.sha1("/".join(row.get(c, "") for c in PATH_FIELDS).encode()).hexdigest()
 
 
 def toy_rows() -> list[dict[str, str]]:
@@ -29,7 +30,6 @@ def toy_rows() -> list[dict[str, str]]:
             "TOPIC": topic, "GROUP": group, "TYPE": typ, "SUB_TYPE": sub, "CATEGORY": cat,
             "ROLE": role, "OBSERVABILITY_CHANNEL": chan, "DISPLAY_NAME": name,
             "DESCRIPTION": f"desc {name}", "SCHEDULED": "", "VALID_ENTITY_TYPES": "", "TAGS": "",
-            "POLARITY": sub,
         })
 
     add("macro", "funding", "liquidity", "stress", "interbank", "market", "m-liq-stress-ib")
@@ -44,19 +44,28 @@ def toy_rows() -> list[dict[str, str]]:
 
 
 def write_toy_taxonomy(root: Path, k: int = 2, style: str = "headline",
-                       rows: list[dict[str, str]] | None = None) -> Path:
+                       rows: list[dict[str, str]] | None = None, name: str = TAX_NAME,
+                       styles: tuple[str, ...] | None = None) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     rows = rows or toy_rows()
-    pl.DataFrame(rows).write_csv(root / f"{TAX_NAME}_taxonomy.authored.csv")
-    records = [
-        {"id": _path_id(r), "display_name": r["DISPLAY_NAME"],
-         "master": f"master {r['DISPLAY_NAME']}",
-         "paraphrases": [f"{r['DISPLAY_NAME']} para {i}" for i in range(k)]}
-        for r in rows
-    ]
-    (root / f"{TAX_NAME}-primitive_{style}_paraphrases.jsonl").write_text(
-        "\n".join(json.dumps(r) for r in records) + "\n")
+    pl.DataFrame(rows).write_csv(root / f"{name}_taxonomy.authored.csv")
+    for st in styles or (style,):
+        records = [
+            {"id": _path_id(r), "display_name": r["DISPLAY_NAME"],
+             "master": f"master {r['DISPLAY_NAME']}",
+             "paraphrases": [f"{r['DISPLAY_NAME']} para {i}" if st == "headline"
+                             else f"{r['DISPLAY_NAME']} {st} para {i}" for i in range(k)]}
+            for r in rows
+        ]
+        (root / f"{name}-primitive_{st}_paraphrases.jsonl").write_text(
+            "\n".join(json.dumps(r) for r in records) + "\n")
     return root
+
+
+def vendor_rows() -> list[dict[str, str]]:
+    """RavenPack-like rows: no OBSERVABILITY_CHANNEL column at all."""
+    return [{k: v for k, v in r.items() if k != "OBSERVABILITY_CHANNEL"}
+            for r in toy_rows() if r["OBSERVABILITY_CHANNEL"] in ("market", "corporate", "event")]
 
 
 @pytest.fixture

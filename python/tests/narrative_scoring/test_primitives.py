@@ -20,7 +20,7 @@ from narrative_scoring.primitives import (
 )
 from narrative_scoring.schema import EMBEDDING_DIM
 
-from .conftest import TAX_NAME, toy_rows, unit_rows, write_toy_taxonomy
+from .conftest import TAX_NAME, toy_rows, unit_rows, vendor_rows, write_toy_taxonomy
 
 
 class TestLoad:
@@ -97,26 +97,59 @@ class TestLoad:
 
 
 class TestChecks:
-    def test_sanity_checks_pass(self, toy_table, toy_root):
-        checks = sanity_checks(toy_table, toy_root)
+    def test_sanity_checks_pass(self, toy_table):
+        checks = sanity_checks(toy_table)
         res = dict(zip(checks["check"].to_list(), checks["result"].to_list()))
         assert res["1. primitive key uniqueness"] == "PASS"
-        assert res["5. polarity coherence"] == "PASS"
         assert res["6. bipolar mirror presence"] == "REVIEW"
-
-    def test_polarity_incoherence_detected(self, tmp_path: Path, ):
-        rows = toy_rows()
-        rows[0]["POLARITY"] = "easing"          # SUB_TYPE stays 'stress'
-        root = write_toy_taxonomy(tmp_path / "t", rows=rows)
-        table = load_primitive_table(root, TAX_NAME, "headline")
-        checks = sanity_checks(table, root)
-        res = dict(zip(checks["check"].to_list(), checks["result"].to_list()))
-        assert res["5. polarity coherence"] == "FAIL"
+        assert not any(c.startswith("5.") for c in res)          # polarity check removed
 
     def test_orphan_pole_candidates(self, toy_table):
         orphans = orphan_pole_candidates(toy_table)
         # macro|funding has stress + easing (a pair); firm|balance-sheet has only stress
         assert orphans.select(["reservoir", "dimension"]).rows() == [("firm", "balance-sheet")]
+
+
+class TestVendorSchema:
+    def test_non_vendor_columns_are_dropped(self, tmp_path: Path):
+        rows = [{**r, "POLARITY": r["SUB_TYPE"], "EXTRA": "x"} for r in toy_rows()]
+        root = write_toy_taxonomy(tmp_path / "t", rows=rows)
+        table = load_primitive_table(root, TAX_NAME, "headline")
+        assert "POLARITY" not in table.frame.columns and "EXTRA" not in table.frame.columns
+        assert table.n_primitives == 8 and table.has_observability_channel
+
+    def test_missing_channel_is_empty_segment(self, tmp_path: Path):
+        rows = vendor_rows()
+        assert "OBSERVABILITY_CHANNEL" not in rows[0]
+        root = write_toy_taxonomy(tmp_path / "t", rows=rows)       # ids: 7 fields, channel ""
+        table = load_primitive_table(root, TAX_NAME, "headline")
+        assert table.n_primitives == len(rows)
+        assert not table.has_observability_channel
+        assert table.frame["observability_channel"].unique().to_list() == [""]
+        assert "observability_channel" in table.primitive_nodes.columns
+
+    def test_six_field_ids_do_not_join(self, tmp_path: Path):
+        """The pre-fix vendor ids (channel segment dropped, no trailing '/') must fail loudly."""
+        import hashlib
+
+        from narrative_scoring.primitives import PATH_FIELDS
+
+        rows = vendor_rows()
+        root = write_toy_taxonomy(tmp_path / "t", rows=rows)
+        p = root / f"{TAX_NAME}-primitive_headline_paraphrases.jsonl"
+        recs = [json.loads(line) for line in p.read_text().splitlines()]
+        for rec, r in zip(recs, rows):
+            six = "/".join(r[c] for c in PATH_FIELDS if c in r)
+            rec["id"] = hashlib.sha1(six.encode()).hexdigest()
+        p.write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+        with pytest.raises(ValueError, match="bijection"):
+            load_primitive_table(root, TAX_NAME, "headline")
+
+    def test_required_column_missing_raises(self, tmp_path: Path):
+        rows = [{k: v for k, v in r.items() if k != "TYPE"} for r in toy_rows()]
+        root = write_toy_taxonomy(tmp_path / "t", rows=rows)
+        with pytest.raises(ValueError, match="lacks column"):
+            load_primitive_table(root, TAX_NAME, "headline")
 
 
 class TestScoringMatrix:

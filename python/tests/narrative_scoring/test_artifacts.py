@@ -205,3 +205,67 @@ def test_latest_matching_and_missing(lake, toy_table, cfg):
     P = np.zeros((toy_table.n_primitives * toy_table.n_texts, EMBEDDING_DIM), np.float32)
     assert A.build_tau_asof(lake, cfg, toy_table, P) is None
     assert A.earliest_headline_day(lake.latest(A.KIND_HEADLINES)) == EARLIEST
+
+
+class TestTaxonomyRegistration:
+    def _write(self, tmp_path, name, rows=None):
+        from .conftest import write_toy_taxonomy
+
+        return write_toy_taxonomy(tmp_path / "src", name=name, rows=rows,
+                                  styles=("headline", "semantic"))
+
+    def test_register_resolve_load_and_idempotent(self, lake, tmp_path):
+        from .conftest import vendor_rows
+
+        src = self._write(tmp_path, "Ever")
+        self._write(tmp_path, "Vendor", rows=vendor_rows())
+        ev = A.register_taxonomy(lake, src, "Ever", temp=True)
+        vd = A.register_taxonomy(lake, src, "Vendor", temp=True)
+        assert ev.layer == "raw" and ev.kind == A.KIND_TAXONOMY and "__TEMP" in ev.artifact_id
+        assert sorted(ev.file_hashes) == sorted(A.taxonomy_files("Ever"))
+        assert ev.meta.hyperparams["has_observability_channel"] is True
+        assert vd.meta.hyperparams["has_observability_channel"] is False
+        assert A.verify_taxonomy(ev) == [] and A.verify_taxonomy(vd) == []
+        assert A.register_taxonomy(lake, src, "Ever", temp=True).artifact_id == ev.artifact_id
+        got = A.resolve_taxonomy([lake], name="Vendor")
+        assert got.artifact_id == vd.artifact_id
+        assert A.resolve_taxonomy([lake], artifact_id=ev.artifact_id).artifact_id == ev.artifact_id
+        t = A.load_registered_table(vd, "semantic")
+        assert t.name == "Vendor" and not t.has_observability_channel
+        assert t.frame["observability_channel"].unique().to_list() == [""]
+        with pytest.raises(DatalakeError, match="register-taxonomy"):
+            A.resolve_taxonomy([lake], name="Nope")
+        with pytest.raises(DatalakeError, match="not a narrative_taxonomy"):
+            A.resolve_taxonomy([lake], artifact_id=lake.latest(A.KIND_MU_ASOF).artifact_id)
+
+    def test_invalid_taxonomy_is_never_registered(self, lake, tmp_path):
+        import json as _json
+
+        src = self._write(tmp_path, "Bad")
+        p = src / "Bad-primitive_semantic_paraphrases.jsonl"
+        recs = [_json.loads(line) for line in p.read_text().splitlines()]
+        recs[0]["id"] = "0" * 40
+        p.write_text("\n".join(_json.dumps(r) for r in recs) + "\n")
+        with pytest.raises(ValueError, match="bijection"):
+            A.register_taxonomy(lake, src, "Bad", temp=True)
+        assert lake.list(A.KIND_TAXONOMY, include_partial=True) == []
+        (src / "Bad-primitive_headline_paraphrases.jsonl").unlink()
+        with pytest.raises(FileNotFoundError):
+            A.register_taxonomy(lake, src, "Bad", temp=True)
+
+    def test_scoring_cites_the_taxonomy(self, lake, toy_embeddings, cfg, tmp_path):
+        from .conftest import TAX_NAME
+
+        src = self._write(tmp_path, TAX_NAME)
+        tax = A.register_taxonomy(lake, src, TAX_NAME, temp=True)
+        table = A.load_registered_table(tax, "headline")
+        s = A.score_range_to_datalake(
+            lake, date(2008, 3, 1), date(2008, 4, 30), cfg, table=table, P=toy_embeddings,
+            source=_source(table, toy_embeddings, [(2008, m) for m in (2, 3, 4)]),
+            use_kernel=False, temp=True, taxonomy_id=tax.artifact_id)
+        nd = lake.get(s["narrative_daily_id"])
+        assert tax.artifact_id in nd.meta.sources
+        assert nd.meta.hyperparams["taxonomy_artifact_id"] == tax.artifact_id
+        assert tax.artifact_id in lake.get(s["tau_asof_id"]).meta.sources
+        assert tax.artifact_id in lake.get(s["partitions_id"]).meta.sources
+        assert nd.artifact_id in lake.descendants(tax.artifact_id)

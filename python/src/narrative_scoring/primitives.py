@@ -33,10 +33,18 @@ log = logging.getLogger(__name__)
 TAXONOMY_CSV = "{name}_taxonomy.authored.csv"
 PARAPHRASE_JSONL = "{name}-primitive_{style}_paraphrases.jsonl"
 
+# Strict vendor (RavenPack) schema, plus the one column the vendor lacks. Anything else in
+# the CSV (e.g. a POLARITY column) is dropped on load; polarity IS SUB_TYPE.
+VENDOR_COLUMNS = ("TOPIC", "GROUP", "TYPE", "SUB_TYPE", "ROLE", "CATEGORY", "DISPLAY_NAME",
+                  "DESCRIPTION", "SCHEDULED", "VALID_ENTITY_TYPES", "TAGS")
+CHANNEL_COLUMN = "OBSERVABILITY_CHANNEL"
+REQUIRED_COLUMNS = ("TOPIC", "GROUP", "TYPE", "SUB_TYPE", "ROLE", "CATEGORY", "DISPLAY_NAME")
 # The spec's unique primitive key. CATEGORY alone is NOT unique.
-PRIMITIVE_KEY = ("TOPIC", "GROUP", "CATEGORY", "ROLE", "OBSERVABILITY_CHANNEL")
-# The path whose sha1 keys the paraphrase JSONL.
-PATH_FIELDS = ("TOPIC", "GROUP", "TYPE", "SUB_TYPE", "CATEGORY", "ROLE", "OBSERVABILITY_CHANNEL")
+PRIMITIVE_KEY = ("TOPIC", "GROUP", "CATEGORY", "ROLE", CHANNEL_COLUMN)
+# The path whose sha1 keys the paraphrase JSONL: ALWAYS these 7 fields, a missing channel
+# being an empty trailing segment ("a/b/c/d/e/f/"), so every taxonomy hashes on one base.
+# The authoring notebook (author_primitives.ipynb, cell 9) uses the same rule.
+PATH_FIELDS = ("TOPIC", "GROUP", "TYPE", "SUB_TYPE", "CATEGORY", "ROLE", CHANNEL_COLUMN)
 
 NARRATIVE_COLUMNS = ["reservoir", "dimension", "narrative", "pole", "narrative_key", "n_primitives"]
 PRIMITIVE_COLUMNS = [
@@ -77,6 +85,7 @@ class PrimitiveTable:
     narrative_frame: pl.DataFrame
     taxonomy_sha1: str
     paraphrase_sha1: str
+    has_observability_channel: bool = True
 
     @property
     def n_primitives(self) -> int:
@@ -109,8 +118,11 @@ def load_primitive_table(
 ) -> PrimitiveTable:
     """Load the CSV and paraphrase JSONL, joined on the sha1 path hash.
 
-    Raises ``ValueError`` when the join is not a bijection, when K is not
-    uniform, or when the primitive key is not unique.
+    Only ``VENDOR_COLUMNS`` + ``OBSERVABILITY_CHANNEL`` are kept; the channel is
+    added as an empty column when the vendor file has none (before hashing, so
+    it contributes the empty trailing path segment). Raises ``ValueError`` when
+    a required column is missing, the join is not a bijection, K is not
+    uniform, or the primitive key is not unique.
     """
     root = Path(taxonomy_root)
     csv_path = root / TAXONOMY_CSV.format(name=name)
@@ -123,9 +135,16 @@ def load_primitive_table(
     csv = pl.read_csv(
         csv_path, infer_schema_length=0, missing_utf8_is_empty_string=True
     )
-    missing = [c for c in PATH_FIELDS if c not in csv.columns]
+    missing = [c for c in REQUIRED_COLUMNS if c not in csv.columns]
     if missing:
-        raise ValueError(f"taxonomy CSV {csv_path.name} lacks path column(s) {missing}")
+        raise ValueError(f"taxonomy CSV {csv_path.name} lacks column(s) {missing}")
+    has_channel = CHANNEL_COLUMN in csv.columns
+    dropped = [c for c in csv.columns if c not in VENDOR_COLUMNS and c != CHANNEL_COLUMN]
+    if dropped:
+        log.info("%s: non-vendor column(s) ignored: %s", csv_path.name, dropped)
+    csv = csv.select([c for c in (*VENDOR_COLUMNS, CHANNEL_COLUMN) if c in csv.columns])
+    if not has_channel:
+        csv = csv.with_columns(pl.lit("").alias(CHANNEL_COLUMN))
     csv = csv.with_columns(
         pl.concat_str([pl.col(c).fill_null("") for c in PATH_FIELDS], separator="/").alias("_path")
     ).with_columns(
@@ -194,15 +213,17 @@ def load_primitive_table(
         n_texts=(1 if include_master else 0) + k, k_paraphrases=k,
         narrative_frame=narrative_frame,
         taxonomy_sha1=file_sha1(csv_path), paraphrase_sha1=file_sha1(jsonl_path),
+        has_observability_channel=has_channel,
     )
 
 
 # ---------------------------------------------------------------------------
-# Spec section 4: taxonomy-only sanity checks (1, 2, 3, 5, 6)
+# Spec section 4: taxonomy-only sanity checks (1, 2, 3, 6). Check 5 (a POLARITY
+# column coherent with SUB_TYPE) is gone: the schema is strict vendor, polarity IS SUB_TYPE.
 # ---------------------------------------------------------------------------
 
-def sanity_checks(table: PrimitiveTable, taxonomy_root: Path) -> pl.DataFrame:
-    """Checks 1, 2, 3, 5, 6 of the spec. Score-dependent checks live in validation.py."""
+def sanity_checks(table: PrimitiveTable) -> pl.DataFrame:
+    """Checks 1, 2, 3, 6 of the spec. Score-dependent checks live in validation.py."""
     f = table.frame
     rows: list[dict[str, Any]] = []
 
@@ -223,20 +244,6 @@ def sanity_checks(table: PrimitiveTable, taxonomy_root: Path) -> pl.DataFrame:
         "result": "PASS",
         "detail": f"K={table.k_paraphrases}; {table.n_texts} text(s) per primitive "
                   f"(master {'included' if table.n_texts > table.k_paraphrases else 'EXCLUDED'})",
-    })
-
-    pol = pl.read_csv(
-        Path(taxonomy_root) / TAXONOMY_CSV.format(name=table.name), infer_schema_length=0
-    ).select(["SUB_TYPE", "POLARITY"])
-    incoherent = pol.filter(
-        pl.col("POLARITY").fill_null("") != pl.col("SUB_TYPE").fill_null("")
-    ).height
-    signed = pol.filter(pl.col("SUB_TYPE").fill_null("") != "").height
-    rows.append({
-        "check": "5. polarity coherence",
-        "result": "PASS" if incoherent == 0 else "FAIL",
-        "detail": f"{signed}/{pol.height} signed, {pol.height - signed} intensity; "
-                  f"{incoherent} row(s) where POLARITY != SUB_TYPE",
     })
 
     orphans = orphan_pole_candidates(table)

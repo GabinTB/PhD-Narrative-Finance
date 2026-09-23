@@ -1,9 +1,12 @@
 """Datalake registration and the chronological replay driver.
 
-Families (all in the ``derived`` layer, registered exactly like mu_asof /
-headline_embeddings: slug id, per-file content hashes, hyperparams carrying
-the config hashes, source artifact ids, git revision, timestamps):
+Families (registered exactly like mu_asof / headline_embeddings: slug id,
+per-file content hashes, hyperparams carrying the config hashes, source
+artifact ids, git revision, timestamps):
 
+    narrative_taxonomy      (raw layer) one dir per taxonomy version: authored CSV + the
+                            headline and semantic paraphrase JSONLs, validated before
+                            registration; the scorer loads the taxonomy from here
     f0_monthly_partitions   one dir per F0 config, EXTENDED month by month (YYYY-MM.parquet)
     tau_asof                one dir per (F0 config, window), EXTENDED cutoff by cutoff
     narrative_daily         one dir per scoring run (YYYY-MM.parquet, run_metadata.json)
@@ -30,6 +33,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -51,7 +55,13 @@ from narrative_scoring.partitions import (
     months_between,
 )
 from narrative_scoring.pipeline import ParquetMonthWriter, score_dates
-from narrative_scoring.primitives import PrimitiveTable
+from narrative_scoring.primitives import (
+    PARAPHRASE_JSONL,
+    TAXONOMY_CSV,
+    PrimitiveTable,
+    file_sha1,
+    load_primitive_table,
+)
 from narrative_scoring.schema import (
     DAY_DIAGNOSTICS_SCHEMA,
     F0_PARTITION_SCHEMA,
@@ -73,6 +83,7 @@ PIPELINE_REPO = "https://github.com/GabinTB/PhD-Narrative-Finance"
 PIPELINE_VERSION = "v2.1.0"
 TEMP_SUFFIX = "__TEMP"
 
+KIND_TAXONOMY = "narrative_taxonomy"
 KIND_PARTITIONS = "f0_monthly_partitions"
 KIND_TAU_ASOF = "tau_asof"
 KIND_NARRATIVE_DAILY = "narrative_daily"
@@ -83,6 +94,7 @@ KIND_MU_ASOF = "mu_asof"
 AGENT_KINDS = (KIND_PARTITIONS, KIND_TAU_ASOF, KIND_NARRATIVE_DAILY, KIND_DAY_DIAGNOSTICS)
 
 TAU_ASOF_FILE = "tau_asof.parquet"
+PARAPHRASE_STYLES = ("headline", "semantic")
 X_MIN_MONTHS = 2          # earliest scorable start = earliest data + X_MIN_MONTHS (spec)
 X_FULL_MONTHS = 61        # 60-partition rolling window + the 1M delay
 
@@ -138,6 +150,79 @@ def is_agent_created(art: Artifact) -> bool:
 def _taxonomy_params(table: PrimitiveTable) -> dict[str, Any]:
     return {"taxonomy_name": table.name, "taxonomy_sha1": table.taxonomy_sha1[:12],
             "paraphrase_sha1": table.paraphrase_sha1[:12], "paraphrase_style": table.style}
+
+
+# ---------------------------------------------------------------------------
+# narrative_taxonomy: the scorer's taxonomy input, registered and versioned
+# ---------------------------------------------------------------------------
+
+def taxonomy_files(name: str) -> list[str]:
+    return [TAXONOMY_CSV.format(name=name)] + [
+        PARAPHRASE_JSONL.format(name=name, style=st) for st in PARAPHRASE_STYLES]
+
+
+def register_taxonomy(dl: DatalakeIndex, source_root: Path, name: str, *,
+                      temp: bool = False) -> Artifact:
+    """Validate and register ``{name}`` (authored CSV + both paraphrase JSONLs).
+
+    Both styles are loaded through ``load_primitive_table`` first (vendor columns, CSV<->JSONL
+    bijection on the sha1 path, uniform K, key uniqueness), so an invalid taxonomy is never
+    registered. Registering byte-identical files again returns the existing artifact.
+    """
+    source_root = Path(source_root)
+    files = [source_root / f for f in taxonomy_files(name)]
+    missing = [f.name for f in files if not f.exists()]
+    if missing:
+        raise FileNotFoundError(f"taxonomy {name!r}: missing {missing} under {source_root}")
+    tables = {st: load_primitive_table(source_root, name, st) for st in PARAPHRASE_STYLES}
+    t = tables["headline"]
+    shas = {f.name: file_sha1(f) for f in files}
+    hp = {"taxonomy_name": name, "taxonomy_sha1": t.taxonomy_sha1[:12],
+          "headline_sha1": shas[files[1].name][:12], "semantic_sha1": shas[files[2].name][:12],
+          "n_primitives": t.n_primitives, "n_narratives": t.n_narratives,
+          "k": t.k_paraphrases, "has_observability_channel": t.has_observability_channel,
+          "agent_created": temp}
+    for art in dl.list(KIND_TAXONOMY):
+        same = all(art.meta.hyperparams.get(k) == v for k, v in hp.items())
+        if same:
+            log.info("taxonomy %s already registered as %s", name, art.artifact_id)
+            return art
+    with dl.run(kind=KIND_TAXONOMY, pipeline=PIPELINE, pipeline_version=_version(temp),
+                pipeline_repo=PIPELINE_REPO, hyperparams=hp, repo_dir=_repo_dir(),
+                layer="raw", verifier=KIND_TAXONOMY, hash_pattern="*",
+                notes=f"copied from {source_root}") as run:
+        for f in files:
+            shutil.copy2(f, run.out_dir / f.name)
+        run.note(f"{t.n_primitives} primitives, {t.n_narratives} narratives, K={t.k_paraphrases}, "
+                 f"observability channel {'present' if t.has_observability_channel else 'absent'}")
+    return dl.get(run.artifact_id)
+
+
+def resolve_taxonomy(indexes: list[DatalakeIndex], *, name: str | None = None,
+                     artifact_id: str | None = None) -> Artifact:
+    """A registered taxonomy: the exact ``artifact_id`` if given, else the latest of ``name``."""
+    if (name is None) == (artifact_id is None):
+        raise ValueError("give exactly one of name / artifact_id")
+    for dl in indexes:
+        try:
+            art = (dl.get(artifact_id) if artifact_id
+                   else latest_matching(dl, KIND_TAXONOMY, taxonomy_name=name))
+        except DatalakeError:
+            continue
+        if art.kind != KIND_TAXONOMY:
+            raise DatalakeError(f"{artifact_id} is a {art.kind}, not a {KIND_TAXONOMY}")
+        return art
+    what = artifact_id or name
+    raise DatalakeError(
+        f"no registered {KIND_TAXONOMY} {what!r}; register it first:  "
+        f"uv run python -m narrative_scoring.jobs register-taxonomy --taxonomy {name or '<NAME>'}")
+
+
+def load_registered_table(art: Artifact, style: str, *,
+                          include_master: bool = True) -> PrimitiveTable:
+    """Load the primitive table from a registered taxonomy artifact's own files."""
+    name = art.meta.hyperparams["taxonomy_name"]
+    return load_primitive_table(art.path, name, style, include_master=include_master)
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +315,7 @@ def build_tau_asof(
     dl: DatalakeIndex, config: ScoringConfig, table: PrimitiveTable, P: np.ndarray, *,
     upstream: DatalakeIndex | None = None, window: str = WINDOW_DEFAULT, seed: int = 0,
     today: date | None = None, rebuild: bool = False, temp: bool = False,
-    partitions_art: Artifact | None = None,
+    partitions_art: Artifact | None = None, taxonomy_id: str | None = None,
 ) -> Artifact | None:
     """Append every cutoff <= today - 1M not yet in the series (or rebuild it all).
 
@@ -271,7 +356,7 @@ def build_tau_asof(
     if not todo and existing is not None:
         return existing
 
-    sources = [parts_art] + ([mu_art] if mu_art else [])
+    sources = [parts_art] + ([mu_art] if mu_art else []) + ([taxonomy_id] if taxonomy_id else [])
     with dl.run(kind=KIND_TAU_ASOF, pipeline=PIPELINE, pipeline_version=_version(temp),
                 pipeline_repo=PIPELINE_REPO, hyperparams=hp, repo_dir=_repo_dir(),
                 sources=sources, verifier=KIND_TAU_ASOF, hash_pattern="*.parquet",
@@ -317,7 +402,7 @@ def score_range_to_datalake(
     source: HeadlineSource | None = None, window: str = WINDOW_DEFAULT, seed: int = 0,
     keep_primitive_daily: bool = False, threads: int = 8,
     rss_budget_gb: float | None = 30.0, use_kernel: bool | None = None,
-    temp: bool = False, label: str = "",
+    temp: bool = False, label: str = "", taxonomy_id: str | None = None,
 ) -> dict[str, Any]:
     """Score [start, end] chronologically through the live machinery.
 
@@ -362,8 +447,9 @@ def score_range_to_datalake(
           "pooling": config.paraphrase_pooling.value, "q": config.q,
           "split": config.sentiment_split.value, "window": window, "seed": seed,
           "start": start.isoformat(), "end": end.isoformat(), "label": label,
-          "agent_created": temp}
-    sources: list[Any] = [hl, em] + ([mu_art] if mu_art else [])
+          "taxonomy_artifact_id": taxonomy_id, "agent_created": temp}
+    sources: list[Any] = ([hl, em] + ([mu_art] if mu_art else [])
+                          + ([taxonomy_id] if taxonomy_id else []))
     summary: dict[str, Any] = {"start": start, "end": end, "earliest_data": earliest,
                                "n_days_scored": 0, "n_days_null_only": 0, "peak_rss_gb": 0.0,
                                "months_finalised": [], "tau_rows": None}
@@ -399,7 +485,8 @@ def score_range_to_datalake(
             # (1) the monthly tau job, as of the first day of this month
             tau_art = build_tau_asof(dl, config, table, P, upstream=upstream, window=window,
                                      seed=seed, today=date(y, m, 1), temp=temp,
-                                     partitions_art=dl.get(pt_run.artifact_id))
+                                     partitions_art=dl.get(pt_run.artifact_id),
+                                     taxonomy_id=taxonomy_id)
             cal = calibration_as_of(dl, config, table, upstream=upstream, window=window,
                                     seed=seed, temp=temp)
             if tau_art is not None:
@@ -465,6 +552,25 @@ def _schema_check(files: list[Path], schema: pl.Schema, label: str):
             yield f"{p.name}: empty"
 
 
+def verify_taxonomy(artifact: Artifact):
+    def check():
+        hp = artifact.meta.hyperparams
+        name = hp.get("taxonomy_name")
+        if not name:
+            yield "hyperparams missing taxonomy_name"
+            return
+        for f in taxonomy_files(name):
+            if not (artifact.path / f).exists():
+                yield f"{f} missing"
+        for st in PARAPHRASE_STYLES:
+            t = load_primitive_table(artifact.path, name, st)
+            if t.n_primitives != hp.get("n_primitives"):
+                yield f"{st}: {t.n_primitives} primitives, hyperparams say {hp.get('n_primitives')}"
+            if t.taxonomy_sha1[:12] != hp.get("taxonomy_sha1"):
+                yield "authored CSV hash differs from the registered hash"
+    return _findings(KIND_TAXONOMY, artifact, check)
+
+
 def verify_partitions(artifact: Artifact):
     def check():
         yield from _schema_check(artifact.files(), F0_PARTITION_SCHEMA, KIND_PARTITIONS)
@@ -499,6 +605,7 @@ def verify_day_diagnostics(artifact: Artifact):
 
 
 __all__ = [
+    "KIND_TAXONOMY", "register_taxonomy", "resolve_taxonomy", "load_registered_table",
     "KIND_PARTITIONS", "KIND_TAU_ASOF", "KIND_NARRATIVE_DAILY", "KIND_DAY_DIAGNOSTICS",
     "latest_matching", "mark_temp_deprecated", "is_agent_created", "find_partitions",
     "find_tau_asof",

@@ -1,8 +1,17 @@
 """Command-line entry points for the production scorer.
 
-    uv run python -m narrative_scoring.jobs score    --from 2004-01-01 --to 2004-12-31
+    uv run python -m narrative_scoring.jobs register-taxonomy --taxonomy Evergreen_v5
+    uv run python -m narrative_scoring.jobs score    --from 2004-01-01 --to 2004-12-31 \
+                                                     --taxonomy Evergreen_v5
     uv run python -m narrative_scoring.jobs tau-asof [--window 5Y | expanding] [--today ...]
     uv run python -m narrative_scoring.jobs mark-temp <artifact_id> [...]
+
+``register-taxonomy`` validates {NAME}_taxonomy.authored.csv + both paraphrase JSONLs from
+$RAW_DATA_PATH/Narrative_Taxonomy and registers them as a ``narrative_taxonomy`` artifact.
+``score`` / ``tau-asof`` load the taxonomy from a registered artifact only: ``--taxonomy NAME``
+(latest registration of that name) or ``--taxonomy-artifact ID`` (an exact one, for replays).
+Scoring against several taxonomies = one run per taxonomy; their outputs never mix (every
+family is resolved by the taxonomy hash).
 
 ``score`` is the one scoring path: it replays the live loop over the dates
 in order (monthly tau_asof job, then the days), enforcing the 1-month delay
@@ -63,14 +72,30 @@ def _indexes(args: argparse.Namespace):
     return dl, upstream
 
 
-def _table_and_embeddings(args: argparse.Namespace):
-    from narrative_scoring.primitives import embed_primitive_texts, load_primitive_table
+def _table_and_embeddings(args: argparse.Namespace, dl, upstream):
+    """The chosen registered taxonomy, its primitive table and primitive-text embeddings."""
+    from narrative_scoring.artifacts import load_registered_table, resolve_taxonomy
+    from narrative_scoring.primitives import embed_primitive_texts
 
-    root = _env("RAW_DATA_PATH") / "Narrative_Taxonomy"
-    table = load_primitive_table(root, args.taxonomy, args.style)
+    art = resolve_taxonomy([dl, upstream], name=None if args.taxonomy_artifact else args.taxonomy,
+                           artifact_id=args.taxonomy_artifact)
+    log.info("taxonomy: %s", art.artifact_id)
+    table = load_registered_table(art, args.style)
     cache = (Path(args.embedding_cache) if args.embedding_cache
              else _env("CACHE_PATH") / "narrative_scoring")
-    return table, embed_primitive_texts(table, cache, device=args.device)
+    return art, table, embed_primitive_texts(table, cache, device=args.device)
+
+
+def cmd_register_taxonomy(args: argparse.Namespace) -> int:
+    from narrative_scoring.artifacts import register_taxonomy
+
+    dl, _ = _indexes(args)
+    root = Path(args.source) if args.source else _env("RAW_DATA_PATH") / "Narrative_Taxonomy"
+    art = register_taxonomy(dl, root, args.taxonomy, temp=args.temp)
+    hp = art.meta.hyperparams
+    print(f"{art.artifact_id}\n  primitives={hp['n_primitives']} narratives={hp['n_narratives']} "
+          f"K={hp['k']} observability_channel={hp['has_observability_channel']}")
+    return 0
 
 
 def cmd_score(args: argparse.Namespace) -> int:
@@ -78,13 +103,13 @@ def cmd_score(args: argparse.Namespace) -> int:
 
     dl, upstream = _indexes(args)
     config = _config(args)
-    table, P = _table_and_embeddings(args)
+    tax_art, table, P = _table_and_embeddings(args, dl, upstream)
     source = headline_source(upstream, chunk_size=args.chunk_size, threads=args.threads)
     summary = score_range_to_datalake(
         dl, date.fromisoformat(args.start), date.fromisoformat(args.end), config,
         table=table, P=P, upstream=upstream, source=source, window=args.window,
         seed=args.seed, threads=args.threads, rss_budget_gb=args.rss_budget_gb,
-        temp=args.temp, label=args.label)
+        temp=args.temp, label=args.label, taxonomy_id=tax_art.artifact_id)
     for k in ("start", "end", "n_days_scored", "n_days_null_only", "peak_rss_gb",
               "months_finalised", "narrative_daily_id", "day_diagnostics_id",
               "partitions_id", "tau_asof_id"):
@@ -97,9 +122,10 @@ def cmd_tau_asof(args: argparse.Namespace) -> int:
 
     dl, upstream = _indexes(args)
     config = _config(args)
-    table, P = _table_and_embeddings(args)
+    tax_art, table, P = _table_and_embeddings(args, dl, upstream)
     art = build_tau_asof(dl, config, table, P, upstream=upstream, window=args.window,
                          seed=args.seed, rebuild=args.rebuild, temp=args.temp,
+                         taxonomy_id=tax_art.artifact_id,
                          today=date.fromisoformat(args.today) if args.today else None)
     print(art.artifact_id if art else "no partition old enough yet")
     return 0
@@ -125,7 +151,10 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--taxonomy", default="Evergreen_v5")
+    common.add_argument("--taxonomy", default="Evergreen_v5",
+                        help="registered taxonomy name (latest registration is used)")
+    common.add_argument("--taxonomy-artifact", default=None,
+                        help="exact narrative_taxonomy artifact id (overrides --taxonomy)")
     common.add_argument("--style", default="headline", choices=[s.value for s in ParaphraseStyle])
     common.add_argument("--mode", default="r2", choices=[m.value for m in Correction])
     common.add_argument("--pooling", default=None, choices=[p.value for p in PoolRule])
@@ -145,6 +174,11 @@ def main(argv: list[str] | None = None) -> int:
     common.add_argument("--temp", action="store_true",
                         help="mark everything registered as agent-created / TEMP")
     sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("register-taxonomy", parents=[common])
+    p.add_argument("--source", default=None,
+                   help="directory holding the taxonomy files (default: "
+                        "$RAW_DATA_PATH/Narrative_Taxonomy)")
+    p.set_defaults(fn=cmd_register_taxonomy)
     p = sub.add_parser("score", parents=[common])
     p.add_argument("--from", dest="start", required=True)
     p.add_argument("--to", dest="end", required=True)
