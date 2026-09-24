@@ -35,6 +35,8 @@ from narrative_scoring.validation import (
 from .conftest import FixedTauProvider, unit_rows
 
 D0 = date(2008, 9, 15)
+SPLIT = {"sentiment_split": SentimentSplit.SIGN, "sentiment_source": "test",
+         "sentiment_column": "SENT_X"}
 
 
 def _mu_df(dates: list[date], seed: int = 0) -> pl.DataFrame:
@@ -384,7 +386,7 @@ def _sentiment_world(world, seed=5):
 @pytest.mark.parametrize("eps", [0.0, 0.3])
 def test_sentiment_split_reconciles(world, eps, use_kernel):
     sent = _sentiment_world(world)
-    cfg = ScoringConfig(q=0.75, sentiment_split=SentimentSplit.SIGN, neutral_eps=eps)
+    cfg = ScoringConfig(q=0.75, **SPLIT, neutral_eps=eps)
     cal = FixedTauProvider(_tau(0.2), world["mu_df"])
     src = InMemoryHeadlineSource(world["X"], chunk_size=11, sentiment=sent)
     res = score_dates(world["days"], cfg, table=world["table"], primitive_embeddings=world["P"],
@@ -428,7 +430,7 @@ def test_sentiment_all_labelled_reconciles_exactly(world):
     """With no missing sentiment and eps > 0, sum of split rows == the 'all' row."""
     rng = np.random.default_rng(6)
     sent = {d: rng.normal(size=X.shape[0]).astype(np.float32) for d, X in world["X"].items()}
-    cfg = ScoringConfig(q=0.75, sentiment_split=SentimentSplit.SIGN, neutral_eps=0.2)
+    cfg = ScoringConfig(q=0.75, **SPLIT, neutral_eps=0.2)
     cal = FixedTauProvider(_tau(0.2), world["mu_df"])
     res = score_dates(world["days"], cfg, table=world["table"], primitive_embeddings=world["P"],
                       source=InMemoryHeadlineSource(world["X"], sentiment=sent), calibration=cal,
@@ -453,13 +455,57 @@ def test_split_disabled_is_current_artifact_plus_all_label(world):
                       primitive_embeddings=world["P"],
                       source=InMemoryHeadlineSource(world["X"], sentiment=sent),
                       calibration=cal, use_kernel=False)
-    on = score_dates(world["days"], ScoringConfig(q=0.75, sentiment_split=SentimentSplit.SIGN),
+    on = score_dates(world["days"], ScoringConfig(q=0.75, **SPLIT),
                      table=world["table"], primitive_embeddings=world["P"],
                      source=InMemoryHeadlineSource(world["X"], sentiment=sent),
                      calibration=cal, use_kernel=False)
     assert set(off.narrative_daily["SENTIMENT"].unique()) == {"all"}
     assert off.narrative_daily.equals(on.narrative_daily.filter(pl.col("SENTIMENT") == "all"))
     assert off.day_diagnostics["N_WITH_SENTIMENT"].sum() == 0
+
+
+def test_sentiment_config_validation_and_identity():
+    with pytest.raises(ValueError, match="needs sentiment_source"):
+        ScoringConfig(sentiment_split=SentimentSplit.SIGN)
+    with pytest.raises(ValueError, match="needs sentiment_source"):
+        ScoringConfig(sentiment_split=SentimentSplit.SIGN, sentiment_source="finbert")
+    with pytest.raises(ValueError, match="only meaningful"):
+        ScoringConfig(sentiment_source="finbert", sentiment_column="SENT_BAND")
+    with pytest.raises(ValueError, match="SENT_"):
+        ScoringConfig(sentiment_split=SentimentSplit.SIGN, sentiment_source="finbert",
+                      sentiment_column="P_POS")
+    a = ScoringConfig(**SPLIT)
+    b = ScoringConfig(**{**SPLIT, "sentiment_column": "SENT_Y"})
+    c = ScoringConfig(**{**SPLIT, "sentiment_source": "other"})
+    assert len({a.digest(), b.digest(), c.digest()}) == 3
+    assert a.f0_digest() == ScoringConfig().f0_digest()       # the null model is sentiment-free
+
+
+def test_split_without_source_sentiment_raises(world):
+    cal = FixedTauProvider(_tau(0.2), world["mu_df"])
+    with pytest.raises(RuntimeError, match="yields no sentiment"):
+        score_dates(world["days"], ScoringConfig(q=0.75, **SPLIT), table=world["table"],
+                    primitive_embeddings=world["P"],
+                    source=InMemoryHeadlineSource(world["X"]), calibration=cal,
+                    use_kernel=False)
+
+
+def test_sentiment_identity_in_metadata_and_diagnostics(world):
+    sent = _sentiment_world(world)
+    cal = FixedTauProvider(_tau(0.2), world["mu_df"])
+    res = score_dates(world["days"], ScoringConfig(q=0.75, **SPLIT), table=world["table"],
+                      primitive_embeddings=world["P"],
+                      source=InMemoryHeadlineSource(world["X"], sentiment=sent),
+                      calibration=cal, use_kernel=False, sentiment_artifact_id="hs-1")
+    assert res.metadata.sentiment_artifact_id == "hs-1"
+    assert res.metadata.config["sentiment_column"] == "SENT_X"
+    assert res.day_diagnostics["SENTIMENT_SOURCE_ID"].unique().to_list() == ["hs-1:SENT_X"]
+    off = score_dates(world["days"], ScoringConfig(q=0.75), table=world["table"],
+                      primitive_embeddings=world["P"],
+                      source=InMemoryHeadlineSource(world["X"]), calibration=cal,
+                      use_kernel=False)
+    assert off.day_diagnostics["SENTIMENT_SOURCE_ID"].null_count() == off.n_days
+    assert off.metadata.sentiment_artifact_id is None
 
 
 # ---------------------------------------------------------------------------
@@ -532,7 +578,7 @@ def test_combine_sentiment_reproduces_all_row(world):
 
     rng = np.random.default_rng(6)
     sent = {d: rng.normal(size=X.shape[0]).astype(np.float32) for d, X in world["X"].items()}
-    cfg = ScoringConfig(q=0.75, sentiment_split=SentimentSplit.SIGN, neutral_eps=0.2)
+    cfg = ScoringConfig(q=0.75, **SPLIT, neutral_eps=0.2)
     cal = FixedTauProvider(_tau(0.2), world["mu_df"])
     res = score_dates(world["days"], cfg, table=world["table"], primitive_embeddings=world["P"],
                       source=InMemoryHeadlineSource(world["X"], sentiment=sent), calibration=cal,

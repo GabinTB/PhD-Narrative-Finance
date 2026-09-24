@@ -48,6 +48,7 @@ f0_monthly_partitions = "narrative_scoring.artifacts:verify_partitions"
 tau_asof = "narrative_scoring.artifacts:verify_tau_asof"
 narrative_daily = "narrative_scoring.artifacts:verify_narrative_daily"
 day_diagnostics = "narrative_scoring.artifacts:verify_day_diagnostics"
+headline_sentiment = "ravenpack.headlines.sentiment:verify_artifact"
 
 [build-system]
 requires      = ["hatchling"]

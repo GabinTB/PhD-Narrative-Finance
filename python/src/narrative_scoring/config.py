@@ -67,6 +67,8 @@ class SentimentSplit(str, Enum):
 
 
 SENTIMENT_ALL = "all"
+SENTIMENT_NONE = "none"
+SENTIMENT_COLUMN_PREFIX = "SENT_"
 
 
 @dataclass(frozen=True)
@@ -90,6 +92,11 @@ class ScoringConfig:
         gap_alert_threshold: |tau_gauss - tau_empirical| above this is logged (warning only).
         sentiment_split: ``none`` (default) or ``sign``; see pipeline.py.
         neutral_eps: |sentiment| <= eps is "neu" (only when > 0).
+        sentiment_source: the ``headline_sentiment`` producer the split reads (e.g.
+            ``ravenpack``, ``ravenbert``, ``finbert``); ``none`` without a split.
+        sentiment_column: the ``SENT_*`` column of that artifact; "" without a split.
+            Source and column are numerical choices (different scores, different
+            pos/neg rows), so both enter ``digest``; the exact artifact id is lineage.
     """
 
     mode: Correction = Correction.R2
@@ -107,6 +114,8 @@ class ScoringConfig:
     gap_alert_threshold: float = 0.05
     sentiment_split: SentimentSplit = SentimentSplit.NONE
     neutral_eps: float = 0.0
+    sentiment_source: str = SENTIMENT_NONE
+    sentiment_column: str = ""
     label: str = ""
 
     def __post_init__(self) -> None:
@@ -133,6 +142,16 @@ class ScoringConfig:
             raise ValueError("gap_alert_threshold must be > 0")
         if self.neutral_eps < 0.0:
             raise ValueError("neutral_eps must be >= 0")
+        split = self.sentiment_split is SentimentSplit.SIGN
+        has_source = self.sentiment_source != SENTIMENT_NONE or bool(self.sentiment_column)
+        if split and (self.sentiment_source == SENTIMENT_NONE or not self.sentiment_column):
+            raise ValueError("sentiment_split=sign needs sentiment_source and sentiment_column")
+        if not split and has_source:
+            raise ValueError("sentiment_source/sentiment_column are only meaningful with "
+                             "sentiment_split=sign")
+        if split and not self.sentiment_column.startswith(SENTIMENT_COLUMN_PREFIX):
+            raise ValueError(f"sentiment_column must be a {SENTIMENT_COLUMN_PREFIX}* column, "
+                             f"got {self.sentiment_column!r}")
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -190,6 +209,7 @@ class RunMetadata:
     n_eff: float                  # of the first tau row used; per-day values in day_diagnostics
     seed: int
     code_version: str | None
+    sentiment_artifact_id: str | None = None   # headline_sentiment artifact read by the split
     config_id: str = ""
     f0_config_id: str = ""
     spec: str = SPEC_PATH

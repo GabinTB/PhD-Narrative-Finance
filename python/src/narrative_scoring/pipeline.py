@@ -25,7 +25,9 @@ differs. Per day, in order:
        sentiment label), optional day x primitive diagnostics, the day
        diagnostics row with RSS before/after, hand to the writer and the sink.
 
-Sentiment split (config.sentiment_split = sign): every headline contributes
+Sentiment split (config.sentiment_split = sign, reading the config's
+sentiment_source / sentiment_column through the source's SentimentSource; a
+split run whose source yields no sentiment raises): every headline contributes
 to the "all" rows; headlines with a sentiment score contribute additionally
 to their label's rows (pos: s > eps, neg: s < -eps, neu: |s| <= eps when
 eps > 0). Headlines with missing sentiment (NaN, or exactly 0 when eps == 0)
@@ -305,6 +307,7 @@ def score_dates(
     seed: int = 0,
     code_version: str | None = None,
     extra_metadata: dict[str, Any] | None = None,
+    sentiment_artifact_id: str | None = None,
 ) -> ScoringResult:
     """Score every day in ``dates`` (sorted, de-duplicated) with point-in-time inputs.
 
@@ -327,6 +330,8 @@ def score_dates(
         threads: kernel thread count; BLAS keeps its own pool (phases are sequential).
         rss_budget_gb: raise ``MemoryBudgetExceeded`` naming the day when RSS exceeds it.
         seed: recorded; the scorer itself is deterministic (null sampling is seeded by the sink).
+        sentiment_artifact_id: the headline_sentiment artifact behind ``source``'s sentiment
+            (split runs); recorded in the metadata and in day_diagnostics.
     Days with no headlines are skipped (listed in ``skipped_days``) but still closed
     in the null sink, so a month with quiet days can complete.
     """
@@ -345,6 +350,8 @@ def score_dates(
     prim_to_narr = table.primitive_to_narrative
     n_candidates = n_candidates_for(config.q, n_prim)
     labels = config.sentiment_labels()
+    sentiment_source_id = (f"{sentiment_artifact_id or config.sentiment_source}:"
+                           f"{config.sentiment_column}" if labels else None)
     narr_nodes, prim_nodes = table.narrative_nodes, table.primitive_nodes
     n_trim_rows = n_trim(n_prim, config.trim_frac) if null_sink is not None else 0
     n_keep_rows = n_keep(n_prim, config.trim_frac)
@@ -446,6 +453,7 @@ def score_dates(
             "TAU": ctx["tau32"], "TAU_MONTH_END": tau_rec.month_end, "N_EFF": tau_rec.n_eff,
             "CONFIG_ID": config.digest(), "F0_CONFIG_ID": config.f0_digest(),
             "TAU_SOURCE_ID": calibration.tau_source_id, "MU_ASOF_ID": calibration.mu_asof_id,
+            "SENTIMENT_SOURCE_ID": sentiment_source_id,
             "RSS_GB_BEFORE": rss_before, "RSS_GB_AFTER": rss_after,
             "SECONDS": time.perf_counter() - ctx["t0"],
         }
@@ -494,6 +502,10 @@ def score_dates(
             state.narr[SENTIMENT_ALL], state.prim[SENTIMENT_ALL] if state.prim else None,
             use_kernel, threads, state.funnel, n_trim_rows)
         if labels:
+            if chunk.sentiment is None:
+                raise RuntimeError(
+                    f"{current['day']}: sentiment_split=sign ({config.sentiment_source}:"
+                    f"{config.sentiment_column}) but the headline source yields no sentiment")
             codes = sentiment_labels(chunk.sentiment, S.shape[0], config)
             state.n_with_sentiment += int((codes > 0).sum())
             for lab in labels:
@@ -545,6 +557,7 @@ def score_dates(
         tau_source_id=calibration.tau_source_id, tau_policy=calibration.tau_policy,
         n_eff=first_tau.n_eff,
         seed=seed, code_version=code_version if code_version is not None else _git_revision(),
+        sentiment_artifact_id=sentiment_artifact_id,
         config_id=config.digest(), f0_config_id=config.f0_digest(),
         extra={"source": source.describe(), "scoring_path": "kernel" if use_kernel else "numpy",
                "first_tau_record": first_tau.to_dict(), **(extra_metadata or {})},

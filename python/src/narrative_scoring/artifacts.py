@@ -4,6 +4,8 @@ Families (registered exactly like mu_asof / headline_embeddings: slug id,
 per-file content hashes, hyperparams carrying the config hashes, source
 artifact ids, git revision, timestamps):
 
+    headline_sentiment      (read only) a score database (RP_STORY_ID + SENT_* columns, see
+                            ravenpack/headlines/sentiment.py); a split run reads one column
     narrative_taxonomy      (raw layer) one dir per taxonomy version: authored CSV + the
                             headline and semantic paraphrase JSONLs, validated before
                             registration; the scorer loads the taxonomy from here
@@ -46,7 +48,7 @@ import polars as pl
 from datalake import Artifact, DatalakeError, DatalakeIndex
 from datalake.meta import git_commit
 from narrative_scoring.calibration import load_mu_asof
-from narrative_scoring.config import ScoringConfig
+from narrative_scoring.config import ScoringConfig, SentimentSplit
 from narrative_scoring.corrections import Correction
 from narrative_scoring.partitions import (
     MonthlyNullPartitionWriter,
@@ -64,11 +66,16 @@ from narrative_scoring.primitives import (
 )
 from narrative_scoring.schema import (
     DAY_DIAGNOSTICS_SCHEMA,
+    DAY_DIAGNOSTICS_SCHEMA_V1,
     F0_PARTITION_SCHEMA,
     NARRATIVE_DAILY_SCHEMA,
     TAU_ASOF_SCHEMA,
 )
-from narrative_scoring.streaming import HeadlineSource, ParquetHeadlineSource
+from narrative_scoring.streaming import (
+    HeadlineSource,
+    ParquetHeadlineSource,
+    ParquetSentimentSource,
+)
 from narrative_scoring.tau_asof import (
     WINDOW_DEFAULT,
     TauSeriesProvider,
@@ -91,6 +98,7 @@ KIND_DAY_DIAGNOSTICS = "day_diagnostics"
 KIND_HEADLINES = "ravenpack_headlines"
 KIND_EMBEDDINGS = "headline_embeddings"
 KIND_MU_ASOF = "mu_asof"
+KIND_SENTIMENT = "headline_sentiment"
 AGENT_KINDS = (KIND_PARTITIONS, KIND_TAU_ASOF, KIND_NARRATIVE_DAILY, KIND_DAY_DIAGNOSTICS)
 
 TAU_ASOF_FILE = "tau_asof.parquet"
@@ -276,11 +284,59 @@ def load_tau_series(art: Artifact | None) -> pl.DataFrame:
 # ---------------------------------------------------------------------------
 
 def headline_source(upstream: DatalakeIndex, chunk_size: int = 8_192, threads: int = 8,
-                    sentiment: Any = None) -> ParquetHeadlineSource:
+                    sentiment: Artifact | None = None,
+                    sentiment_column: str = "") -> ParquetHeadlineSource:
+    """The latest headlines + embeddings, with one column of ``sentiment`` joined in."""
     hl, em = upstream.latest(KIND_HEADLINES), upstream.latest(KIND_EMBEDDINGS)
+    sent = None
+    if sentiment is not None:
+        check_sentiment(sentiment, headlines_id=hl.artifact_id, column=sentiment_column)
+        sent = ParquetSentimentSource(sentiment.path, sentiment_column, sentiment.artifact_id)
     return ParquetHeadlineSource(hl.path, em.path, chunk_size=chunk_size, threads=threads,
                                  source_id=f"{hl.artifact_id}+{em.artifact_id}",
-                                 sentiment=sentiment)
+                                 sentiment=sent)
+
+
+def sentiment_columns(art: Artifact) -> list[str]:
+    return [c for c in str(art.meta.hyperparams.get("columns", "")).split(",") if c]
+
+
+def check_sentiment(art: Artifact, *, headlines_id: str, column: str,
+                    source: str | None = None) -> None:
+    """Refuse a sentiment artifact that is not scoring-compatible: wrong kind, built on
+    another headlines artifact (story sets would differ), unknown column, other source."""
+    hp = art.meta.hyperparams
+    if art.kind != KIND_SENTIMENT:
+        raise DatalakeError(f"{art.artifact_id} is a {art.kind}, not a {KIND_SENTIMENT}")
+    if hp.get("headlines_id") != headlines_id:
+        raise DatalakeError(f"{art.artifact_id} was built on {hp.get('headlines_id')}, the "
+                            f"scorer reads {headlines_id}")
+    if column not in sentiment_columns(art):
+        raise DatalakeError(f"{art.artifact_id} has no column {column!r} "
+                            f"(has {sentiment_columns(art)})")
+    if source is not None and hp.get("source") != source:
+        raise DatalakeError(f"{art.artifact_id} is source {hp.get('source')!r}, config says "
+                            f"{source!r}")
+
+
+def resolve_sentiment(indexes: list[DatalakeIndex], *, headlines_id: str, column: str,
+                      source: str | None = None, artifact_id: str | None = None) -> Artifact:
+    """A scoring-compatible ``headline_sentiment``: the exact ``artifact_id`` if given,
+    else the latest of ``source`` built on ``headlines_id``; checked by ``check_sentiment``."""
+    if (source is None) == (artifact_id is None):
+        raise ValueError("give exactly one of source / artifact_id")
+    for dl in indexes:
+        try:
+            art = (dl.get(artifact_id) if artifact_id
+                   else latest_matching(dl, KIND_SENTIMENT, source=source,
+                                        headlines_id=headlines_id))
+        except DatalakeError:
+            continue
+        check_sentiment(art, headlines_id=headlines_id, column=column, source=source)
+        return art
+    raise DatalakeError(f"no {KIND_SENTIMENT} {artifact_id or source!r} built on "
+                        f"{headlines_id}; run ravenpack.headlines.sentiment_vendor / "
+                        f"sentiment_model first")
 
 
 def earliest_headline_day(headlines: Artifact) -> date:
@@ -403,6 +459,7 @@ def score_range_to_datalake(
     keep_primitive_daily: bool = False, threads: int = 8,
     rss_budget_gb: float | None = 30.0, use_kernel: bool | None = None,
     temp: bool = False, label: str = "", taxonomy_id: str | None = None,
+    sentiment: Artifact | None = None,
 ) -> dict[str, Any]:
     """Score [start, end] chronologically through the live machinery.
 
@@ -414,13 +471,25 @@ def score_range_to_datalake(
     them. ``start`` is shifted to earliest_data + X_MIN_MONTHS when earlier,
     with a loud warning, never an error.
 
+    A split run (``config.sentiment_split = sign``) needs ``sentiment``, the
+    ``headline_sentiment`` artifact whose ``config.sentiment_column`` is joined in; it
+    is checked against the headlines artifact and cited in the lineage. The null
+    partitions and tau never see sentiment.
+
     Returns a summary dict with the artifact ids and counts.
     """
     upstream = upstream or dl
     if end < start:
         raise ValueError("end before start")
-    source = source or headline_source(upstream, threads=threads)
     hl, em = upstream.latest(KIND_HEADLINES), upstream.latest(KIND_EMBEDDINGS)
+    split = config.sentiment_split is SentimentSplit.SIGN
+    if split != (sentiment is not None):
+        raise ValueError("a sentiment artifact is required iff sentiment_split=sign")
+    if sentiment is not None:
+        check_sentiment(sentiment, headlines_id=hl.artifact_id,
+                        column=config.sentiment_column, source=config.sentiment_source)
+    source = source or headline_source(upstream, threads=threads, sentiment=sentiment,
+                                       sentiment_column=config.sentiment_column)
     mu_art, _ = _mu_inputs(upstream, config)
 
     earliest = earliest_headline_day(hl)
@@ -448,17 +517,22 @@ def score_range_to_datalake(
           "split": config.sentiment_split.value, "window": window, "seed": seed,
           "start": start.isoformat(), "end": end.isoformat(), "label": label,
           "taxonomy_artifact_id": taxonomy_id, "agent_created": temp}
+    if sentiment is not None:
+        hp.update(sentiment_source=config.sentiment_source,
+                  sentiment_column=config.sentiment_column,
+                  sentiment_artifact_id=sentiment.artifact_id)
     sources: list[Any] = ([hl, em] + ([mu_art] if mu_art else [])
                           + ([taxonomy_id] if taxonomy_id else []))
+    nd_sources = sources + ([sentiment] if sentiment is not None else [])
     summary: dict[str, Any] = {"start": start, "end": end, "earliest_data": earliest,
                                "n_days_scored": 0, "n_days_null_only": 0, "peak_rss_gb": 0.0,
                                "months_finalised": [], "tau_rows": None}
 
     run_kw = dict(pipeline=PIPELINE, pipeline_version=_version(temp),
                   pipeline_repo=PIPELINE_REPO, repo_dir=_repo_dir())
-    with dl.run(kind=KIND_NARRATIVE_DAILY, hyperparams=hp, sources=sources,
+    with dl.run(kind=KIND_NARRATIVE_DAILY, hyperparams=hp, sources=nd_sources,
                 verifier=KIND_NARRATIVE_DAILY, hash_pattern="*", **run_kw) as nd_run, \
-         dl.run(kind=KIND_DAY_DIAGNOSTICS, hyperparams=hp, sources=sources,
+         dl.run(kind=KIND_DAY_DIAGNOSTICS, hyperparams=hp, sources=nd_sources,
                 verifier=KIND_DAY_DIAGNOSTICS, hash_pattern="*", **run_kw) as dg_run, \
          dl.run(kind=KIND_PARTITIONS, hyperparams=partitions_params(config, table, seed, temp),
                 sources=sources, verifier=KIND_PARTITIONS, hash_pattern="*.parquet",
@@ -500,6 +574,7 @@ def score_range_to_datalake(
                 keep_primitive_daily=keep_primitive_daily, collect=False,
                 use_kernel=use_kernel, threads=threads, rss_budget_gb=rss_budget_gb,
                 seed=seed, code_version=nd_run.record.pipeline_commit,
+                sentiment_artifact_id=sentiment.artifact_id if sentiment else None,
                 extra_metadata={"narrative_daily_id": nd_run.artifact_id,
                                 "day_diagnostics_id": dg_run.artifact_id,
                                 "partitions_id": pt_run.artifact_id})
@@ -541,12 +616,13 @@ def _findings(kind: str, artifact: Artifact, check):
     return out
 
 
-def _schema_check(files: list[Path], schema: pl.Schema, label: str):
+def _schema_check(files: list[Path], schema: pl.Schema, label: str,
+                  accepted: tuple[pl.Schema, ...] = ()):
     if not files:
         yield f"{label}: no parquet files"
     for p in files[:6]:
         df = pl.read_parquet(p)
-        if df.schema != schema:
+        if df.schema != schema and df.schema not in accepted:
             yield f"{p.name}: schema mismatch"
         if df.is_empty():
             yield f"{p.name}: empty"
@@ -600,7 +676,8 @@ def verify_narrative_daily(artifact: Artifact):
 
 def verify_day_diagnostics(artifact: Artifact):
     def check():
-        yield from _schema_check(artifact.files(), DAY_DIAGNOSTICS_SCHEMA, KIND_DAY_DIAGNOSTICS)
+        yield from _schema_check(artifact.files(), DAY_DIAGNOSTICS_SCHEMA, KIND_DAY_DIAGNOSTICS,
+                                 accepted=(DAY_DIAGNOSTICS_SCHEMA_V1,))
     return _findings(KIND_DAY_DIAGNOSTICS, artifact, check)
 
 
@@ -610,5 +687,6 @@ __all__ = [
     "latest_matching", "mark_temp_deprecated", "is_agent_created", "find_partitions",
     "find_tau_asof",
     "build_tau_asof", "calibration_as_of", "headline_source", "earliest_headline_day",
+    "KIND_SENTIMENT", "resolve_sentiment", "check_sentiment", "sentiment_columns",
     "score_range_to_datalake",
 ]

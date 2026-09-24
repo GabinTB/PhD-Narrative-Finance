@@ -13,11 +13,16 @@ Canonical scorer (spec: python/doc/narratives.md, owner rulings on top of it):
   - calibration.py   Point-in-time records, lookahead guard, mu_asof lookup.
   - selection.py     q-candidates on the full row -> tau -> optional jump cut.
   - aggregation.py   primitive -> narrative per headline; day accumulators (ddof=0).
-  - streaming.py     Bounded-memory per-day access to headline embeddings (+ sentiment).
+  - streaming.py     Bounded-memory per-day access to headline embeddings, with one SENT_*
+                     column of a headline_sentiment artifact joined in for split runs.
   - pipeline.py      score_dates(): the single live/historical entry point.
   - artifacts.py     Datalake registration; score_range_to_datalake(): the one scoring
                      path (chronological replay of the live loop).
-  - jobs.py          CLI: score / tau-asof / mark-temp.
+  - jobs.py          CLI: score / tau-asof / mark-temp (--split sign --sentiment-source
+                     --sentiment-column --neutral-eps for the sentiment split).
+
+Sentiment scores are produced outside this package, as headline_sentiment artifacts
+(ravenpack/headlines/sentiment*.py: RavenPack CSS/ESS, RavenBERT, FinBERT).
   - validation.py    Dense reference implementations, derived views, summaries.
   - _kernels/        Optional compiled fused kernel (asserted equal to numpy).
 

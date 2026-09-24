@@ -91,11 +91,17 @@ DAY_DIAGNOSTICS_SCHEMA: pl.Schema = pl.Schema(
         "F0_CONFIG_ID":              pl.String,
         "TAU_SOURCE_ID":             pl.String,
         "MU_ASOF_ID":                pl.String,
+        "SENTIMENT_SOURCE_ID":       pl.String,     # headline_sentiment artifact:column
         "RSS_GB_BEFORE":             pl.Float64,
         "RSS_GB_AFTER":              pl.Float64,
         "SECONDS":                   pl.Float64,
     }
 )
+
+# The day_diagnostics schema before SENTIMENT_SOURCE_ID existed; artifacts written with it
+# stay valid (the verifier accepts both).
+DAY_DIAGNOSTICS_SCHEMA_V1: pl.Schema = pl.Schema(
+    {k: v for k, v in DAY_DIAGNOSTICS_SCHEMA.items() if k != "SENTIMENT_SOURCE_ID"})
 
 # f0_monthly_partitions: one row (one file) per closed calendar month.
 F0_PARTITION_SCHEMA: pl.Schema = pl.Schema(

@@ -3,6 +3,10 @@
     uv run python -m narrative_scoring.jobs register-taxonomy --taxonomy Evergreen_v5
     uv run python -m narrative_scoring.jobs score    --from 2004-01-01 --to 2004-12-31 \
                                                      --taxonomy Evergreen_v5
+    uv run python -m narrative_scoring.jobs score    --from 2004-01-01 --to 2004-12-31 \
+                                                     --split sign --sentiment-source finbert \
+                                                     --sentiment-column SENT_BAND \
+                                                     --neutral-eps 0.3333333
     uv run python -m narrative_scoring.jobs tau-asof [--window 5Y | expanding] [--today ...]
     uv run python -m narrative_scoring.jobs mark-temp <artifact_id> [...]
 
@@ -12,6 +16,11 @@ $RAW_DATA_PATH/Narrative_Taxonomy and registers them as a ``narrative_taxonomy``
 (latest registration of that name) or ``--taxonomy-artifact ID`` (an exact one, for replays).
 Scoring against several taxonomies = one run per taxonomy; their outputs never mix (every
 family is resolved by the taxonomy hash).
+
+``--split sign`` adds pos/neg(/neu) rows from one SENT_* column of a ``headline_sentiment``
+artifact: ``--sentiment-source NAME`` (latest of that producer built on the scored headlines)
+or ``--sentiment-artifact ID`` (an exact one), plus ``--sentiment-column`` (required) and
+``--neutral-eps``. Source and column enter config_id; the artifact is cited in the lineage.
 
 ``score`` is the one scoring path: it replays the live loop over the dates
 in order (monthly tau_asof job, then the days), enforcing the 1-month delay
@@ -34,6 +43,7 @@ from datetime import date
 from pathlib import Path
 
 from narrative_scoring.config import (
+    SENTIMENT_NONE,
     ParaphraseStyle,
     PoolRule,
     ScoringConfig,
@@ -58,9 +68,42 @@ def _config(args: argparse.Namespace) -> ScoringConfig:
     return ScoringConfig(
         mode=Correction(args.mode), paraphrase_style=style, paraphrase_pooling=pooling,
         q=args.q, jump_cut=args.jump_cut, sentiment_split=SentimentSplit(args.split),
+        neutral_eps=args.neutral_eps,
+        sentiment_source=_sentiment_source_name(args),
+        sentiment_column=args.sentiment_column or "",
         min_month_draws=args.min_month_draws, gap_alert_threshold=args.gap_alert_threshold,
         label=args.label,
     )
+
+
+def _sentiment_source_name(args: argparse.Namespace) -> str:
+    """The producer name for the config: --sentiment-source, or the pinned artifact's."""
+    if args.sentiment_artifact:
+        from datalake import DatalakeIndex
+
+        for root in (os.environ.get("DATALAKE_ROOT"), os.environ.get("DATALAKE_UPSTREAM_ROOT")):
+            if not root:
+                continue
+            with DatalakeIndex(root, create=False) as dl:
+                if dl.exists(args.sentiment_artifact):
+                    return str(dl.get(args.sentiment_artifact).meta.hyperparams["source"])
+        raise SystemExit(f"sentiment artifact {args.sentiment_artifact} not found")
+    return args.sentiment_source or SENTIMENT_NONE
+
+
+def _sentiment(args: argparse.Namespace, config: ScoringConfig, dl, upstream):
+    """The headline_sentiment artifact of a split run (None without a split)."""
+    if config.sentiment_split is not SentimentSplit.SIGN:
+        return None
+    from narrative_scoring.artifacts import KIND_HEADLINES, resolve_sentiment
+
+    art = resolve_sentiment(
+        [dl, upstream], headlines_id=upstream.latest(KIND_HEADLINES).artifact_id,
+        column=config.sentiment_column,
+        source=None if args.sentiment_artifact else config.sentiment_source,
+        artifact_id=args.sentiment_artifact)
+    log.info("sentiment: %s column %s", art.artifact_id, config.sentiment_column)
+    return art
 
 
 def _indexes(args: argparse.Namespace):
@@ -103,13 +146,16 @@ def cmd_score(args: argparse.Namespace) -> int:
 
     dl, upstream = _indexes(args)
     config = _config(args)
+    sentiment = _sentiment(args, config, dl, upstream)
     tax_art, table, P = _table_and_embeddings(args, dl, upstream)
-    source = headline_source(upstream, chunk_size=args.chunk_size, threads=args.threads)
+    source = headline_source(upstream, chunk_size=args.chunk_size, threads=args.threads,
+                             sentiment=sentiment, sentiment_column=config.sentiment_column)
     summary = score_range_to_datalake(
         dl, date.fromisoformat(args.start), date.fromisoformat(args.end), config,
         table=table, P=P, upstream=upstream, source=source, window=args.window,
         seed=args.seed, threads=args.threads, rss_budget_gb=args.rss_budget_gb,
-        temp=args.temp, label=args.label, taxonomy_id=tax_art.artifact_id)
+        temp=args.temp, label=args.label, taxonomy_id=tax_art.artifact_id,
+        sentiment=sentiment)
     for k in ("start", "end", "n_days_scored", "n_days_null_only", "peak_rss_gb",
               "months_finalised", "narrative_daily_id", "day_diagnostics_id",
               "partitions_id", "tau_asof_id"):
@@ -161,6 +207,14 @@ def main(argv: list[str] | None = None) -> int:
     common.add_argument("--q", type=float, default=0.99)
     common.add_argument("--jump-cut", action="store_true")
     common.add_argument("--split", default="none", choices=[s.value for s in SentimentSplit])
+    common.add_argument("--neutral-eps", type=float, default=0.0,
+                        help="|sentiment| <= eps is 'neu' (split runs)")
+    common.add_argument("--sentiment-source", default=None,
+                        help="headline_sentiment producer: ravenpack | ravenbert | finbert")
+    common.add_argument("--sentiment-artifact", default=None,
+                        help="exact headline_sentiment artifact id (overrides the source)")
+    common.add_argument("--sentiment-column", default=None,
+                        help="SENT_* column of the sentiment artifact (split runs)")
     common.add_argument("--min-month-draws", type=int, default=20_000_000)
     common.add_argument("--gap-alert-threshold", type=float, default=0.05)
     common.add_argument("--label", default="")

@@ -13,6 +13,7 @@ from narrative_scoring.schema import EMBEDDING_DIM
 from narrative_scoring.streaming import (
     InMemoryHeadlineSource,
     ParquetHeadlineSource,
+    ParquetSentimentSource,
     arrow_embeddings_to_numpy,
     month_file,
     prefetch,
@@ -68,25 +69,69 @@ def test_day_filter_and_single_copy(month):
     assert src.has_day(date(2008, 9, 1)) and not src.has_day(date(2009, 1, 1))
 
 
-class _MockSentiment:
-    def scores(self, story_ids):
-        # sign from the story index, NaN for every third headline
-        out = np.array([float(int(s.rsplit("-", 1)[1]) % 5 - 2) for s in story_ids])
-        out[[i for i, s in enumerate(story_ids) if int(s.rsplit("-", 1)[1]) % 3 == 0]] = np.nan
-        return out
+def _write_sentiment(root: Path, day: date, n: int, *, drop: int | None = None,
+                     value=None, column: str = "SENT_X", dtype=pl.Float32) -> Path:
+    """A headline_sentiment month for the fixture day: SENT_X = i % 5 - 2 scaled to [-1, 1],
+    NaN for every third story, plus the other fixture day's stories."""
+    d = root / "sentiment"
+    d.mkdir(exist_ok=True)
+    ids, vals = [], []
+    for dd, count in ((day, n), (date(2008, 9, 16), 23)):
+        for i in range(count):
+            if dd == day and i == drop:
+                continue
+            ids.append(f"{dd.isoformat()}-{i}")
+            vals.append(float("nan") if i % 3 == 0 else (i % 5 - 2) / 2)
+    if value is not None:
+        vals[1] = value
+    pl.DataFrame({"RP_STORY_ID": ids, column: pl.Series(vals, dtype=dtype),
+                  "P_POS": pl.Series([0.5] * len(ids), dtype=pl.Float32)}) \
+        .write_parquet(d / month_file(day))
+    return d
 
-    def describe(self):
-        return "mock"
+
+D = date(2008, 9, 15)
 
 
-def test_sentiment_provider_aligned_with_rows(month):
+def test_sentiment_joined_and_aligned_with_rows(month, tmp_path):
     days, src = month
-    src.sentiment = _MockSentiment()
-    chunks = list(src.iter_day(date(2008, 9, 15)))
+    src.sentiment = ParquetSentimentSource(_write_sentiment(tmp_path, D, 50), "SENT_X", "art-1")
+    chunks = list(src.iter_day(D))
+    assert [c.n for c in chunks] == [16, 16, 16, 2]
     sent = np.concatenate([c.sentiment for c in chunks])
-    assert sent.dtype == np.float32 and sent.shape == (50,)
-    assert np.isnan(sent).sum() == len([i for i in range(50) if i % 3 == 0])
-    assert "sentiment:mock" in src.describe()
+    # rows come back ordered by RP_STORY_ID, the sentiment must follow the same order
+    order = sorted(range(50), key=lambda i: f"{D.isoformat()}-{i}")
+    want = np.array([np.nan if i % 3 == 0 else (i % 5 - 2) / 2 for i in order], np.float32)
+    np.testing.assert_array_equal(sent, want)                  # NaN passes through as NaN
+    assert sent.dtype == np.float32
+    assert src.describe().endswith("+sentiment:art-1:SENT_X")
+
+
+@pytest.mark.parametrize("kwargs, column, err, match", [
+    ({"drop": 7}, "SENT_X", LookupError, "no row"),
+    ({"value": 1.5}, "SENT_X", ValueError, "outside"),
+    ({"value": float("inf")}, "SENT_X", ValueError, "outside"),
+    ({}, "SENT_Y", KeyError, "not in"),
+    ({"dtype": pl.Float64}, "SENT_X", TypeError, "float32"),
+])
+def test_sentiment_strict_failures(month, tmp_path, kwargs, column, err, match):
+    _, src = month
+    d = _write_sentiment(tmp_path, D, 50, **kwargs)
+    src.sentiment = ParquetSentimentSource(d, column, "art-1")
+    with pytest.raises(err, match=match):
+        list(src.iter_day(D))
+
+
+def test_sentiment_missing_month_file_and_bad_column_name(month, tmp_path):
+    _, src = month
+    (tmp_path / "empty").mkdir()
+    src.sentiment = ParquetSentimentSource(tmp_path / "empty", "SENT_X")
+    with pytest.raises(FileNotFoundError, match="sentiment month file missing"):
+        list(src.iter_day(D))
+    with pytest.raises(ValueError, match="SENT_"):
+        ParquetSentimentSource(tmp_path, "P_POS")
+    with pytest.raises(ValueError, match="SENT_"):
+        ParquetSentimentSource(tmp_path, "SENT_X; DROP TABLE x")
 
 
 def test_arrow_conversion_rejects_nulls():

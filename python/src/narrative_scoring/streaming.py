@@ -17,23 +17,31 @@ next chunk's I/O with the current chunk's scoring. Rows are ordered by
 RP_STORY_ID so the chunk stream, and with it the seeded null-draw sample,
 is deterministic across runs (a hash join's output order is not).
 
-Sentiment is an optional side channel (``SentimentProvider``): given the
-batch's RP_STORY_IDs it returns one float per headline, NaN for missing.
-No sentiment model is wired here; the provider is an interface.
+Sentiment is an optional side channel (``SentimentSource``): one SENT_* column
+of a ``headline_sentiment`` artifact (ravenpack/headlines/sentiment.py, the
+score database contract), LEFT JOINed on RP_STORY_ID in the same day query,
+so the score arrives in the same Arrow batch as the embedding, already
+aligned, with no per-row Python lookup. Strict: a missing month file or
+column, a scored headline without a sentiment row, or a value outside
+[-1, 1] raises; a NaN value is a legitimate "no score" and passes through.
+The score is a function of the story as published, hence available at the
+headline's own timestamp (point-in-time).
 """
 from __future__ import annotations
 
 import logging
 import queue
+import re
 import threading
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any, Iterator, Protocol, Sequence
+from typing import Any, Iterator, Protocol
 
 import duckdb
 import numpy as np
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 from narrative_scoring.schema import EMBEDDING_DIM
 
@@ -68,12 +76,40 @@ class Chunk:
         return int(self.embeddings.shape[0])
 
 
-class SentimentProvider(Protocol):
-    """One sentiment score per headline id; NaN when unknown."""
+class SentimentSource(Protocol):
+    """Where a day's sentiment scores live: one column of monthly parquet files keyed by
+    RP_STORY_ID (the headline_sentiment contract)."""
 
-    def scores(self, story_ids: Sequence[str]) -> np.ndarray: ...
+    column: str
+    artifact_id: str
+
+    def month_path(self, day: date) -> Path: ...
 
     def describe(self) -> str: ...
+
+
+SCORE_COLUMN_RE = re.compile(r"^SENT_[A-Z0-9_]+$")
+
+
+@dataclass
+class ParquetSentimentSource:
+    """One ``SENT_*`` column of a registered ``headline_sentiment`` artifact."""
+
+    sentiment_dir: Path
+    column: str
+    artifact_id: str = ""
+
+    def __post_init__(self) -> None:
+        self.sentiment_dir = Path(self.sentiment_dir)
+        if not SCORE_COLUMN_RE.match(self.column):
+            raise ValueError(f"sentiment column must match {SCORE_COLUMN_RE.pattern}, "
+                             f"got {self.column!r}")
+
+    def month_path(self, day: date) -> Path:
+        return self.sentiment_dir / month_file(day)
+
+    def describe(self) -> str:
+        return f"{self.artifact_id or self.sentiment_dir.name}:{self.column}"
 
 
 class HeadlineSource(Protocol):
@@ -99,7 +135,7 @@ class ParquetHeadlineSource:
     duckdb_memory_limit: str = "6GB"
     temp_directory: str | None = "/tmp/duckdb_spill"
     source_id: str = ""
-    sentiment: SentimentProvider | None = None
+    sentiment: SentimentSource | None = None
 
     def __post_init__(self) -> None:
         self.headlines_dir = Path(self.headlines_dir)
@@ -121,7 +157,12 @@ class ParquetHeadlineSource:
         name = month_file(day)
         hl, emb = self.headlines_dir / name, self.embeddings_dir / name
         day_after = (day + timedelta(days=1)).isoformat()
-        id_col = ", h.RP_STORY_ID" if self.sentiment is not None else ""
+        sent_cols, sent_join = "", ""
+        if self.sentiment is not None:
+            sent_path = self._sentiment_file(day)
+            col = self.sentiment.column
+            sent_cols = f", CAST(s.{col} AS FLOAT) AS SENT, s.RP_STORY_ID IS NULL AS NO_ROW"
+            sent_join = f"LEFT JOIN read_parquet('{sent_path}') s USING (RP_STORY_ID)"
         conn = duckdb.connect()
         try:
             conn.execute("SET enable_progress_bar=false")
@@ -131,9 +172,10 @@ class ParquetHeadlineSource:
                 Path(self.temp_directory).mkdir(parents=True, exist_ok=True)
                 conn.execute(f"SET temp_directory='{self.temp_directory}'")
             query = f"""
-                SELECT CAST(e.EMBEDDING AS FLOAT[{EMBEDDING_DIM}]) AS EMBEDDING{id_col}
+                SELECT CAST(e.EMBEDDING AS FLOAT[{EMBEDDING_DIM}]) AS EMBEDDING{sent_cols}
                 FROM read_parquet('{hl}') h
                 JOIN read_parquet('{emb}') e USING (RP_STORY_ID)
+                {sent_join}
                 WHERE h.TIMESTAMP_UTC >= '{day.isoformat()}'
                   AND h.TIMESTAMP_UTC < '{day_after}'
                 ORDER BY h.RP_STORY_ID
@@ -142,15 +184,45 @@ class ParquetHeadlineSource:
                 if not batch.num_rows:
                     continue
                 X = arrow_embeddings_to_numpy(batch.column(0))
-                sent = None
-                if self.sentiment is not None:
-                    sent = np.asarray(self.sentiment.scores(batch.column(1).to_pylist()),
-                                      dtype=np.float32)
-                    if sent.shape != (X.shape[0],):
-                        raise ValueError("sentiment provider returned a mis-shaped array")
+                sent = (self._checked_sentiment(batch, day) if self.sentiment is not None
+                        else None)
                 yield Chunk(X, sent)
         finally:
             conn.close()
+
+    def _sentiment_file(self, day: date) -> Path:
+        """The day's sentiment month file, after the file and column checks."""
+        assert self.sentiment is not None
+        path = self.sentiment.month_path(day)
+        if not path.exists():
+            raise FileNotFoundError(f"{day}: sentiment month file missing: {path} "
+                                    f"({self.sentiment.describe()})")
+        schema = pq.read_schema(path)
+        col = self.sentiment.column
+        if col not in schema.names:
+            raise KeyError(f"{day}: sentiment column {col!r} not in {path.name} "
+                           f"(has {[n for n in schema.names if n.startswith('SENT_')]})")
+        if schema.field(col).type != pa.float32():
+            raise TypeError(f"{day}: sentiment column {col!r} is {schema.field(col).type}, "
+                            f"expected float32")
+        return path
+
+    def _checked_sentiment(self, batch: pa.RecordBatch, day: date) -> np.ndarray:
+        """float32 scores of the batch; raises on unmatched stories or out-of-range values."""
+        no_row = batch.column(2).to_numpy(zero_copy_only=False)
+        if no_row.any():
+            raise LookupError(f"{day}: {int(no_row.sum())} scored headline(s) have no row in "
+                              f"{self.sentiment.describe()} (strict coverage)")
+        col = batch.column(1)
+        if col.null_count:
+            raise ValueError(f"{day}: {col.null_count} null sentiment value(s) in "
+                             f"{self.sentiment.describe()}; the contract uses NaN")
+        sent = col.to_numpy(zero_copy_only=False).astype(np.float32, copy=False)
+        bad = ~np.isnan(sent) & ~((sent >= -1.0) & (sent <= 1.0))
+        if bad.any():
+            raise ValueError(f"{day}: {int(bad.sum())} sentiment value(s) outside [-1, 1] in "
+                             f"{self.sentiment.describe()}")
+        return sent
 
 
 def arrow_embeddings_to_numpy(column: pa.Array) -> np.ndarray:
