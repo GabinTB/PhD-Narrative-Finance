@@ -36,6 +36,7 @@ dependencies = [
 
 [project.scripts]
 datalake = "datalake.cli:main"
+jobs = "datalake.jobs_cli:main"
 
 [project.entry-points."narrative_finance.verifiers"]
 ravenpack_headlines = "ravenpack.headlines.ingest:verify_artifact"

@@ -158,6 +158,15 @@ class Job(ABC):
     def from_artifact(cls, artifact: Artifact, index: DatalakeIndex, **kwargs: Any) -> Job:
         """Rebuild the job from the artifact alone (hyperparams, card, lineage)."""
 
+    @classmethod
+    def add_cli_args(cls, parser: Any) -> None:
+        """Arguments of ``jobs start <kind>`` (none by default)."""
+
+    @classmethod
+    def from_args(cls, args: Any, index: DatalakeIndex) -> Job:
+        """Build a fresh job from ``jobs start <kind>`` arguments."""
+        raise JobError(f"{cls.kind} cannot be started from the jobs CLI")
+
 
 # ---------------------------------------------------------------------------
 # Registry
