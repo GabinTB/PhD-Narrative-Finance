@@ -2,6 +2,7 @@
 
     jobs start <kind> [job arguments]        a fresh run (``jobs start <kind> -h``)
     jobs resume <artifact_id> [--opt k=v]    finish a partial run from the artifact alone
+    jobs update <artifact_id> [--opt k=v]    add new data to a complete artifact (new execution)
     jobs pause <artifact_id>                 stop it at the next unit boundary
     jobs status [<artifact_id>]              one job, or every partial job
     jobs list [--state running|stale|paused|failed|partial]
@@ -75,7 +76,8 @@ def build_parser() -> argparse.ArgumentParser:
     for kind, cls in sorted(registered_jobs().items()):
         cls.add_cli_args(kinds.add_parser(kind, help=(cls.__doc__ or "").strip().split("\n")[0]))
 
-    for name, help_ in (("resume", "finish a partial run"), ("check", "check a partial run")):
+    for name, help_ in (("resume", "finish a partial run"), ("check", "check a partial run"),
+                        ("update", "add new data to a complete artifact")):
         p = sub.add_parser(name, help=help_)
         p.add_argument("artifact_id")
         p.add_argument("--opt", action="append", metavar="KEY=VALUE",
@@ -112,6 +114,9 @@ def main(argv: list[str] | None = None) -> int:
             _print_status(runner.status(art.artifact_id))
         elif args.command == "resume":
             art = runner.resume(args.artifact_id, **_opts(args.opt))
+            _print_status(runner.status(art.artifact_id))
+        elif args.command == "update":
+            art = runner.update(args.artifact_id, **_opts(args.opt))
             _print_status(runner.status(art.artifact_id))
         elif args.command == "pause":
             runner.pause(args.artifact_id)

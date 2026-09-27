@@ -23,13 +23,16 @@ class CliToyJob(Job):
     pipeline_version = "v0.1.0"
     die_at: str | None = None
 
-    def __init__(self, layout: Layout, temp: bool = True, scale: int = 1) -> None:
-        self.layout, self.temp, self.scale = layout, temp, scale
+    def __init__(self, layout: Layout, temp: bool = True, scale: int = 1,
+                 update: str | None = None) -> None:
+        self.layout, self.temp, self.scale, self.update = layout, temp, scale, update
 
     def params(self) -> dict[str, Any]:
         return self.layout.hyperparams()
 
     def units(self) -> list[Unit]:
+        if self.update:
+            return [Unit(self.update)]
         return [Unit(p.key) for p in self.layout.expected()]
 
     def is_done(self, unit: Unit, out_dir: Path) -> bool:
@@ -40,7 +43,8 @@ class CliToyJob(Job):
 
         if unit.key == self.die_at:
             raise RuntimeError(f"killed during {unit.key}")
-        pl.DataFrame({"day": parse_key(unit.key).days()}).write_parquet(
+        days = [] if self.update else parse_key(unit.key).days()
+        pl.DataFrame({"day": days}, schema={"day": pl.Date}).write_parquet(
             ctx.out_dir / f"{unit.key}.parquet")
 
     @classmethod
@@ -56,6 +60,11 @@ class CliToyJob(Job):
     @classmethod
     def from_artifact(cls, artifact, index, **kwargs) -> CliToyJob:
         return cls(layout_from_hyperparams(artifact.meta.hyperparams), **kwargs)
+
+    @classmethod
+    def for_update(cls, artifact, index, **kwargs) -> CliToyJob:
+        return cls(layout_from_hyperparams(artifact.meta.hyperparams),
+                   update=f"update-{len(artifact.meta.runs)}", **kwargs)
 
 
 @pytest.fixture
@@ -131,3 +140,27 @@ def test_missing_root_is_an_error(monkeypatch, capsys):
     monkeypatch.setattr("dotenv.load_dotenv", lambda *a, **k: False)
     monkeypatch.delenv("DATALAKE_ROOT", raising=False)
     assert main(["list"]) == 2
+
+
+def test_update_appends_an_execution_to_a_complete_artifact(lake, capsys):
+    assert _run(lake, "start", "toy_cli", "--start", "2008-01-01", "--end", "2008-02-29") == 0
+    art = _partial(lake)
+    capsys.readouterr()
+    assert _run(lake, "update", art.artifact_id) == 0
+    out = capsys.readouterr().out
+    assert "complete" in out and "1/1" in out
+    done = _partial(lake)
+    assert len(done.meta.runs) == 2 and not done.partial
+    assert (done.path / "update-1.parquet").exists()
+    assert done.meta.runs[-1].produced == ["update-1.parquet"]
+
+
+def test_update_of_a_partial_artifact_is_refused(lake):
+    from datalake.jobs import JobError
+
+    CliToyJob.die_at = "2008-02"
+    with pytest.raises(RuntimeError):
+        _run(lake, "start", "toy_cli", "--start", "2008-01-01", "--end", "2008-03-31")
+    CliToyJob.die_at = None
+    with pytest.raises(JobError, match="partial"):
+        _run(lake, "update", _partial(lake).artifact_id)

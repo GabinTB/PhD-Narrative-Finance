@@ -10,6 +10,8 @@ A ``Job`` declares WHAT it computes; ``JobRunner`` owns HOW it runs:
     run_unit(unit, ctx)                    the work
     finalize(ctx)                          optional last step (e.g. a series from checkpoints)
     from_artifact(artifact, index)         rebuild the job from the artifact alone (resume)
+    for_update(artifact, index)            optional: the job adding new data to a complete
+                                           artifact (update)
 
 Runner guarantees, identical for every job:
 
@@ -17,6 +19,10 @@ Runner guarantees, identical for every job:
     job is rebuilt from the artifact, the code's pipeline_version is checked
     against the artifact's (same major.minor, else refused), and the models
     are checked against the recorded identities (``backend.check_unchanged``);
+  * update -> ``run(extend=...)`` on a COMPLETE artifact, with the same version
+    and model checks: a new RunRecord, new files only (existing files are never
+    rewritten). A crashed update leaves the artifact partial; ``resume``
+    finishes it (``from_artifact`` recognises the unfinished update);
   * the unit loop skips done units, re-checks the models before every unit,
     runs it, then updates ``job.json`` (status, units done / total, current
     unit, rate, ETA, host, pid, heartbeat, last error, version, commit);
@@ -165,6 +171,11 @@ class Job(ABC):
     @abstractmethod
     def from_artifact(cls, artifact: Artifact, index: DatalakeIndex, **kwargs: Any) -> Job:
         """Rebuild the job from the artifact alone (hyperparams, card, lineage)."""
+
+    @classmethod
+    def for_update(cls, artifact: Artifact, index: DatalakeIndex, **kwargs: Any) -> Job:
+        """The job adding new data to the complete ``artifact`` (default: unsupported)."""
+        raise JobError(f"{cls.kind} does not support updates")
 
     @classmethod
     def add_cli_args(cls, parser: Any) -> None:
@@ -426,6 +437,31 @@ class JobRunner:
         return self._execute(job, resume=artifact_id, notes=self._dirty_guard(job, ""),
                              hyperparams=art.meta.hyperparams)
 
+    def update(self, artifact_id: str, **job_kwargs: Any) -> Artifact:
+        """Add new data to a complete artifact (``Job.for_update``), as a new execution."""
+        art = self._complete(artifact_id)
+        cls = job_class(art.kind)
+        check_resume_version(art.meta.pipeline_version, cls.pipeline_version)
+        return self.update_job(artifact_id, cls.for_update(art, self.index, **job_kwargs))
+
+    def update_job(self, artifact_id: str, job: Job) -> Artifact:
+        """``update`` with an already built ``job`` (library callers)."""
+        art = self._complete(artifact_id)
+        if art.kind != job.kind:
+            raise JobError(f"{artifact_id} is a {art.kind}, not a {job.kind}")
+        check_resume_version(art.meta.pipeline_version, job.pipeline_version)
+        for backend in job.backends():
+            backend.check_unchanged()
+        return self._execute(job, resume=None, extend=artifact_id,
+                             notes=self._dirty_guard(job, job.notes()),
+                             hyperparams=art.meta.hyperparams)
+
+    def _complete(self, artifact_id: str) -> Artifact:
+        art = self.index.get(artifact_id)
+        if art.partial:
+            raise JobError(f"{artifact_id} is partial; finish it with resume before updating")
+        return art
+
     def _partial(self, artifact_id: str) -> Artifact:
         art = self.index.get(artifact_id)
         if not art.partial:
@@ -496,19 +532,20 @@ class JobRunner:
     # -- execution ----------------------------------------------------------
 
     def _execute(self, job: Job, *, resume: str | None, notes: str,
-                 hyperparams: dict[str, Any] | None = None) -> Artifact:
+                 hyperparams: dict[str, Any] | None = None,
+                 extend: str | None = None) -> Artifact:
         run_kwargs = dict(kind=job.kind, pipeline=job.pipeline,
                           pipeline_version=job.version, pipeline_repo=job.pipeline_repo,
                           hyperparams=hyperparams if hyperparams is not None else job.params(),
                           sources=job.sources(),
                           model_card=job.model_card(), verifier=job.verifier,
                           repo_dir=self.repo_dir, notes=notes, hash_pattern=job.hash_pattern)
-        artifact_id: str | None = resume
+        artifact_id: str | None = resume or extend
         previous = self._install_signals()
         try:
-            with self.index.run(resume=resume, **run_kwargs) as run:
+            with self.index.run(resume=resume, extend=extend, **run_kwargs) as run:
                 artifact_id = run.artifact_id
-                self._loop(job, run)
+                self._loop(job, run, new_execution=extend is not None)
             return self.index.get(artifact_id)
         except JobPaused:
             log.info("job %s paused at a unit boundary", artifact_id)
@@ -516,7 +553,7 @@ class JobRunner:
         finally:
             self._restore_signals(previous)
 
-    def _loop(self, job: Job, run: Any) -> None:
+    def _loop(self, job: Job, run: Any, *, new_execution: bool = False) -> None:
         out_dir: Path = run.out_dir
         (out_dir / PAUSE_FILE).unlink(missing_ok=True)
         units = job.units()
@@ -524,7 +561,7 @@ class JobRunner:
                          units_total=len(units), pipeline_version=job.version,
                          commit=run.record.pipeline_commit,
                          backends=[b.identity() for b in job.backends()])
-        previous = JobState.read(out_dir)
+        previous = None if new_execution else JobState.read(out_dir)   # an update starts afresh
         if previous is not None:
             state.started_at, state.unit_seconds = previous.started_at, previous.unit_seconds
 

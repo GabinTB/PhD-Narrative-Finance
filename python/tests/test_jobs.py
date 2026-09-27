@@ -275,3 +275,11 @@ def test_json_log_lines_and_log_file_off(env, tmp_path):
     runner.log_file = False
     art2 = runner.start(ToyJob(Layout("M", date(2010, 1, 1), date(2010, 1, 31))))
     assert not (art2.path / LOG_FILE).exists()
+
+
+def test_update_is_refused_for_a_job_without_updates(env):
+    index, runner = env
+    art = runner.start(ToyJob(LAYOUT))
+    with pytest.raises(JobError, match="does not support updates"):
+        runner.update(art.artifact_id)
+    assert len(index.get(art.artifact_id).meta.runs) == 1
