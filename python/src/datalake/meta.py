@@ -49,14 +49,19 @@ def hash_file(path: Path) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
+# datalake.jobs control files: run state, not outputs (never hashed)
+JOB_CONTROL_FILES = ("job.json", "job.lock", "job.log", "PAUSE")
+
+
 def hash_directory(
     directory: Path,
     pattern: str = "*",
-    exclude: frozenset[str] = frozenset({META_FILENAME, README_FILENAME}),
+    exclude: frozenset[str] = frozenset({META_FILENAME, README_FILENAME,
+                                         *JOB_CONTROL_FILES}),
 ) -> dict[str, dict[str, Any]]:
     """Hash every matching file directly inside `directory` (non-recursive).
 
-    Sidecars are excluded by default.  Returns
+    Sidecars and job control files (datalake.jobs) are excluded by default.  Returns
     {filename: {"digest", "size_bytes", "algorithm"}}, sorted by filename.
     """
     results: dict[str, dict[str, Any]] = {}

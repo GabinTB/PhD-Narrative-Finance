@@ -36,6 +36,8 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -46,6 +48,7 @@ import pandas as pd
 import polars as pl
 
 from datalake import Artifact, DatalakeError, DatalakeIndex
+from datalake.jobs import Job, JobContext, Unit, register_job
 from datalake.layout import Layout, layout_of
 from datalake.meta import git_commit
 from narrative_scoring.config import ScoringConfig, SentimentSplit
@@ -598,18 +601,346 @@ def calibration_as_of(dl: DatalakeIndex, config: ScoringConfig, table: Primitive
 # THE scoring path: chronological replay of the live loop
 # ---------------------------------------------------------------------------
 
-def score_range_to_datalake(
-    dl: DatalakeIndex, start: date, end: date, config: ScoringConfig, *,
-    table: PrimitiveTable, P: np.ndarray, upstream: DatalakeIndex | None = None,
-    source: HeadlineSource | None = None, window: str = WINDOW_DEFAULT, seed: int = 0,
-    keep_primitive_daily: bool = False, threads: int = 8,
-    rss_budget_gb: float | None = 30.0, use_kernel: bool | None = None,
-    temp: bool = False, label: str = "", taxonomy_id: str | None = None,
-    sentiment: Artifact | None = None, primitive_meta: dict[str, Any] | None = None,
-    inputs: dict[str, str | None] | None = None, resume: dict[str, str] | None = None,
-    calendar: CalibrationCalendar = DEFAULT_CALENDAR,
-) -> dict[str, Any]:
-    """Score [start, end] chronologically through the live machinery.
+@register_job
+class ScoringJob(Job):
+    """Narrative scores over [start, end]: per calibration period, tau then the days.
+
+    The replay of the live loop; one unit = one calibration period. Writes narrative_daily (the
+    job's artifact) with its siblings day_diagnostics and the null partitions, which
+    ``session`` holds open across units; tau_asof is extended by its own nested runs."""
+
+    kind = KIND_NARRATIVE_DAILY
+    pipeline_version = PIPELINE_VERSION
+    hash_pattern = "*"
+
+    def __init__(
+        self, dl: DatalakeIndex, start: date, end: date, config: ScoringConfig, *,
+        table: PrimitiveTable, P: np.ndarray, upstream: DatalakeIndex | None = None,
+        source: HeadlineSource | None = None, window: str = WINDOW_DEFAULT, seed: int = 0,
+        keep_primitive_daily: bool = False, threads: int = 8,
+        rss_budget_gb: float | None = 30.0, use_kernel: bool | None = None,
+        temp: bool = False, label: str = "", taxonomy_id: str | None = None,
+        sentiment: Artifact | None = None, primitive_meta: dict[str, Any] | None = None,
+        inputs: dict[str, str | None] | None = None, resume: dict[str, str] | None = None,
+        calendar: CalibrationCalendar = DEFAULT_CALENDAR,
+    ) -> None:
+        upstream = upstream or dl
+        if end < start:
+            raise ValueError("end before start")
+        inputs = inputs or {}
+        hl = upstream.get(inputs["headlines"]) if inputs.get("headlines") \
+            else upstream.latest(KIND_HEADLINES)
+        em = upstream.get(inputs["embeddings"]) if inputs.get("embeddings") \
+            else upstream.latest(KIND_EMBEDDINGS)
+        mu_id = inputs.get("mu_asof")
+        split = config.sentiment_split is SentimentSplit.SIGN
+        if split != (sentiment is not None):
+            raise ValueError("a sentiment artifact is required iff sentiment_split=sign")
+        if sentiment is not None:
+            check_sentiment(sentiment, headlines_id=hl.artifact_id,
+                            column=config.sentiment_column, source=config.sentiment_source)
+        source = source or headline_source(upstream, threads=threads, sentiment=sentiment,
+                                           sentiment_column=config.sentiment_column,
+                                           headlines=hl, embeddings=em)
+        mu_art, first_mu = _mu_inputs(upstream, config, mu_id)
+
+        earliest = earliest_headline_day(hl)
+        x_min = calendar.first_scorable(earliest)
+        if start < x_min:
+            log.warning("requested start %s precedes earliest data %s + delay %s + one %s "
+                        "period; start shifted to %s (cold start: earlier periods feed the "
+                        "null partitions only)", start, earliest, calendar.delay,
+                        calendar.freq, x_min)
+            start = x_min
+        if end < start:
+            log.warning("nothing to score: end %s precedes the shifted start %s", end, start)
+
+        emb_key = embedding_key(P, primitive_meta)
+        parts_art = (dl.get(resume["partitions"]) if resume
+                     else find_partitions(dl, config, table, emb_key, seed, temp, calendar))
+        have = (set(load_partitions(parts_art.path)["MONTH_END"].to_list())
+                if parts_art else set())
+        # periods that end before the first mu_asof row can never be corrected, hence
+        # never yield a partition: not walked at all
+        first_correctable = first_mu["DATE"].min() if first_mu is not None else earliest
+        walk = [p for p in calendar.periods(earliest, end) if p.last >= first_correctable]
+        hp = {**_taxonomy_params(table), "embeddings_id": emb_key,
+              "config_id": config.digest(),
+              "f0_config_id": config.f0_digest(), "mode": config.mode.value,
+              "pooling": config.paraphrase_pooling.value, "q": config.q,
+              "split": config.sentiment_split.value, "window": window, "seed": seed,
+              "start": start.isoformat(), "end": end.isoformat(), "label": label,
+              "taxonomy_artifact_id": taxonomy_id, "agent_created": temp,
+              **calendar.hyperparams()}
+        if sentiment is not None:
+            hp.update(sentiment_source=config.sentiment_source,
+                      sentiment_column=config.sentiment_column,
+                      sentiment_artifact_id=sentiment.artifact_id)
+
+        self.dl, self.upstream, self.config, self.table, self.P = dl, upstream, config, table, P
+        self.source, self.window, self.seed, self.temp = source, window, seed, temp
+        self.keep_primitive_daily, self.threads = keep_primitive_daily, threads
+        self.rss_budget_gb, self.use_kernel, self.label = rss_budget_gb, use_kernel, label
+        self.taxonomy_id, self.sentiment, self.primitive_meta = taxonomy_id, sentiment, \
+            primitive_meta
+        self.resume, self.calendar, self.start, self.end = resume or {}, calendar, start, end
+        self.hl, self.em, self.mu_art, self.mu_id = hl, em, mu_art, mu_id
+        self.earliest, self.emb_key, self.parts_art, self.have = earliest, emb_key, \
+            parts_art, have
+        self.hp = hp
+        self.provenance = embeddings_provenance(P, primitive_meta, em)
+        self._sources: list[Any] = ([hl, em] + ([mu_art] if mu_art else [])
+                                    + ([taxonomy_id] if taxonomy_id else []))
+        self.summary: dict[str, Any] = {
+            "start": start, "end": end, "earliest_data": earliest, "n_days_scored": 0,
+            "n_days_null_only": 0, "peak_rss_gb": 0.0, "months_finalised": [],
+            "tau_rows": None}
+        start_period = calendar.period_of(start).first
+        self._plan: dict[str, tuple[Any, list[date], str]] = {}
+        for period in walk:
+            all_days = period.days()
+            days = [d for d in all_days if d <= end]
+            if period.first < start_period:
+                mode = "null-only (pre-start)"
+            else:
+                days = [d for d in days if d >= start]
+                mode = "score"
+            if days:
+                self._plan[period.key] = (period, days, mode)
+
+    # -- identity -------------------------------------------------------------
+
+    def params(self) -> dict[str, Any]:
+        return self.hp
+
+    def sources(self) -> list[Any]:
+        return self._sources + ([self.sentiment] if self.sentiment is not None else [])
+
+    # -- units ----------------------------------------------------------------
+
+    def units(self) -> list[Unit]:
+        return [Unit(key, mode) for key, (_, _, mode) in self._plan.items()]
+
+    def is_done(self, unit: Unit, out_dir: Path) -> bool:
+        period, _, mode = self._plan[unit.key]
+        if mode != "score":
+            return period.last in self.have                    # partition already there
+        return Layout(self.calendar.freq).path_of(out_dir, period).exists()
+
+    @contextmanager
+    def session(self, ctx: JobContext) -> Iterator[None]:
+        """Open day_diagnostics and the null partitions next to narrative_daily."""
+        dl, config, calendar = self.dl, self.config, self.calendar
+        run_kw = dict(pipeline=self.pipeline, pipeline_version=self.version,
+                      pipeline_repo=self.pipeline_repo, repo_dir=_repo_dir())
+        parts_art = self.parts_art
+        pt_partial = bool(parts_art) and parts_art.partial
+        nd_run = ctx.run
+        with dl.run(kind=KIND_DAY_DIAGNOSTICS, hyperparams=self.hp, sources=self.sources(),
+                    verifier=KIND_DAY_DIAGNOSTICS, hash_pattern="*",
+                    resume=self.resume.get("day_diagnostics"), **run_kw) as dg_run, \
+             dl.run(kind=KIND_PARTITIONS,
+                    hyperparams=partitions_params(config, self.table, self.emb_key, self.seed,
+                                                  self.temp, calendar),
+                    sources=self._sources, verifier=KIND_PARTITIONS, hash_pattern="*.parquet",
+                    extend=parts_art.artifact_id if parts_art and not pt_partial else None,
+                    resume=parts_art.artifact_id if pt_partial else None, **run_kw) as pt_run:
+            for out_dir in (nd_run.out_dir, dg_run.out_dir, pt_run.out_dir):
+                record_provenance(out_dir, self.provenance)
+            if not self.resume:
+                write_run_config(nd_run.out_dir, {
+                    "config": config.to_dict(), "start": self.start.isoformat(),
+                    "end": self.end.isoformat(), "window": self.window, "seed": self.seed,
+                    "label": self.label, "temp": self.temp,
+                    "keep_primitive_daily": self.keep_primitive_daily,
+                    "taxonomy_artifact_id": self.taxonomy_id,
+                    "calibration": {"freq": calendar.freq, "delay": calendar.delay},
+                    "sentiment_artifact_id": (self.sentiment.artifact_id if self.sentiment
+                                              else None),
+                    "inputs": {"headlines": self.hl.artifact_id,
+                               "embeddings": self.em.artifact_id,
+                               "mu_asof": self.mu_art.artifact_id if self.mu_art else None},
+                    "primitive_embeddings": {
+                        "embedding_key": self.emb_key,
+                        "paraphrase_style": config.paraphrase_style.value,
+                        "model_card": (self.primitive_meta or {}).get("model_card")},
+                    "artifacts": {"narrative_daily": nd_run.artifact_id,
+                                  "day_diagnostics": dg_run.artifact_id,
+                                  "partitions": pt_run.artifact_id},
+                })
+            self.nd_run, self.dg_run, self.pt_run = nd_run, dg_run, pt_run
+            self.writer = ParquetMonthWriter(nd_run.out_dir, dg_run.out_dir, freq=calendar.freq)
+            partition_writer = NullPartitionWriter(
+                pt_run.out_dir, config=config, table=self.table, seed=self.seed,
+                input_ids={"headlines": self.hl.artifact_id, "embeddings": self.em.artifact_id,
+                           "mu_asof": self.mu_art.artifact_id if self.mu_art else None},
+                code_version=pt_run.record.pipeline_commit, freq=calendar.freq)
+            self.sink = SkipClosedDays(partition_writer) if self.resume else partition_writer
+            self.last_metadata = None
+            yield
+        self.summary.update(narrative_daily_id=nd_run.artifact_id,
+                            day_diagnostics_id=dg_run.artifact_id,
+                            partitions_id=pt_run.artifact_id)
+
+    def run_unit(self, unit: Unit, ctx: JobContext) -> None:
+        """(1) the tau job as of the period's first day; (2) its days, through the one
+        pipeline; (3) the period's null partition closes when the period does."""
+        period, days, mode = self._plan[unit.key]
+        dl, config, calendar, summary = self.dl, self.config, self.calendar, self.summary
+        tau_art = build_tau_asof(dl, config, self.table, self.P, upstream=self.upstream,
+                                 window=self.window, seed=self.seed, today=period.first,
+                                 temp=self.temp, partitions_art=dl.get(self.pt_run.artifact_id),
+                                 taxonomy_id=self.taxonomy_id,
+                                 primitive_meta=self.primitive_meta, mu_id=self.mu_id,
+                                 calendar=calendar)
+        cal = calibration_as_of(dl, config, self.table, self.emb_key, upstream=self.upstream,
+                                window=self.window, seed=self.seed, temp=self.temp,
+                                mu_id=self.mu_id, as_of=period.first, calendar=calendar)
+        if tau_art is not None:
+            summary["tau_rows"] = load_tau_series(tau_art)
+        log.info("%s %s: %s, %d day(s), tau rows available: %d",
+                 "month" if calendar.freq == "M" else "period", period.key, mode, len(days),
+                 cal.tau_df.height)
+        res = score_dates(
+            days, config, table=self.table, primitive_embeddings=self.P, source=self.source,
+            calibration=cal, writer=self.writer, null_sink=self.sink,
+            tau_missing="null_only", keep_primitive_daily=self.keep_primitive_daily,
+            collect=False, use_kernel=self.use_kernel, threads=self.threads,
+            rss_budget_gb=self.rss_budget_gb, seed=self.seed,
+            code_version=self.nd_run.record.pipeline_commit,
+            sentiment_artifact_id=self.sentiment.artifact_id if self.sentiment else None,
+            embeddings_provenance=self.provenance,
+            extra_metadata={"narrative_daily_id": self.nd_run.artifact_id,
+                            "day_diagnostics_id": self.dg_run.artifact_id,
+                            "partitions_id": self.pt_run.artifact_id})
+        summary["n_days_scored"] += res.n_days
+        summary["n_days_null_only"] += len(res.null_only_days)
+        summary["peak_rss_gb"] = max(summary["peak_rss_gb"], res.peak_rss_gb)
+        if res.metadata is not None:
+            self.last_metadata = res.metadata
+        if days[-1] == period.last:                # the period closed on schedule
+            self.sink.finalise_before(period.next().first)
+
+    def finalize(self, ctx: JobContext) -> None:
+        summary, calendar = self.summary, self.calendar
+        summary["months_finalised"] = [p.name for p in self.sink.finalised]
+        if self.last_metadata is not None:
+            self.writer.close(self.last_metadata)
+        self.pt_run.note(f"{len(self.sink.finalised)} {calendar.freq} partition(s) finalised "
+                         f"in [{self.earliest}, {self.end}]")
+        self.nd_run.note(f"{summary['n_days_scored']} day(s) scored, "
+                         f"{summary['n_days_null_only']} null-only, peak RSS "
+                         f"{summary['peak_rss_gb']:.2f} GB")
+        self.dg_run.note(f"{summary['n_days_scored']} day(s)")
+
+    def final_summary(self) -> dict[str, Any]:
+        """The run summary (artifact ids, counts) once the job has completed."""
+        tau_art = find_tau_asof(self.dl, self.config, self.table, self.emb_key, self.window,
+                                self.seed, self.temp, self.calendar)
+        return {**self.summary, "tau_asof_id": tau_art.artifact_id if tau_art else None}
+
+    # -- resume / CLI -----------------------------------------------------------
+
+    @classmethod
+    def from_artifact(cls, artifact: Artifact, index: DatalakeIndex, *,
+                      upstream: DatalakeIndex | None = None, cache_dir: Path | None = None,
+                      threads: int = 8, chunk_size: int = 8_192,
+                      rss_budget_gb: float | None = 30.0, use_kernel: bool | None = None,
+                      embedder: Any = None) -> ScoringJob:
+        """Everything from the run's ``run_config.json`` (written at its start):
+        config, dates, window, seed, taxonomy, sentiment, the exact upstream inputs
+        (never "latest") and the sibling artifact ids. The primitive-text embedder is
+        rebuilt from the recorded model card and must serve the same model (a remote
+        server's metadata is read first); its embeddings come from the recipe-keyed
+        cache. Only throughput knobs come from the caller."""
+        from datalake import ModelCard
+        from narrative_scoring.primitives import embed_primitive_texts
+        from nlp.embedding import embedder_from_card
+
+        dl = index
+        upstream = upstream or _upstream_from_env(dl)
+        nd = artifact
+        if nd.kind != KIND_NARRATIVE_DAILY:
+            raise ValueError(f"{nd.artifact_id} is a {nd.kind}, not a {KIND_NARRATIVE_DAILY}")
+        path = nd.path / RUN_CONFIG_FILE
+        if not path.exists():
+            raise ValueError(f"{nd.artifact_id} has no {RUN_CONFIG_FILE} (written before "
+                             "resume support); it cannot be resumed")
+        rc = json.loads(path.read_text())
+        config = ScoringConfig(**rc["config"])
+        tax_art = resolve_taxonomy([dl, upstream], artifact_id=rc["taxonomy_artifact_id"])
+        table = load_registered_table(tax_art, rc["primitive_embeddings"]["paraphrase_style"])
+        card = rc["primitive_embeddings"]["model_card"]
+        if embedder is None:
+            if card is None:
+                raise ValueError("the run recorded no primitive-embedding model card")
+            embedder = embedder_from_card(ModelCard.from_dict(card))
+        if cache_dir is None:
+            cache_dir = _cache_dir_from_env()
+        P, meta = embed_primitive_texts(table, cache_dir, embedder=embedder)
+        if embedding_key(P, meta) != rc["primitive_embeddings"]["embedding_key"]:
+            raise ValueError("the primitive-embedding recipe differs from the one the run "
+                             "started with")
+        sentiment = None
+        if rc.get("sentiment_artifact_id"):
+            sentiment = next(ix.get(rc["sentiment_artifact_id"]) for ix in (dl, upstream)
+                             if ix.exists(rc["sentiment_artifact_id"]))
+        inputs = rc["inputs"]
+        source = headline_source(upstream, chunk_size=chunk_size, threads=threads,
+                                 sentiment=sentiment, sentiment_column=config.sentiment_column,
+                                 headlines=upstream.get(inputs["headlines"]),
+                                 embeddings=upstream.get(inputs["embeddings"]))
+        calendar = CalibrationCalendar(**rc.get("calibration", {}))   # absent: the default
+        log.info("resuming %s (%s -> %s)", nd.artifact_id, rc["start"], rc["end"])
+        return cls(
+            dl, date.fromisoformat(rc["start"]), date.fromisoformat(rc["end"]), config,
+            table=table, P=P, upstream=upstream, source=source, window=rc["window"],
+            seed=rc["seed"], keep_primitive_daily=rc["keep_primitive_daily"], threads=threads,
+            rss_budget_gb=rss_budget_gb, use_kernel=use_kernel, temp=rc["temp"],
+            label=rc["label"], taxonomy_id=rc["taxonomy_artifact_id"], sentiment=sentiment,
+            primitive_meta=meta, inputs=inputs, resume=rc["artifacts"], calendar=calendar)
+
+    @classmethod
+    def add_cli_args(cls, parser: Any) -> None:
+        from narrative_scoring.jobs import add_scoring_args
+
+        add_scoring_args(parser)
+        parser.add_argument("--from", dest="start", required=True)
+        parser.add_argument("--to", dest="end", required=True)
+
+    @classmethod
+    def from_args(cls, args: Any, index: DatalakeIndex) -> ScoringJob:
+        from narrative_scoring.jobs import scoring_job_from_args
+
+        return scoring_job_from_args(args, index, _upstream_from_env(index))
+
+
+def _upstream_from_env(dl: DatalakeIndex) -> DatalakeIndex:
+    """$DATALAKE_UPSTREAM_ROOT when set (headlines / embeddings / mu_asof), else ``dl``."""
+    import os
+
+    up = os.environ.get("DATALAKE_UPSTREAM_ROOT")
+    return DatalakeIndex(up, create=False) if up else dl
+
+
+def _cache_dir_from_env() -> Path:
+    import os
+
+    root = os.environ.get("CACHE_PATH")
+    if not root:
+        raise ValueError("CACHE_PATH is not set; pass cache_dir")
+    return Path(root) / "narrative_scoring"
+
+
+def _runner(dl: DatalakeIndex) -> Any:
+    from datalake.jobs import JobRunner
+
+    return JobRunner(dl, repo_dir=_repo_dir(), allow_dirty=True, handle_signals=False)
+
+
+def score_range_to_datalake(dl: DatalakeIndex, start: date, end: date, config: ScoringConfig,
+                            **kwargs: Any) -> dict[str, Any]:
+    """Score [start, end] chronologically through the live machinery (``ScoringJob``).
 
     The walk follows the tau job's calibration ``calendar`` (default monthly,
     1M delay). Per calibration period P in order: (1) the tau_asof job as of
@@ -636,181 +967,22 @@ def score_range_to_datalake(
     ``inputs`` pins the upstream artifacts (``headlines``, ``embeddings``,
     ``mu_asof`` ids) instead of the latest ones; ``resume`` (``narrative_daily``,
     ``day_diagnostics``, ``partitions`` ids of an interrupted run) continues that
-    run in place -- use ``resume_scoring``, which reads both from the run itself.
-    A resumed run skips every month whose narrative_daily file exists, re-scores the
-    rest, and never feeds a null draw twice: partitions checkpoint their open
-    month at every closed day (with the RNG state), and days already closed there
-    are re-scored for narrative_daily only. The outputs equal an uninterrupted run.
+    run in place -- use ``resume_scoring`` (or ``jobs resume <narrative_daily id>``),
+    which reads both from the run itself. On resume every period whose narrative_daily
+    file exists is skipped, the rest re-scored, and no null draw is fed twice (partitions checkpoint
+    their open period at every closed day, with the RNG state; days already closed
+    there are re-scored for narrative_daily only). The outputs equal an
+    uninterrupted run.
 
-    Returns a summary dict with the artifact ids and counts.
+    Keyword arguments are ``ScoringJob``'s. Returns a summary dict with the artifact
+    ids and counts.
     """
-    upstream = upstream or dl
-    if end < start:
-        raise ValueError("end before start")
-    inputs = inputs or {}
-    hl = upstream.get(inputs["headlines"]) if inputs.get("headlines") \
-        else upstream.latest(KIND_HEADLINES)
-    em = upstream.get(inputs["embeddings"]) if inputs.get("embeddings") \
-        else upstream.latest(KIND_EMBEDDINGS)
-    mu_id = inputs.get("mu_asof")
-    split = config.sentiment_split is SentimentSplit.SIGN
-    if split != (sentiment is not None):
-        raise ValueError("a sentiment artifact is required iff sentiment_split=sign")
-    if sentiment is not None:
-        check_sentiment(sentiment, headlines_id=hl.artifact_id,
-                        column=config.sentiment_column, source=config.sentiment_source)
-    source = source or headline_source(upstream, threads=threads, sentiment=sentiment,
-                                       sentiment_column=config.sentiment_column,
-                                       headlines=hl, embeddings=em)
-    mu_art, _ = _mu_inputs(upstream, config, mu_id)
-
-    earliest = earliest_headline_day(hl)
-    x_min = calendar.first_scorable(earliest)
-    if start < x_min:
-        log.warning("requested start %s precedes earliest data %s + delay %s + one %s period; "
-                    "start shifted to %s (cold start: earlier periods feed the null "
-                    "partitions only)", start, earliest, calendar.delay, calendar.freq, x_min)
-        start = x_min
-    if end < start:
-        log.warning("nothing to score: end %s precedes the shifted start %s", end, start)
-
-    emb_key = embedding_key(P, primitive_meta)
-    parts_art = (dl.get(resume["partitions"]) if resume
-                 else find_partitions(dl, config, table, emb_key, seed, temp, calendar))
-    have = (set(load_partitions(parts_art.path)["MONTH_END"].to_list())
-            if parts_art else set())
-    # months that end before the first mu_asof row can never be corrected, hence never
-    # yield a partition: not walked at all
-    first_mu = _mu_inputs(upstream, config, mu_id)[1]
-    first_correctable = first_mu["DATE"].min() if first_mu is not None else earliest
-    walk = [p for p in calendar.periods(earliest, end) if p.last >= first_correctable]
-    provenance = embeddings_provenance(P, primitive_meta, em)
-    hp = {**_taxonomy_params(table), "embeddings_id": emb_key,
-          "config_id": config.digest(),
-          "f0_config_id": config.f0_digest(), "mode": config.mode.value,
-          "pooling": config.paraphrase_pooling.value, "q": config.q,
-          "split": config.sentiment_split.value, "window": window, "seed": seed,
-          "start": start.isoformat(), "end": end.isoformat(), "label": label,
-          "taxonomy_artifact_id": taxonomy_id, "agent_created": temp,
-          **calendar.hyperparams()}
-    if sentiment is not None:
-        hp.update(sentiment_source=config.sentiment_source,
-                  sentiment_column=config.sentiment_column,
-                  sentiment_artifact_id=sentiment.artifact_id)
-    sources: list[Any] = ([hl, em] + ([mu_art] if mu_art else [])
-                          + ([taxonomy_id] if taxonomy_id else []))
-    nd_sources = sources + ([sentiment] if sentiment is not None else [])
-    summary: dict[str, Any] = {"start": start, "end": end, "earliest_data": earliest,
-                               "n_days_scored": 0, "n_days_null_only": 0, "peak_rss_gb": 0.0,
-                               "months_finalised": [], "tau_rows": None}
-
-    run_kw = dict(pipeline=PIPELINE, pipeline_version=_version(temp),
-                  pipeline_repo=PIPELINE_REPO, repo_dir=_repo_dir())
-    resume = resume or {}
-    pt_partial = bool(parts_art) and parts_art.partial
-    with dl.run(kind=KIND_NARRATIVE_DAILY, hyperparams=hp, sources=nd_sources,
-                verifier=KIND_NARRATIVE_DAILY, hash_pattern="*",
-                resume=resume.get("narrative_daily"), **run_kw) as nd_run, \
-         dl.run(kind=KIND_DAY_DIAGNOSTICS, hyperparams=hp, sources=nd_sources,
-                verifier=KIND_DAY_DIAGNOSTICS, hash_pattern="*",
-                resume=resume.get("day_diagnostics"), **run_kw) as dg_run, \
-         dl.run(kind=KIND_PARTITIONS, hyperparams=partitions_params(config, table, emb_key, seed,
-                                                                temp, calendar),
-                sources=sources, verifier=KIND_PARTITIONS, hash_pattern="*.parquet",
-                extend=parts_art.artifact_id if parts_art and not pt_partial else None,
-                resume=parts_art.artifact_id if pt_partial else None, **run_kw) as pt_run:
-        for out_dir in (nd_run.out_dir, dg_run.out_dir, pt_run.out_dir):
-            record_provenance(out_dir, provenance)
-        if not resume:
-            write_run_config(nd_run.out_dir, {
-                "config": config.to_dict(), "start": start.isoformat(),
-                "end": end.isoformat(), "window": window, "seed": seed, "label": label,
-                "temp": temp, "keep_primitive_daily": keep_primitive_daily,
-                "taxonomy_artifact_id": taxonomy_id,
-                "calibration": {"freq": calendar.freq, "delay": calendar.delay},
-                "sentiment_artifact_id": sentiment.artifact_id if sentiment else None,
-                "inputs": {"headlines": hl.artifact_id, "embeddings": em.artifact_id,
-                           "mu_asof": mu_art.artifact_id if mu_art else None},
-                "primitive_embeddings": {
-                    "embedding_key": emb_key,
-                    "paraphrase_style": config.paraphrase_style.value,
-                    "model_card": (primitive_meta or {}).get("model_card")},
-                "artifacts": {"narrative_daily": nd_run.artifact_id,
-                              "day_diagnostics": dg_run.artifact_id,
-                              "partitions": pt_run.artifact_id},
-            })
-        writer = ParquetMonthWriter(nd_run.out_dir, dg_run.out_dir, freq=calendar.freq)
-        out_layout = Layout(calendar.freq)
-        partition_writer = NullPartitionWriter(
-            pt_run.out_dir, config=config, table=table, seed=seed,
-            input_ids={"headlines": hl.artifact_id, "embeddings": em.artifact_id,
-                       "mu_asof": mu_art.artifact_id if mu_art else None},
-            code_version=pt_run.record.pipeline_commit, freq=calendar.freq)
-        sink = SkipClosedDays(partition_writer) if resume else partition_writer
-        last_metadata = None
-        start_period = calendar.period_of(start).first
-        for period in walk:
-            all_days = period.days()
-            days = [d for d in all_days if d <= end]
-            if period.first < start_period:
-                if all_days[-1] in have:
-                    continue                      # partition already there
-                mode = "null-only (pre-start)"
-            else:
-                days = [d for d in days if d >= start]
-                mode = "score"
-            if not days:
-                continue
-            if resume and mode == "score" and \
-                    out_layout.path_of(nd_run.out_dir, period).exists():
-                continue                          # finished before the interruption
-            # (1) the tau job, as of the first day of this calibration period
-            tau_art = build_tau_asof(dl, config, table, P, upstream=upstream, window=window,
-                                     seed=seed, today=period.first, temp=temp,
-                                     partitions_art=dl.get(pt_run.artifact_id),
-                                     taxonomy_id=taxonomy_id, primitive_meta=primitive_meta,
-                                     mu_id=mu_id, calendar=calendar)
-            cal = calibration_as_of(dl, config, table, emb_key, upstream=upstream, window=window,
-                                    seed=seed, temp=temp, mu_id=mu_id, as_of=period.first,
-                                    calendar=calendar)
-            if tau_art is not None:
-                summary["tau_rows"] = load_tau_series(tau_art)
-            log.info("%s %s: %s, %d day(s), tau rows available: %d",
-                     "month" if calendar.freq == "M" else "period", period.key, mode, len(days),
-                     cal.tau_df.height)
-            # (2) the days, through the one pipeline
-            res = score_dates(
-                days, config, table=table, primitive_embeddings=P, source=source,
-                calibration=cal, writer=writer, null_sink=sink, tau_missing="null_only",
-                keep_primitive_daily=keep_primitive_daily, collect=False,
-                use_kernel=use_kernel, threads=threads, rss_budget_gb=rss_budget_gb,
-                seed=seed, code_version=nd_run.record.pipeline_commit,
-                sentiment_artifact_id=sentiment.artifact_id if sentiment else None,
-                embeddings_provenance=provenance,
-                extra_metadata={"narrative_daily_id": nd_run.artifact_id,
-                                "day_diagnostics_id": dg_run.artifact_id,
-                                "partitions_id": pt_run.artifact_id})
-            summary["n_days_scored"] += res.n_days
-            summary["n_days_null_only"] += len(res.null_only_days)
-            summary["peak_rss_gb"] = max(summary["peak_rss_gb"], res.peak_rss_gb)
-            if res.metadata is not None:
-                last_metadata = res.metadata
-            if days[-1] == all_days[-1]:          # the period closed on schedule
-                sink.finalise_before(period.next().first)
-        summary["months_finalised"] = [p.name for p in sink.finalised]
-        if last_metadata is not None:
-            writer.close(last_metadata)
-        pt_run.note(f"{len(sink.finalised)} {calendar.freq} partition(s) finalised in "
-                    f"[{earliest}, {end}]")
-        nd_run.note(f"{summary['n_days_scored']} day(s) scored, "
-                    f"{summary['n_days_null_only']} null-only, peak RSS "
-                    f"{summary['peak_rss_gb']:.2f} GB")
-        dg_run.note(f"{summary['n_days_scored']} day(s)")
-    summary.update(narrative_daily_id=nd_run.artifact_id, day_diagnostics_id=dg_run.artifact_id,
-                   partitions_id=pt_run.artifact_id)
-    tau_art = find_tau_asof(dl, config, table, emb_key, window, seed, temp, calendar)
-    summary["tau_asof_id"] = tau_art.artifact_id if tau_art else None
-    return summary
+    job = ScoringJob(dl, start, end, config, **kwargs)
+    if job.resume:                     # the run's own ids (resume_scoring reads them)
+        _runner(dl).resume_job(job.resume["narrative_daily"], job)
+    else:
+        _runner(dl).start(job)
+    return job.final_summary()
 
 
 def resume_scoring(
@@ -818,61 +990,19 @@ def resume_scoring(
     cache_dir: Path, threads: int = 8, chunk_size: int = 8_192,
     rss_budget_gb: float | None = 30.0, use_kernel: bool | None = None, embedder: Any = None,
 ) -> dict[str, Any]:
-    """Continue an interrupted scoring run from the run alone.
-
-    Everything comes from the run's ``run_config.json`` (written at its start):
-    config, dates, window, seed, taxonomy artifact, sentiment artifact, the exact
-    upstream inputs (never "latest"), and the ids of its narrative_daily /
-    day_diagnostics / partitions artifacts. The primitive-text embedder is rebuilt
-    from the recorded model card and must serve the same model (a remote server's
-    metadata is read first); its embeddings come from the recipe-keyed cache.
-    Only throughput knobs come from the caller.
-    """
-    from datalake import ModelCard
-    from nlp.embedding import embedder_from_card
-
-    upstream = upstream or dl
+    """Continue an interrupted scoring run from the run alone (``ScoringJob.from_artifact``;
+    the same as ``jobs resume <id>``). Only throughput knobs come from the caller."""
     nd = dl.get(narrative_daily_id)
     if nd.kind != KIND_NARRATIVE_DAILY:
         raise ValueError(f"{narrative_daily_id} is a {nd.kind}, not a {KIND_NARRATIVE_DAILY}")
     if not nd.partial:
         raise ValueError(f"{narrative_daily_id} is complete; nothing to resume")
-    path = nd.path / RUN_CONFIG_FILE
-    if not path.exists():
-        raise ValueError(f"{narrative_daily_id} has no {RUN_CONFIG_FILE} (written before "
-                         "resume support); it cannot be resumed")
-    rc = json.loads(path.read_text())
-    config = ScoringConfig(**rc["config"])
-    tax_art = resolve_taxonomy([dl, upstream], artifact_id=rc["taxonomy_artifact_id"])
-    table = load_registered_table(tax_art, rc["primitive_embeddings"]["paraphrase_style"])
-    card = rc["primitive_embeddings"]["model_card"]
-    if embedder is None:
-        if card is None:
-            raise ValueError("the run recorded no primitive-embedding model card")
-        embedder = embedder_from_card(ModelCard.from_dict(card))
-    from narrative_scoring.primitives import embed_primitive_texts
-
-    P, meta = embed_primitive_texts(table, cache_dir, embedder=embedder)
-    if embedding_key(P, meta) != rc["primitive_embeddings"]["embedding_key"]:
-        raise ValueError("the primitive-embedding recipe differs from the one the run started with")
-    sentiment = None
-    if rc.get("sentiment_artifact_id"):
-        sentiment = next(ix.get(rc["sentiment_artifact_id"]) for ix in (dl, upstream)
-                         if ix.exists(rc["sentiment_artifact_id"]))
-    inputs = rc["inputs"]
-    source = headline_source(upstream, chunk_size=chunk_size, threads=threads,
-                             sentiment=sentiment, sentiment_column=config.sentiment_column,
-                             headlines=upstream.get(inputs["headlines"]),
-                             embeddings=upstream.get(inputs["embeddings"]))
-    calendar = CalibrationCalendar(**rc.get("calibration", {}))   # absent: the default
-    log.info("resuming %s (%s -> %s)", narrative_daily_id, rc["start"], rc["end"])
-    return score_range_to_datalake(
-        dl, date.fromisoformat(rc["start"]), date.fromisoformat(rc["end"]), config,
-        table=table, P=P, upstream=upstream, source=source, window=rc["window"],
-        seed=rc["seed"], keep_primitive_daily=rc["keep_primitive_daily"], threads=threads,
-        rss_budget_gb=rss_budget_gb, use_kernel=use_kernel, temp=rc["temp"],
-        label=rc["label"], taxonomy_id=rc["taxonomy_artifact_id"], sentiment=sentiment,
-        primitive_meta=meta, inputs=inputs, resume=rc["artifacts"], calendar=calendar)
+    job = ScoringJob.from_artifact(nd, dl, upstream=upstream, cache_dir=cache_dir,
+                                   threads=threads, chunk_size=chunk_size,
+                                   rss_budget_gb=rss_budget_gb, use_kernel=use_kernel,
+                                   embedder=embedder)
+    _runner(dl).resume_job(narrative_daily_id, job)
+    return job.final_summary()
 
 
 # ---------------------------------------------------------------------------

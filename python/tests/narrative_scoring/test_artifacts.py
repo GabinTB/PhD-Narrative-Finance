@@ -579,3 +579,55 @@ def test_weekly_calibration_calendar_end_to_end_and_resume(tmp_path, toy_table, 
         for name in want:
             cols = [c for c in drop if c in want[name].columns]
             assert got[name].drop(cols).equals(want[name].drop(cols)), (got_id, name)
+
+
+def test_scoring_job_pauses_at_a_period_boundary_and_resumes_identically(
+        tmp_path, toy_table, toy_embeddings, cfg, monkeypatch):
+    """The jobs lifecycle on scoring: a PAUSE request stops the run after its current
+    calibration period (siblings left partial, status paused, job.json not hashed);
+    the resume from the run's own ids gives the uninterrupted outputs."""
+    from datalake.jobs import PAUSE_FILE, STATE_FILE, JobRunner, JobState
+
+    months = [(2008, m) for m in range(1, 7)]
+    kw = dict(table=toy_table, P=toy_embeddings, window="5Y", use_kernel=False, temp=True)
+    ref_lake = _make_lake(tmp_path / "ref")
+    ref = A.score_range_to_datalake(ref_lake, date(2008, 1, 1), date(2008, 6, 30), cfg,
+                                    source=_source(toy_table, toy_embeddings, months), **kw)
+
+    lake = _make_lake(tmp_path / "lake")
+    real = A.ScoringJob.run_unit
+
+    def pause_after_march(self, unit, ctx):
+        real(self, unit, ctx)
+        if unit.key == "2008-03":
+            (ctx.out_dir / PAUSE_FILE).write_text("stop")
+
+    monkeypatch.setattr(A.ScoringJob, "run_unit", pause_after_march)
+    job = A.ScoringJob(lake, date(2008, 1, 1), date(2008, 6, 30), cfg,
+                       source=_source(toy_table, toy_embeddings, months), **kw)
+    runner = JobRunner(lake, allow_dirty=True, handle_signals=False)
+    nd = runner.start(job)
+    assert nd.partial and runner.status(nd.artifact_id).status == "paused"
+    state = JobState.read(nd.path)
+    assert state.units_done < state.units_total
+    rc = json.loads((nd.path / A.RUN_CONFIG_FILE).read_text())
+    assert lake.get(rc["artifacts"]["day_diagnostics"]).partial
+    monkeypatch.setattr(A.ScoringJob, "run_unit", real)
+
+    s = A.score_range_to_datalake(
+        lake, date.fromisoformat(rc["start"]), date.fromisoformat(rc["end"]), cfg,
+        source=_source(toy_table, toy_embeddings, months), inputs=rc["inputs"],
+        resume=rc["artifacts"], **kw)
+    for got_id, ref_id in ((s["narrative_daily_id"], ref["narrative_daily_id"]),
+                           (s["day_diagnostics_id"], ref["day_diagnostics_id"]),
+                           (s["partitions_id"], ref["partitions_id"]),
+                           (s["tau_asof_id"], ref["tau_asof_id"])):
+        got, want = _frames(lake.get(got_id)), _frames(ref_lake.get(ref_id))
+        assert sorted(got) == sorted(want)
+        for name in want:
+            drop = [c for c in ("RSS_GB_BEFORE", "RSS_GB_AFTER", "SECONDS", "RSS_PEAK_GB",
+                                "CODE_VERSION") if c in want[name].columns]
+            assert got[name].drop(drop).equals(want[name].drop(drop)), (got_id, name)
+    done = lake.get(s["narrative_daily_id"])
+    assert not done.partial and STATE_FILE not in done.file_hashes
+    assert JobState.read(done.path).status == "complete"

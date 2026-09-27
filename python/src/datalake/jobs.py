@@ -48,6 +48,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,17 +56,14 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 from datalake.artifact import utc_now_iso
 from datalake.index import DatalakeError, DatalakeIndex
-from datalake.meta import git_commit
+from datalake.meta import JOB_CONTROL_FILES, git_commit
 
 if TYPE_CHECKING:
     from datalake.artifact import Artifact, ModelCard
 
 log = logging.getLogger(__name__)
 
-STATE_FILE = "job.json"
-LOCK_FILE = "job.lock"
-LOG_FILE = "job.log"
-PAUSE_FILE = "PAUSE"
+STATE_FILE, LOCK_FILE, LOG_FILE, PAUSE_FILE = JOB_CONTROL_FILES     # never hashed
 JOB_ENTRYPOINT_GROUP = "narrative_finance.jobs"
 TEMP_SUFFIX = "__TEMP"
 
@@ -155,6 +153,13 @@ class Job(ABC):
 
     def finalize(self, ctx: JobContext) -> None:
         """Optional last step after every unit is done."""
+
+    def session(self, ctx: JobContext) -> AbstractContextManager[Any]:
+        """Context held around the unit loop and ``finalize`` (default: nothing).
+
+        A job writing several artifacts in one pass opens the siblings here; an
+        exception (crash or pause) leaves them partial exactly like the main one."""
+        return nullcontext()
 
     @classmethod
     @abstractmethod
@@ -533,40 +538,41 @@ class JobRunner:
             adapter.info("%s: %d/%d unit(s) already done", "resume" if previous else "start",
                          state.units_done, state.units_total)
             t_run, n_run = time.monotonic(), 0
-            for unit in units:
-                if job.is_done(unit, out_dir):
-                    if unit.key not in done_before:    # written by an earlier unit's run
-                        state.units_done += 1
-                    continue
-                if self._pause_requested.is_set() or (out_dir / PAUSE_FILE).exists():
-                    state.status, state.current_unit = "paused", None
+            with job.session(ctx):           # e.g. sibling artifacts open across units
+                for unit in units:
+                    if job.is_done(unit, out_dir):
+                        if unit.key not in done_before:    # written by an earlier unit's run
+                            state.units_done += 1
+                        continue
+                    if self._pause_requested.is_set() or (out_dir / PAUSE_FILE).exists():
+                        state.status, state.current_unit = "paused", None
+                        state.write(out_dir)
+                        adapter.info("pause requested: stopping before %s", unit.key)
+                        raise JobPaused(unit.key)
+                    state.current_unit = unit.key
                     state.write(out_dir)
-                    adapter.info("pause requested: stopping before %s", unit.key)
-                    raise JobPaused(unit.key)
-                state.current_unit = unit.key
-                state.write(out_dir)
-                adapter.extra["unit"] = unit.key
-                for backend in job.backends():
-                    backend.check_unchanged()
-                t0 = time.monotonic()
-                job.run_unit(unit, ctx)
-                elapsed = time.monotonic() - t0
-                n_run += 1
-                state.units_done += 1
-                state.unit_seconds[unit.key] = round(elapsed, 3)
-                rate = n_run / max(time.monotonic() - t_run, 1e-9) * 3600
-                left = state.units_total - state.units_done
-                state.rate_units_per_hour = round(rate, 3)
-                state.eta = (datetime.now(timezone.utc).timestamp() + left / rate * 3600
-                             if rate > 0 else None)
-                state.eta = (datetime.fromtimestamp(state.eta, timezone.utc).isoformat(
-                    timespec="seconds") if state.eta else None)
-                state.write(out_dir)
-                adapter.info("unit %s done in %.1fs (%d/%d)", unit.key, elapsed,
-                             state.units_done, state.units_total)
-            adapter.extra["unit"] = "-"
-            state.current_unit = None
-            job.finalize(ctx)
+                    adapter.extra["unit"] = unit.key
+                    for backend in job.backends():
+                        backend.check_unchanged()
+                    t0 = time.monotonic()
+                    job.run_unit(unit, ctx)
+                    elapsed = time.monotonic() - t0
+                    n_run += 1
+                    state.units_done += 1
+                    state.unit_seconds[unit.key] = round(elapsed, 3)
+                    rate = n_run / max(time.monotonic() - t_run, 1e-9) * 3600
+                    left = state.units_total - state.units_done
+                    state.rate_units_per_hour = round(rate, 3)
+                    state.eta = (datetime.now(timezone.utc).timestamp() + left / rate * 3600
+                                 if rate > 0 else None)
+                    state.eta = (datetime.fromtimestamp(state.eta, timezone.utc).isoformat(
+                        timespec="seconds") if state.eta else None)
+                    state.write(out_dir)
+                    adapter.info("unit %s done in %.1fs (%d/%d)", unit.key, elapsed,
+                                 state.units_done, state.units_total)
+                adapter.extra["unit"] = "-"
+                state.current_unit = None
+                job.finalize(ctx)
             state.status = "complete"
             state.write(out_dir)
             adapter.info("job complete: %d unit(s)", state.units_total)

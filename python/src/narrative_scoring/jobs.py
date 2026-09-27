@@ -9,6 +9,8 @@
                                                      --neutral-eps 0.3333333
     uv run python -m narrative_scoring.jobs tau-asof [--window 5Y | expanding] [--today ...]
     uv run python -m narrative_scoring.jobs resume <partial narrative_daily artifact id>
+    uv run jobs start narrative_daily --from ... --to ... [same flags]   (same as score)
+    uv run jobs resume <partial narrative_daily artifact id>             (same as resume)
     uv run python -m narrative_scoring.jobs mark-temp <artifact_id> [...]
 
 ``register-taxonomy`` validates {NAME}_taxonomy.authored.csv + both paraphrase JSONLs from
@@ -159,21 +161,30 @@ def cmd_register_taxonomy(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_score(args: argparse.Namespace) -> int:
-    from narrative_scoring.artifacts import headline_source, score_range_to_datalake
+def scoring_job_from_args(args: argparse.Namespace, dl, upstream):
+    """The ``ScoringJob`` a ``score`` command line describes."""
+    from narrative_scoring.artifacts import ScoringJob, headline_source
 
-    dl, upstream = _indexes(args)
     config = _config(args)
     sentiment = _sentiment(args, config, dl, upstream)
     tax_art, table, P, p_meta = _table_and_embeddings(args, dl, upstream)
     source = headline_source(upstream, chunk_size=args.chunk_size, threads=args.threads,
                              sentiment=sentiment, sentiment_column=config.sentiment_column)
-    summary = score_range_to_datalake(
+    return ScoringJob(
         dl, date.fromisoformat(args.start), date.fromisoformat(args.end), config,
         table=table, P=P, upstream=upstream, source=source, window=args.window,
         seed=args.seed, threads=args.threads, rss_budget_gb=args.rss_budget_gb,
         temp=args.temp, label=args.label, taxonomy_id=tax_art.artifact_id,
         sentiment=sentiment, primitive_meta=p_meta, calendar=_calendar(args))
+
+
+def cmd_score(args: argparse.Namespace) -> int:
+    from narrative_scoring.artifacts import _runner
+
+    dl, upstream = _indexes(args)
+    job = scoring_job_from_args(args, dl, upstream)
+    _runner(dl).start(job)
+    summary = job.final_summary()
     for k in ("start", "end", "n_days_scored", "n_days_null_only", "peak_rss_gb",
               "months_finalised", "narrative_daily_id", "day_diagnostics_id",
               "partitions_id", "tau_asof_id"):
@@ -224,6 +235,50 @@ def cmd_mark_temp(args: argparse.Namespace) -> int:
     return 0
 
 
+def add_scoring_args(parser: argparse.ArgumentParser) -> None:
+    """The run's configuration flags (``score``, ``tau-asof`` and ``jobs start
+    narrative_daily``)."""
+    parser.add_argument("--taxonomy", default="Evergreen_v5",
+                        help="registered taxonomy name (latest registration is used)")
+    parser.add_argument("--taxonomy-artifact", default=None,
+                        help="exact narrative_taxonomy artifact id (overrides --taxonomy)")
+    parser.add_argument("--style", default="headline", choices=[s.value for s in ParaphraseStyle])
+    parser.add_argument("--mode", default="r2", choices=[m.value for m in Correction])
+    parser.add_argument("--pooling", default=None, choices=[p.value for p in PoolRule])
+    parser.add_argument("--q", type=float, default=0.99)
+    parser.add_argument("--jump-cut", action="store_true")
+    parser.add_argument("--split", default="none", choices=[s.value for s in SentimentSplit])
+    parser.add_argument("--neutral-eps", type=float, default=0.0,
+                        help="|sentiment| <= eps is 'neu' (split runs)")
+    parser.add_argument("--sentiment-source", default=None,
+                        help="headline_sentiment producer: ravenpack | ravenbert | finbert")
+    parser.add_argument("--sentiment-artifact", default=None,
+                        help="exact headline_sentiment artifact id (overrides the source)")
+    parser.add_argument("--sentiment-column", default=None,
+                        help="SENT_* column of the sentiment artifact (split runs; "
+                             "default SENT_SCORE)")
+    parser.add_argument("--min-month-draws", type=int, default=20_000_000)
+    parser.add_argument("--gap-alert-threshold", type=float, default=0.05)
+    parser.add_argument("--label", default="")
+    parser.add_argument("--calibration-freq", default="M", choices=["D", "W", "M", "Q", "Y"],
+                        help="tau job: null-partition period (default M)")
+    parser.add_argument("--calibration-delay", default="1M",
+                        help="tau job: publication delay, e.g. 1M, 1Q, 7d (default 1M)")
+    parser.add_argument("--embedding-backend", default="tei",
+                        choices=["tei", "local", "embedx"],
+                        help="engine for the primitive-text embeddings (default: tei)")
+    parser.add_argument("--embedding-dtype", default="float16",
+                        help="compute dtype of the primitive-text embeddings (default: float16)")
+    parser.add_argument("--embedding-cache", default=None)
+    parser.add_argument("--threads", type=int, default=8)
+    parser.add_argument("--chunk-size", type=int, default=8_192)
+    parser.add_argument("--rss-budget-gb", type=float, default=30.0)
+    parser.add_argument("--window", default="5Y")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--temp", action="store_true",
+                        help="mark everything registered as agent-created / TEMP")
+
+
 def main(argv: list[str] | None = None) -> int:
     from dotenv import find_dotenv, load_dotenv
 
@@ -233,45 +288,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--taxonomy", default="Evergreen_v5",
-                        help="registered taxonomy name (latest registration is used)")
-    common.add_argument("--taxonomy-artifact", default=None,
-                        help="exact narrative_taxonomy artifact id (overrides --taxonomy)")
-    common.add_argument("--style", default="headline", choices=[s.value for s in ParaphraseStyle])
-    common.add_argument("--mode", default="r2", choices=[m.value for m in Correction])
-    common.add_argument("--pooling", default=None, choices=[p.value for p in PoolRule])
-    common.add_argument("--q", type=float, default=0.99)
-    common.add_argument("--jump-cut", action="store_true")
-    common.add_argument("--split", default="none", choices=[s.value for s in SentimentSplit])
-    common.add_argument("--neutral-eps", type=float, default=0.0,
-                        help="|sentiment| <= eps is 'neu' (split runs)")
-    common.add_argument("--sentiment-source", default=None,
-                        help="headline_sentiment producer: ravenpack | ravenbert | finbert")
-    common.add_argument("--sentiment-artifact", default=None,
-                        help="exact headline_sentiment artifact id (overrides the source)")
-    common.add_argument("--sentiment-column", default=None,
-                        help="SENT_* column of the sentiment artifact (split runs; "
-                             "default SENT_SCORE)")
-    common.add_argument("--min-month-draws", type=int, default=20_000_000)
-    common.add_argument("--gap-alert-threshold", type=float, default=0.05)
-    common.add_argument("--label", default="")
-    common.add_argument("--calibration-freq", default="M", choices=["D", "W", "M", "Q", "Y"],
-                        help="tau job: null-partition period (default M)")
-    common.add_argument("--calibration-delay", default="1M",
-                        help="tau job: publication delay, e.g. 1M, 1Q, 7d (default 1M)")
-    common.add_argument("--embedding-backend", default="tei",
-                        choices=["tei", "local", "embedx"],
-                        help="engine for the primitive-text embeddings (default: tei)")
-    common.add_argument("--embedding-dtype", default="float16",
-                        help="compute dtype of the primitive-text embeddings (default: float16)")
-    common.add_argument("--embedding-cache", default=None)
-    common.add_argument("--threads", type=int, default=8)
-    common.add_argument("--chunk-size", type=int, default=8_192)
-    common.add_argument("--rss-budget-gb", type=float, default=30.0)
-    common.add_argument("--window", default="5Y")
-    common.add_argument("--seed", type=int, default=0)
-    common.add_argument("--temp", action="store_true",
-                        help="mark everything registered as agent-created / TEMP")
+    add_scoring_args(common)
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("register-taxonomy", parents=[common])
     p.add_argument("--source", default=None,
