@@ -97,6 +97,8 @@ def main() -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    log.warning("deprecated entry point: use `jobs start headline_embeddings ...` / "
+                "`jobs resume <id>` (same Job: status, pause, lock, job.log)")
 
     load_dotenv(find_dotenv(usecwd=True))
     if args.env != ".env":

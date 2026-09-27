@@ -315,6 +315,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--reason", default="superseded by owner run")
     p.set_defaults(fn=cmd_mark_temp)
     args = ap.parse_args(argv)
+    if args.cmd in ("score", "resume"):
+        log.warning("deprecated: use `jobs start narrative_daily ...` / `jobs resume <id>` "
+                    "(same Job: status, pause, lock, job.log)")
     return args.fn(args)
 
 
