@@ -15,10 +15,13 @@ import pytest
 
 from nlp.backends.local import LocalBackend
 from nlp.sentiment import FinbertSentimeter, RavenbertSentimeter
-from ravenpack.headlines.sentiment import validate_sentiment_frame, verify_artifact
+from ravenpack.headlines.sentiment import (
+    ingest_to_datalake,
+    validate_sentiment_frame,
+    verify_artifact,
+)
 from ravenpack.headlines.sentiment_model import (
     check_resume_compatible,
-    ingest_to_datalake,
     producer,
     run_hyperparams,
 )

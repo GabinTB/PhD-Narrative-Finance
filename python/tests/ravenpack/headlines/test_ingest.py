@@ -489,7 +489,7 @@ def test_script_resume_completes_a_killed_ingest(tmp_path, monkeypatch):
     with DatalakeIndex(tmp_path / "dl") as index:
         monkeypatch.setattr(ingest_mod, "ingest_range", killed_after_january)
         with pytest.raises(RuntimeError, match="killed"):
-            ingest_to_datalake(index, raw_all, 2010, 2010, pipeline_version="v0.1.0")
+            ingest_to_datalake(index, raw_all, 2010, 2010)
         monkeypatch.setattr(ingest_mod, "ingest_range", real)
         part = index.list(KIND, include_partial=True)[0]
         assert part.partial and [p.name for p in part.path.glob("*.parquet")] == \

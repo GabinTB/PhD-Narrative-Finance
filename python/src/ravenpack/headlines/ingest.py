@@ -46,8 +46,9 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from datalake.layout import Layout, layout_from_hyperparams
-from datalake.periods import period_key, periods
+from datalake.jobs import TEMP_SUFFIX, Job, JobContext, Unit, register_job
+from datalake.layout import Layout, add_layout_args, layout_from_args, layout_from_hyperparams
+from datalake.periods import parse_key, partition_file, period_key, periods
 from ravenpack.headlines.schema import (
     ENTITY_LIST_COLS,
     RAW_COLUMNS,
@@ -310,8 +311,6 @@ class _PartitionWriters:
 
 
 def _last_day(key: str) -> date:
-    from datalake.periods import parse_key
-
     return parse_key(key).last
 
 
@@ -325,6 +324,7 @@ def ingest_range(
     overwrite: bool = False,
     *,
     layout: Layout | None = None,
+    keys: set[str] | None = None,
 ) -> None:
     """Ingest every partition of ``layout`` (or the monthly layout of [start_year,
     end_year], the historical call) from the raw zip files.
@@ -338,6 +338,7 @@ def ingest_range(
         log_every:      Emit a progress line roughly every N stories written.
         overwrite:      Re-process partitions whose output file already exists.
         layout:         Partition frequency and range (rounded out to whole periods).
+        keys:           Only these partitions of ``layout`` (default: all of them).
     """
     if layout is None:
         if start_year is None or end_year is None:
@@ -347,10 +348,11 @@ def ingest_range(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     parts = layout.expected()
-    todo = {p.key for p in parts
-            if overwrite or not layout.path_of(out_dir, p).exists()}
+    todo = {p.key for p in parts if (keys is None or p.key in keys)
+            and (overwrite or not layout.path_of(out_dir, p).exists())}
+    asked = len(parts) if keys is None else len(keys)
     log.info("ingest: %d/%d %s partitions already done, %d to process (overwrite=%s)",
-             len(parts) - len(todo), len(parts), layout.freq, len(todo), overwrite)
+             asked - len(todo), asked, layout.freq, len(todo), overwrite)
     if not todo:
         log.info("nothing to do")
         return
@@ -416,8 +418,116 @@ def ingest_range(
 
 
 # ---------------------------------------------------------------------------
-# Datalake-aware entry point
+# The Job (datalake.jobs) and the datalake-aware entry point
 # ---------------------------------------------------------------------------
+
+PIPELINE_VERSION = "v0.2.0"   # v0.2.0: partition layout (partition_freq/start/end) in the id
+RAW_SUBDIR = ("RavenPack", "headlines_edge_v1.0")
+
+
+def default_raw_dir() -> Path:
+    """``$RAW_DATA_PATH/RavenPack/headlines_edge_v1.0``."""
+    root = os.environ.get("RAW_DATA_PATH")
+    if not root:
+        raise ValueError("RAW_DATA_PATH is not set; pass the raw directory explicitly")
+    return Path(root).joinpath(*RAW_SUBDIR)
+
+
+def _raw_months(first: date, last: date) -> frozenset[tuple[int, int]]:
+    return frozenset((m.first.year, m.first.month) for m in periods(first, last, "M"))
+
+
+@register_job
+class IngestJob(Job):
+    """RavenPack Annotations zips -> ravenpack_headlines partitions."""
+
+    kind = KIND
+    pipeline_version = PIPELINE_VERSION
+
+    def __init__(self, raw_dir: Path, layout: Layout, *, temp: bool = False,
+                 pipeline_version: str | None = None, raw_chunk_rows: int = 2_000_000,
+                 log_every: int = 100_000) -> None:
+        self.raw_dir, self.layout, self.temp = Path(raw_dir), whole_periods(layout), temp
+        if pipeline_version is not None:
+            self.pipeline_version = pipeline_version
+        self.raw_chunk_rows, self.log_every = raw_chunk_rows, log_every
+        self._read: set[str] = set()        # partitions whose raw months were read this run
+
+    def params(self) -> dict:
+        return self.layout.hyperparams()
+
+    def notes(self) -> str:
+        return f"raw_dir={self.raw_dir} columns={','.join(RAW_COLUMNS)}"
+
+    def units(self) -> list[Unit]:
+        return [Unit(p.key) for p in self.layout.expected()]
+
+    def is_done(self, unit: Unit, out_dir: Path) -> bool:
+        return (out_dir / partition_file(unit.key)).exists()
+
+    def run_unit(self, unit: Unit, ctx: JobContext) -> None:
+        """Read the raw months of ``unit`` once and write every partition they complete.
+
+        For M / Q / Y that is the unit alone; for D / W it is every day / week
+        of those raw months, so a raw CSV is read once, not once per day. A
+        partition with no stories writes no file (as before); it is not re-read
+        in the same run.
+        """
+        if unit.key in self._read:
+            return
+        need = _raw_months(*_bounds(unit.key))
+        group = {p.key for p in self.layout.expected()
+                 if _raw_months(p.first, p.last) <= need
+                 and not (ctx.out_dir / partition_file(p.key)).exists()}
+        ingest_range(raw_dir=self.raw_dir, out_dir=ctx.out_dir,
+                     raw_chunk_rows=self.raw_chunk_rows, log_every=self.log_every,
+                     overwrite=False, layout=self.layout, keys=group)
+        self._read |= group
+
+    def finalize(self, ctx: JobContext) -> None:
+        n_parts = len(self.layout.existing(ctx.out_dir))
+        if n_parts == 0:
+            raise RuntimeError(
+                f"ingest produced no output for {self.layout.start}..{self.layout.end}; "
+                f"check that {self.raw_dir} contains the expected zip files")
+        expected = len(self.layout.expected())
+        if n_parts < expected:
+            ctx.log.warning("%d/%d partitions present: some raw months are missing or empty",
+                            n_parts, expected)
+        ctx.note(f"{n_parts} {self.layout.freq} partition(s) ingested")
+
+    @classmethod
+    def from_artifact(cls, artifact: Artifact, index: DatalakeIndex, *,
+                      raw_dir: Path | str | None = None, **kwargs) -> IngestJob:
+        layout = layout_from_hyperparams(artifact.meta.hyperparams)
+        if layout.start is None or layout.end is None:
+            raise ValueError(f"{artifact.artifact_id} declares no range in its hyperparams")
+        version = artifact.meta.pipeline_version
+        return cls(Path(raw_dir) if raw_dir else default_raw_dir(), layout,
+                   temp=version.endswith(TEMP_SUFFIX), **kwargs)
+
+    @classmethod
+    def add_cli_args(cls, parser) -> None:
+        add_layout_args(parser)
+        parser.add_argument("--raw-dir", default=None,
+                            help="default: $RAW_DATA_PATH/RavenPack/headlines_edge_v1.0")
+        parser.add_argument("--raw-chunk-rows", type=int, default=2_000_000)
+        parser.add_argument("--log-every", type=int, default=100_000)
+        parser.add_argument("--temp", action="store_true", help="agent-created (__TEMP)")
+
+    @classmethod
+    def from_args(cls, args, index: DatalakeIndex) -> IngestJob:
+        raw_dir = Path(args.raw_dir) if args.raw_dir else default_raw_dir()
+        if not raw_dir.is_dir():
+            raise ValueError(f"raw directory does not exist: {raw_dir}")
+        return cls(raw_dir, layout_from_args(args), temp=args.temp,
+                   raw_chunk_rows=args.raw_chunk_rows, log_every=args.log_every)
+
+
+def _bounds(key: str) -> tuple[date, date]:
+    period = parse_key(key)
+    return period.first, period.last
+
 
 def ingest_to_datalake(
     index: DatalakeIndex,
@@ -427,29 +537,18 @@ def ingest_to_datalake(
     *,
     layout: Layout | None = None,
     pipeline: str = "PhD-Narrative-Finance",
-    pipeline_version: str,
+    pipeline_version: str = PIPELINE_VERSION,
     pipeline_repo: str | None = None,
     repo_dir: Path | None = None,
     raw_chunk_rows: int = 2_000_000,
     log_every: int = 100_000,
 ) -> Artifact:
-    """Ingest into a new datalake artifact, with provenance recorded.
+    """Ingest into a new datalake artifact through ``IngestJob`` (library entry point).
 
-    Wraps `ingest_range` in a datalake run: the output directory is allocated
-    by the index, sidecars and hashes are written on completion, and a crash
-    leaves the artifact registered as partial rather than silently absent.
-
-    Note there is no `overwrite` parameter.  Datalake artifacts are immutable:
-    re-ingesting produces a new artifact rather than mutating an existing one.
-    Resumption within a single run still works (`ingest_range` skips months
-    already written into this run's output directory), so an interrupted
-    ingest can be continued by re-entering the same artifact directory
-    manually if needed.
-
-    The raw zips themselves are not registered as a datalake artifact: they
-    are vintaged source data living outside the tree.  Their identity is
-    recorded in the run's hyperparameters via `raw_dir`, and the checksums of
-    what was produced from them are recorded in the sidecar.
+    The raw zips are not an artifact: vintaged source data outside the tree,
+    recorded by ``raw_dir`` in the run notes. Datalake artifacts are immutable,
+    so there is no ``overwrite``: an interrupted run is finished with
+    ``jobs resume <artifact_id>`` (or ``JobRunner.resume``).
 
     Args:
         index:            Datalake index to register the artifact in.
@@ -457,46 +556,25 @@ def ingest_to_datalake(
         start_year / end_year: legacy monthly range (inclusive years).
         layout:           Partition frequency and range (default: monthly over
                           [start_year, end_year]); recorded in the hyperparams.
-        pipeline:         Producing repo name, recorded in provenance.
+        pipeline / pipeline_repo: provenance (default: the Job's).
         pipeline_version: Semantic version of this pipeline.
-        pipeline_repo:    URL of the producing repo.
         repo_dir:         Directory to read the git SHA from (default cwd).
         raw_chunk_rows:   Raw CSV rows read per chunk.
         log_every:        Progress line frequency, in stories written.
-
-    Returns:
-        The completed Artifact.
     """
+    from datalake.jobs import JobRunner
+
     if layout is None:
         if start_year is None or end_year is None:
             raise ValueError("give a layout or start_year/end_year")
         layout = Layout("M", date(start_year, 1, 1), date(end_year, 12, 31))
-    layout = whole_periods(layout)
-    hyperparams = layout.hyperparams()
-    notes = f"raw_dir={raw_dir} columns={','.join(RAW_COLUMNS)}"
-
-    with index.run(
-        kind=KIND,
-        pipeline=pipeline,
-        pipeline_version=pipeline_version,
-        pipeline_repo=pipeline_repo,
-        repo_dir=repo_dir,
-        hyperparams=hyperparams,
-        notes=notes,
-        verifier=KIND,
-        hash_pattern="*.parquet",
-    ) as run:
-        ingest_range(raw_dir=raw_dir, out_dir=run.out_dir, raw_chunk_rows=raw_chunk_rows,
-                     log_every=log_every, overwrite=False, layout=layout)
-        n_parts = len(layout.existing(run.out_dir))
-        if n_parts == 0:
-            raise RuntimeError(
-                f"ingest produced no output for {layout.start}..{layout.end}; "
-                f"check that {raw_dir} contains the expected zip files"
-            )
-        run.note(f"{n_parts} {layout.freq} partition(s) ingested")
-
-    return index.get(run.artifact_id)
+    job = IngestJob(raw_dir, layout, pipeline_version=pipeline_version,
+                    raw_chunk_rows=raw_chunk_rows, log_every=log_every)
+    job.pipeline = pipeline
+    if pipeline_repo is not None:
+        job.pipeline_repo = pipeline_repo
+    runner = JobRunner(index, repo_dir=repo_dir, allow_dirty=True, handle_signals=False)
+    return runner.start(job)
 
 # ---------------------------------------------------------------------------
 # Content verifiers (registered via pyproject.toml entry points)

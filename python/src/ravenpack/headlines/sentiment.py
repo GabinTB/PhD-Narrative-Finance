@@ -37,8 +37,9 @@ import numpy as np
 import polars as pl
 import pyarrow.parquet as pq
 
+from datalake.jobs import Job, JobContext, Unit, register_job
 from datalake.layout import Layout, layout_from_hyperparams
-from datalake.periods import period_of
+from datalake.periods import partition_file, period_of
 
 if TYPE_CHECKING:
     from datalake import Artifact, DatalakeIndex, ModelCard
@@ -54,7 +55,7 @@ SCORE_PREFIX = "SENT_"
 PIPELINE = "PhD-Narrative-Finance"
 PIPELINE_REPO = "https://github.com/GabinTB/PhD-Narrative-Finance"
 PIPELINE_VERSION = "v0.2.0"   # v0.2.0: partition layout (partition_freq/start/end) in the id
-TEMP_SUFFIX = "__TEMP"
+TEMP_SUFFIX = "__TEMP"                        # = datalake.jobs.TEMP_SUFFIX
 
 MonthProducer = Callable[[Path, str], pl.DataFrame]
 """(headlines month parquet, tag) -> frame with RP_STORY_ID + SENT_* (+ extras)."""
@@ -162,6 +163,21 @@ def month_names(start_year: int, end_year: int) -> list[str]:
 # The shared ingest driver (fresh run or resume)
 # ---------------------------------------------------------------------------
 
+def write_partition(produce: MonthProducer, headlines_part: Path, out_path: Path,
+                    columns: Sequence[str], tag: str) -> None:
+    """Produce, align, validate and atomically write one partition."""
+    t0 = time.monotonic()
+    ids = headline_story_ids(headlines_part)
+    frame = align_to_stories(produce(headlines_part, tag), ids, where=tag)
+    got = validate_sentiment_frame(frame, where=tag)
+    if got != list(columns):
+        raise SentimentContractError(f"{tag}: score columns {got} != declared {list(columns)}")
+    write_month(frame, out_path)
+    n_scored = int(frame.select(pl.col(columns[0]).is_nan().not_().sum()).item())
+    log.info("%s  wrote %d stories (%d with %s) in %.0fs", tag, frame.height, n_scored,
+             columns[0], time.monotonic() - t0)
+
+
 def fill_months(
     produce: MonthProducer, headlines_dir: Path, out_dir: Path, months: Sequence[str],
     columns: Sequence[str],
@@ -180,18 +196,139 @@ def fill_months(
     log.info("sentiment: %d month(s) to write, %d already present", len(todo),
              sum((out_dir / m).exists() for m in months))
     for i, name in enumerate(todo, 1):
-        tag = f"[{i}/{len(todo)}] {name[:7]}"
-        t0 = time.monotonic()
-        ids = headline_story_ids(headlines_dir / name)
-        frame = align_to_stories(produce(headlines_dir / name, tag), ids, where=tag)
-        got = validate_sentiment_frame(frame, where=tag)
-        if got != list(columns):
-            raise SentimentContractError(f"{tag}: score columns {got} != declared {list(columns)}")
-        write_month(frame, out_dir / name)
-        n_scored = int(frame.select(pl.col(columns[0]).is_nan().not_().sum()).item())
-        log.info("%s  wrote %d stories (%d with %s) in %.0fs", tag, frame.height, n_scored,
-                 columns[0], time.monotonic() - t0)
+        write_partition(produce, headlines_dir / name, out_dir / name, columns,
+                        f"[{i}/{len(todo)}] {name.removesuffix('.parquet')}")
     return len(todo)
+
+
+def sentiment_layout(headlines: Artifact, start: date | None = None,
+                     end: date | None = None) -> Layout:
+    """The headlines' partitioning over [start, end] rounded out to whole periods
+    (default: the headlines' declared range)."""
+    src = layout_from_hyperparams(headlines.meta.hyperparams)
+    start, end = start or src.start, end or src.end
+    if start is None or end is None:
+        raise ValueError(f"no range given and none declared by {headlines.artifact_id}")
+    return Layout(src.freq, period_of(start, src.freq).first, period_of(end, src.freq).last)
+
+
+# source -> module providing ``job_from_artifact`` / ``job_from_args`` (imported lazily:
+# the model producers pull in nlp backends, the vendor one reads raw zips)
+SOURCE_MODULES = {"ravenpack": "ravenpack.headlines.sentiment_vendor",
+                  "ravenbert": "ravenpack.headlines.sentiment_model",
+                  "finbert": "ravenpack.headlines.sentiment_model"}
+
+
+def _source_module(source: str) -> Any:
+    import importlib
+
+    if source not in SOURCE_MODULES:
+        raise ValueError(f"unknown sentiment source {source!r}; known: {sorted(SOURCE_MODULES)}")
+    return importlib.import_module(SOURCE_MODULES[source])
+
+
+@register_job
+class HeadlineSentimentJob(Job):
+    """Headline scores (vendor or model) aligned to a ravenpack_headlines artifact."""
+
+    kind = KIND
+    pipeline_version = PIPELINE_VERSION
+
+    def __init__(self, headlines: Artifact, layout: Layout, *, source: str,
+                 columns: Sequence[str], produce: MonthProducer,
+                 extra_hyperparams: dict[str, Any] | None = None,
+                 model_card: ModelCard | None = None, backends: Sequence[Any] = (),
+                 notes: str = "", temp: bool = False) -> None:
+        self.headlines, self.layout, self.source = headlines, layout, source
+        self.columns, self.produce = list(columns), produce
+        self.extra_hyperparams = dict(extra_hyperparams or {})
+        self._card, self._backends, self._notes, self.temp = model_card, list(backends), \
+            notes, temp
+
+    def params(self) -> dict[str, Any]:
+        return {"source": self.source, "columns": ",".join(self.columns),
+                "headlines_id": self.headlines.artifact_id, **self.layout.hyperparams(),
+                **self.extra_hyperparams, "agent_created": self.temp}
+
+    def sources(self) -> list[Any]:
+        return [self.headlines]
+
+    def model_card(self) -> ModelCard | None:
+        return self._card
+
+    def backends(self) -> list[Any]:
+        return self._backends
+
+    def notes(self) -> str:
+        return self._notes
+
+    def units(self) -> list[Unit]:
+        keys = [p.key for p in self.layout.expected()]
+        missing = [k for k in keys if not (self.headlines.path / partition_file(k)).exists()]
+        if missing:
+            log.warning("%d headlines partition(s) absent from %s, skipped (e.g. %s)",
+                        len(missing), self.headlines.artifact_id, missing[0])
+        return [Unit(k) for k in keys if k not in set(missing)]
+
+    def is_done(self, unit: Unit, out_dir: Path) -> bool:
+        return (out_dir / partition_file(unit.key)).exists()
+
+    def run_unit(self, unit: Unit, ctx: JobContext) -> None:
+        name = partition_file(unit.key)
+        write_partition(self.produce, self.headlines.path / name, ctx.out_dir / name,
+                        self.columns, unit.key)
+
+    def finalize(self, ctx: JobContext) -> None:
+        n = len(list(ctx.out_dir.glob("*.parquet")))
+        if not n:
+            raise RuntimeError(f"no sentiment partition written for {self.layout.start}.."
+                               f"{self.layout.end} from {self.headlines.artifact_id}")
+        ctx.note(f"{n} {self.layout.freq} partition(s) written")
+
+    @classmethod
+    def from_artifact(cls, artifact: Artifact, index: DatalakeIndex,
+                      **kwargs: Any) -> HeadlineSentimentJob:
+        """The source's module rebuilds its producer (and model) from the artifact."""
+        hp = artifact.meta.hyperparams
+        return _source_module(hp["source"]).job_from_artifact(artifact, index, **kwargs)
+
+    @classmethod
+    def add_cli_args(cls, parser: Any) -> None:
+        from datalake.layout import add_layout_args
+
+        parser.add_argument("--source", required=True, choices=sorted(SOURCE_MODULES))
+        parser.add_argument("--headlines-artifact", default=None,
+                            help="default: the latest ravenpack_headlines")
+        add_layout_args(parser, default_freq=None, required=False)
+        parser.add_argument("--temp", action="store_true", help="agent-created (__TEMP)")
+        vendor = parser.add_argument_group("ravenpack (vendor) source")
+        vendor.add_argument("--raw-dir", default=None,
+                            help="default: $RAW_DATA_PATH/RavenPack/headlines_edge_v1.0")
+        model = parser.add_argument_group("model sources (ravenbert, finbert)")
+        model.add_argument("--backend", default="tei", choices=["tei", "local"])
+        model.add_argument("--dtype", default="float16", help="float16 (default) | float32")
+        model.add_argument("--device", default=None, help="local backend: cuda|mps|cpu")
+        model.add_argument("--batch-size", type=int, default=None)
+        model.add_argument("--score-rule", default=None,
+                           help="ravenbert: mean (default) | median; finbert: band")
+        model.add_argument("--min-confidence", type=float, default=None)
+        model.add_argument("--canonical-columns", action="store_true",
+                           help="also write the canonical probabilities as P_* (Float16)")
+
+    @classmethod
+    def from_args(cls, args: Any, index: DatalakeIndex) -> HeadlineSentimentJob:
+        from datalake.layout import layout_from_args
+
+        headlines = (index.get(args.headlines_artifact) if args.headlines_artifact
+                     else index.latest(SOURCE_KIND))
+        given = layout_from_args(args, default=layout_from_hyperparams(
+            headlines.meta.hyperparams))
+        src_freq = layout_from_hyperparams(headlines.meta.hyperparams).freq
+        if args.partition_freq and args.partition_freq != src_freq:
+            raise ValueError(f"sentiment follows its headlines' partitioning ({src_freq}); "
+                             "re-partitioning is its own job")
+        layout = sentiment_layout(headlines, given.start, given.end)
+        return _source_module(args.source).job_from_args(args, index, headlines, layout)
 
 
 def ingest_to_datalake(
@@ -199,9 +336,10 @@ def ingest_to_datalake(
     headlines: Artifact, start_year: int | None = None, end_year: int | None = None,
     extra_hyperparams: dict[str, Any], model_card: ModelCard | None = None, notes: str = "",
     temp: bool = False, repo_dir: Path | None = None, start: date | None = None,
-    end: date | None = None,
+    end: date | None = None, backends: Sequence[Any] = (),
 ) -> Artifact:
-    """Fresh ``headline_sentiment`` run over the partitions of ``headlines``.
+    """Fresh ``headline_sentiment`` run over the partitions of ``headlines`` (library
+    entry point; runs ``HeadlineSentimentJob``).
 
     ``source`` names the producer (``ravenpack``, ``ravenbert``, ``finbert``);
     ``temp`` marks the artifact agent-created (``__TEMP`` in its id). The output
@@ -209,58 +347,55 @@ def ingest_to_datalake(
     (or legacy [start_year, end_year]) rounded out to whole periods, default the
     headlines' declared range.
     """
-    src = layout_from_hyperparams(headlines.meta.hyperparams)
+    from datalake.jobs import JobRunner
+
     if start is None and start_year is not None:
         start = date(start_year, 1, 1)
     if end is None and end_year is not None:
         end = date(end_year, 12, 31)
-    start, end = start or src.start, end or src.end
-    if start is None or end is None:
-        raise ValueError(f"no range given and none declared by {headlines.artifact_id}")
-    layout = Layout(src.freq, period_of(start, src.freq).first, period_of(end, src.freq).last)
-    hp: dict[str, Any] = {"source": source, "columns": ",".join(columns),
-                          "headlines_id": headlines.artifact_id, **layout.hyperparams(),
-                          **extra_hyperparams, "agent_created": temp}
-    version = PIPELINE_VERSION + (TEMP_SUFFIX if temp else "")
-    with index.run(kind=KIND, pipeline=PIPELINE, pipeline_version=version,
-                   pipeline_repo=PIPELINE_REPO, hyperparams=hp, sources=[headlines],
-                   model_card=model_card, verifier=KIND, hash_pattern="*.parquet",
-                   repo_dir=repo_dir, notes=notes) as run:
-        n = fill_months(produce, headlines.path, run.out_dir, partition_names(layout), columns)
-        if not any(run.out_dir.glob("*.parquet")):
-            raise RuntimeError(f"no sentiment partition written for {layout.start}..{layout.end}"
-                               f" from {headlines.artifact_id}")
-        run.note(f"{n} {layout.freq} partition(s) written")
-    return index.get(run.artifact_id)
+    job = HeadlineSentimentJob(headlines, sentiment_layout(headlines, start, end),
+                               source=source, columns=columns, produce=produce,
+                               extra_hyperparams=extra_hyperparams, model_card=model_card,
+                               backends=backends, notes=notes, temp=temp)
+    return JobRunner(index, repo_dir=repo_dir, allow_dirty=True,
+                     handle_signals=False).start(job)
 
 
 def resume_partial(index: DatalakeIndex, artifact_id: str, produce: MonthProducer, *,
-                   repo_dir: Path | None = None) -> Artifact:
-    """Finish a partial ``headline_sentiment`` artifact in place, then mark it complete.
+                   repo_dir: Path | None = None, backends: Sequence[Any] = ()) -> Artifact:
+    """Finish a partial ``headline_sentiment`` artifact in place with ``produce``.
 
-    Parameters come from the artifact's own hyperparams (headlines id, years,
+    Parameters come from the artifact's own hyperparams (headlines id, range,
     columns), so a resume cannot silently change what the artifact means; the
-    datalake refuses any other hyperparams (``DatalakeIndex.run(resume=...)``).
-    Months already written are skipped.
+    datalake refuses any other hyperparams. Partitions already written are
+    skipped. (``jobs resume <id>`` does the same and rebuilds ``produce`` itself.)
     """
+    from datalake.jobs import JobRunner
+
     art = index.get(artifact_id)
     if art.kind != KIND:
         raise ValueError(f"{artifact_id} is a {art.kind}, not a {KIND}")
     if not art.partial:
         raise ValueError(f"{artifact_id} is complete; start a new run instead")
-    hp = art.meta.hyperparams
-    headlines = index.get(hp["headlines_id"])
-    columns = hp["columns"].split(",")
-    with index.run(kind=KIND, pipeline=art.meta.pipeline,
-                   pipeline_version=art.meta.pipeline_version,
-                   pipeline_repo=art.meta.pipeline_repo, hyperparams=hp, repo_dir=repo_dir,
-                   verifier=KIND, hash_pattern="*.parquet", resume=artifact_id) as run:
-        n = fill_months(produce, headlines.path, run.out_dir,
-                        partition_names(layout_from_hyperparams(hp)), columns)
-        if not any(run.out_dir.glob("*.parquet")):
-            raise RuntimeError(f"still no output in {run.out_dir} after resume")
-        run.note(f"{n} month(s) written")
-    return index.get(artifact_id)
+    job = job_from_recorded(art, index, produce, backends=backends)
+    runner = JobRunner(index, repo_dir=repo_dir, allow_dirty=True, handle_signals=False)
+    return runner.resume_job(artifact_id, job)
+
+
+def job_from_recorded(art: Artifact, index: DatalakeIndex, produce: MonthProducer, *,
+                      backends: Sequence[Any] = ()) -> HeadlineSentimentJob:
+    """The job an artifact records, with a producer supplied by its source module."""
+    hp = dict(art.meta.hyperparams)
+    base = {"source", "columns", "headlines_id", "agent_created",
+            *layout_from_hyperparams(hp).hyperparams(), "start_year", "end_year"}
+    extra = {k: v for k, v in hp.items() if k not in base}
+    layout = layout_from_hyperparams(hp)
+    job = HeadlineSentimentJob(index.get(hp["headlines_id"]), layout, source=hp["source"],
+                               columns=hp["columns"].split(","), produce=produce,
+                               extra_hyperparams=extra, model_card=art.meta.model_card,
+                               backends=backends,
+                               temp=art.meta.pipeline_version.endswith(TEMP_SUFFIX))
+    return job
 
 
 # ---------------------------------------------------------------------------

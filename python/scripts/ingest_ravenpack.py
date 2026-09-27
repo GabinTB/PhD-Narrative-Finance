@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Ingest RavenPack Annotations 1.0 zips into a datalake artifact.
 
+Deprecated entry point: ``jobs start ravenpack_headlines ...`` / ``jobs resume <id>``
+do the same through the shared Job lifecycle (status, pause, lock, job.log).
+
 Usage:
     # Fresh run
     python scripts/ingest_ravenpack.py --start-year 2000 --end-year 2025
@@ -30,7 +33,7 @@ from datalake import DatalakeError, DatalakeIndex
 
 PIPELINE = "PhD-Narrative-Finance"
 PIPELINE_REPO = "https://github.com/GabinTB/PhD-Narrative-Finance"
-PIPELINE_VERSION = "v0.2.0"   # v0.2.0: partition layout (partition_freq/start/end) in the id
+from ravenpack.headlines.ingest import PIPELINE_VERSION  # noqa: E402
 
 log = logging.getLogger(__name__)
 
@@ -136,68 +139,17 @@ def _fresh(index, raw_dir, start_year, end_year, pipeline_version, raw_chunk_row
 
 
 def _resume(index, artifact_id, raw_dir_override, raw_chunk_rows, log_every):
-    """Resume a partial run, inferring all params from the artifact metadata."""
-    from ravenpack.headlines.ingest import ingest_range
+    """Resume a partial run through the Job lifecycle (same as ``jobs resume``)."""
+    from datalake.jobs import JobRunner
 
+    raw_dir = raw_dir_override if raw_dir_override is not None and raw_dir_override.is_dir() \
+        else None
     try:
-        artifact = index.get(artifact_id)
-    except DatalakeError:
-        log.error("artifact not found: %s", artifact_id)
+        return JobRunner(index, allow_dirty=True).resume(
+            artifact_id, raw_dir=raw_dir, raw_chunk_rows=raw_chunk_rows, log_every=log_every)
+    except (DatalakeError, ValueError) as exc:
+        log.error("cannot resume %s: %s", artifact_id, exc)
         return None
-
-    if not artifact.partial:
-        log.error(
-            "artifact %s is already complete. "
-            "Start a new run or deprecate the old one first.",
-            artifact_id,
-        )
-        return None
-
-    from datalake.layout import layout_from_hyperparams
-
-    recorded = artifact.meta.hyperparams
-    layout = layout_from_hyperparams(recorded)          # legacy start_year/end_year -> M
-    if layout.start is None or layout.end is None:
-        log.error("artifact %s declares no range in its hyperparams.", artifact_id)
-        return None
-
-    if raw_dir_override is not None and raw_dir_override.is_dir():
-        raw_dir = raw_dir_override
-        log.info("using raw_dir from CLI: %s", raw_dir)
-    else:
-        raw_data_path = os.environ.get("RAW_DATA_PATH")
-        if not raw_data_path:
-            log.error("RAW_DATA_PATH not set and no --raw-dir provided")
-            return None
-        raw_dir = Path(raw_data_path) / "RavenPack" / "headlines_edge_v1.0"
-        log.info("using raw_dir from environment: %s", raw_dir)
-
-    if not raw_dir.is_dir():
-        log.error("raw directory does not exist: %s", raw_dir)
-        return None
-
-    from ravenpack.headlines.ingest import KIND
-
-    expected = len(layout.expected())
-    log.info("resuming %s | %s partitions %s..%s | %d/%d done", artifact_id, layout.freq,
-             layout.start, layout.end, len(layout.existing(artifact.path)), expected)
-    # The datalake reopens the partial artifact only with its own hyperparams and
-    # completes it in place (a new execution record; the crashed one is kept).
-    with index.run(kind=KIND, pipeline=artifact.meta.pipeline,
-                   pipeline_version=artifact.meta.pipeline_version,
-                   pipeline_repo=artifact.meta.pipeline_repo, hyperparams=recorded,
-                   verifier=artifact.meta.verifier, hash_pattern="*.parquet",
-                   resume=artifact_id) as run:
-        ingest_range(raw_dir=raw_dir, out_dir=run.out_dir, raw_chunk_rows=raw_chunk_rows,
-                     log_every=log_every, overwrite=False, layout=layout)
-        n_parts = len(layout.existing(run.out_dir))
-        if n_parts == 0:
-            raise RuntimeError("still no output after resume -- check raw_dir and range")
-        if n_parts < expected:
-            log.warning("%d/%d partitions present -- some months may be missing from raw zips",
-                        n_parts, expected)
-        run.note(f"Resumed after interruption. {n_parts}/{expected} partitions.")
-    return index.get(artifact_id)
 
 if __name__ == "__main__":
     sys.exit(main())

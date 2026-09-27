@@ -20,11 +20,11 @@ model card carries the backend, its full serving metadata, the sentimeter
 settings and the check results; backend, dtype, score rule and the
 confidence threshold are also hyperparams, so they are part of the id.
 
-    uv run python -m ravenpack.headlines.sentiment_model --model finbert \\
-        run --start-year 2000 --end-year 2025 [--temp]
-    uv run python -m ravenpack.headlines.sentiment_model --model ravenbert \\
-        --backend local --dtype float32 --device cuda run --start-year 2026 --end-year 2026
-    uv run python -m ravenpack.headlines.sentiment_model resume <partial artifact id>
+    uv run jobs start headline_sentiment --source finbert --start-year 2000 \\
+        --end-year 2025 [--temp]
+    uv run jobs start headline_sentiment --source ravenbert --backend local \\
+        --dtype float32 --device cuda --start-year 2026 --end-year 2026
+    uv run jobs resume <partial artifact id> [--opt batch_size=64 --opt device=cuda]
 
 ``resume`` takes everything from the artifact: the Sentimeter (family, score rule,
 confidence threshold) and its backend are rebuilt from the model card, and the
@@ -37,6 +37,7 @@ import argparse
 import logging
 import os
 import time
+from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -54,13 +55,15 @@ from nlp.sentiment import (
 from ravenpack.headlines.sentiment import (
     ID_COL,
     SOURCE_KIND,
+    HeadlineSentimentJob,
     MonthProducer,
-    ingest_to_datalake,
-    resume_partial,
+    job_from_recorded,
+    sentiment_layout,
 )
 
 if TYPE_CHECKING:
-    from datalake import ModelCard
+    from datalake import Artifact, DatalakeIndex, ModelCard
+    from datalake.layout import Layout
     from nlp.sentiment import Sentimeter
 
 log = logging.getLogger(__name__)
@@ -122,10 +125,59 @@ def check_resume_compatible(card: ModelCard | None, hyperparams: dict[str, Any],
                          f"this run uses {want}; refusing to mix them in one artifact")
 
 
+def job(headlines: Artifact, layout: Layout, sentimeter: Sentimeter, *,
+        canonical_columns: bool = False, temp: bool = False,
+        read_rows: int = 200_000) -> HeadlineSentimentJob:
+    """The model-sentiment job; the backend is re-checked before every partition."""
+    return HeadlineSentimentJob(
+        headlines, layout, source=sentimeter.name, columns=sentimeter.columns(),
+        produce=producer(sentimeter, canonical_columns=canonical_columns, read_rows=read_rows),
+        extra_hyperparams=run_hyperparams(sentimeter, canonical_columns),
+        model_card=sentimeter.model_card(), backends=[sentimeter.backend], temp=temp)
+
+
+def _backend_kwargs(batch_size: int | None, device: str | None) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {}
+    if batch_size:
+        kwargs["batch_size"] = batch_size
+    if device:
+        kwargs["device"] = device
+    return kwargs
+
+
+def job_from_args(args, index: DatalakeIndex, headlines: Artifact,
+                  layout: Layout) -> HeadlineSentimentJob:
+    if args.device and args.backend != "local":
+        raise ValueError("--device applies to the local backend only")
+    sentimeter = load_sentimeter(args.source, args.backend, args.dtype,
+                                 score_rule=args.score_rule,
+                                 min_confidence=args.min_confidence,
+                                 **_backend_kwargs(args.batch_size, args.device))
+    return job(headlines, layout, sentimeter, canonical_columns=args.canonical_columns,
+               temp=args.temp)
+
+
+def job_from_artifact(artifact: Artifact, index: DatalakeIndex, *,
+                      batch_size: int | None = None, device: str | None = None,
+                      read_rows: int = 200_000) -> HeadlineSentimentJob:
+    """Resume: the Sentimeter and its backend are rebuilt from the model card, and
+    the backend must serve the recorded model (a server's metadata is read first)."""
+    card, hp = artifact.meta.model_card, artifact.meta.hyperparams
+    if card is None:
+        raise ValueError(f"{artifact.artifact_id} has no model card; cannot resume it")
+    sentimeter = sentimeter_from_card(card, **_backend_kwargs(batch_size, device))
+    check_resume_compatible(card, hp, sentimeter)
+    produce = producer(sentimeter, canonical_columns=bool(hp.get("canonical_columns")),
+                       read_rows=read_rows)
+    return job_from_recorded(artifact, index, produce, backends=[sentimeter.backend])
+
+
 def main(argv: list[str] | None = None) -> int:
+    """Deprecated entry point: ``jobs start headline_sentiment --source <model> ...``."""
     from dotenv import find_dotenv, load_dotenv
 
     from datalake import DatalakeIndex
+    from datalake.jobs import JobRunner
 
     load_dotenv(find_dotenv(usecwd=True))
     logging.basicConfig(level=logging.INFO,
@@ -153,42 +205,27 @@ def main(argv: list[str] | None = None) -> int:
     res = sub.add_parser("resume")
     res.add_argument("artifact_id")
     args = ap.parse_args(argv)
+    log.warning("deprecated: use `jobs start headline_sentiment --source <model>` / "
+                "`jobs resume <id>`")
 
-    kwargs: dict[str, Any] = {}
-    if args.batch_size:
-        kwargs["batch_size"] = args.batch_size
-    if args.device:
-        kwargs["device"] = args.device
     repo_dir = Path(__file__).resolve().parents[4]
     with DatalakeIndex(os.environ["DATALAKE_ROOT"]) as dl:
-        if args.cmd == "resume":
-            art = dl.get(args.artifact_id)
-            if art.meta.model_card is None:
-                raise SystemExit(f"{args.artifact_id} has no model card; cannot resume it")
-            try:        # rebuilt from the card; the backend must serve the recorded model
-                sentimeter = sentimeter_from_card(art.meta.model_card, **kwargs)
-                check_resume_compatible(art.meta.model_card, art.meta.hyperparams, sentimeter)
-            except ValueError as exc:
-                raise SystemExit(f"cannot resume {args.artifact_id}: {exc}") from None
-            produce = producer(sentimeter, canonical_columns=bool(
-                art.meta.hyperparams.get("canonical_columns")))
-            art = resume_partial(dl, args.artifact_id, produce, repo_dir=repo_dir)
-        else:
-            if not args.model:
-                raise SystemExit("run needs --model")
-            if args.device and args.backend != "local":
-                raise SystemExit("--device applies to the local backend only")
-            sentimeter = load_sentimeter(args.model, args.backend, args.dtype,
-                                         score_rule=args.score_rule,
-                                         min_confidence=args.min_confidence, **kwargs)
-            produce = producer(sentimeter, canonical_columns=args.canonical_columns)
-            hl = (dl.get(args.headlines_artifact) if args.headlines_artifact
-                  else dl.latest(SOURCE_KIND))
-            art = ingest_to_datalake(
-                dl, source=sentimeter.name, columns=sentimeter.columns(), produce=produce,
-                headlines=hl, start_year=args.start_year, end_year=args.end_year,
-                extra_hyperparams=run_hyperparams(sentimeter, args.canonical_columns),
-                model_card=sentimeter.model_card(), temp=args.temp, repo_dir=repo_dir)
+        runner = JobRunner(dl, repo_dir=repo_dir, allow_dirty=True)
+        try:
+            if args.cmd == "resume":
+                art = runner.resume(args.artifact_id, batch_size=args.batch_size,
+                                    device=args.device)
+            else:
+                if not args.model:
+                    raise SystemExit("run needs --model")
+                args.source = args.model
+                hl = (dl.get(args.headlines_artifact) if args.headlines_artifact
+                      else dl.latest(SOURCE_KIND))
+                layout = sentiment_layout(hl, date(args.start_year, 1, 1),
+                                          date(args.end_year, 12, 31))
+                art = runner.start(job_from_args(args, dl, hl, layout))
+        except ValueError as exc:
+            raise SystemExit(f"{args.cmd}: {exc}") from None
     print(art.artifact_id)
     return 0
 

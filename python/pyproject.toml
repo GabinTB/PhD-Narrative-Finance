@@ -50,6 +50,10 @@ narrative_daily = "narrative_scoring.artifacts:verify_narrative_daily"
 day_diagnostics = "narrative_scoring.artifacts:verify_day_diagnostics"
 headline_sentiment = "ravenpack.headlines.sentiment:verify_artifact"
 
+[project.entry-points."narrative_finance.jobs"]
+ravenpack_headlines = "ravenpack.headlines.ingest:IngestJob"
+headline_sentiment = "ravenpack.headlines.sentiment:HeadlineSentimentJob"
+
 [build-system]
 requires      = ["hatchling"]
 build-backend = "hatchling.build"

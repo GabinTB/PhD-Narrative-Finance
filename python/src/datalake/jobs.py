@@ -148,7 +148,10 @@ class Job(ABC):
 
     @abstractmethod
     def run_unit(self, unit: Unit, ctx: JobContext) -> None:
-        """Compute and write one unit (atomically)."""
+        """Compute and write one unit (atomically).
+
+        It may also write later units that share its inputs (e.g. every day of
+        the raw month it reads); the loop then counts and skips them."""
 
     def finalize(self, ctx: JobContext) -> None:
         """Optional last step after every unit is done."""
@@ -386,26 +389,45 @@ class JobRunner:
 
     def start(self, job: Job) -> Artifact:
         """Run ``job`` into a new artifact (to completion, or until paused)."""
+        return self._execute(job, resume=None, notes=self._dirty_guard(job, job.notes()))
+
+    def resume(self, artifact_id: str, **job_kwargs: Any) -> Artifact:
+        """Rebuild the job from the partial artifact and finish it in place."""
+        art = self._partial(artifact_id)
+        cls = job_class(art.kind)
+        check_resume_version(art.meta.pipeline_version, cls.pipeline_version)
+        return self.resume_job(artifact_id, cls.from_artifact(art, self.index, **job_kwargs))
+
+    def resume_job(self, artifact_id: str, job: Job) -> Artifact:
+        """Finish a partial artifact with an already built ``job`` (library callers).
+
+        The artifact's recorded hyperparams stay its identity (a legacy layout
+        such as start_year / end_year is not rewritten); the version and model
+        checks are the same as ``resume``.
+        """
+        art = self._partial(artifact_id)
+        if art.kind != job.kind:
+            raise JobError(f"{artifact_id} is a {art.kind}, not a {job.kind}")
+        check_resume_version(art.meta.pipeline_version, job.pipeline_version)
+        for backend in job.backends():
+            backend.check_unchanged()
+        return self._execute(job, resume=artifact_id, notes=self._dirty_guard(job, ""),
+                             hyperparams=art.meta.hyperparams)
+
+    def _partial(self, artifact_id: str) -> Artifact:
+        art = self.index.get(artifact_id)
+        if not art.partial:
+            raise JobError(f"{artifact_id} is complete; nothing to resume")
+        return art
+
+    def _dirty_guard(self, job: Job, notes: str) -> str:
         commit = git_commit(self.repo_dir)
-        notes = job.notes()
         if commit and commit.endswith("-dirty") and not job.temp:
             if not self.allow_dirty:
                 raise JobError("refusing a non-TEMP run from a dirty git tree "
                                f"({commit}); commit first or pass allow_dirty")
-            notes = f"{notes} [allow_dirty: started from {commit}]".strip()
-        return self._execute(job, resume=None, notes=notes)
-
-    def resume(self, artifact_id: str, **job_kwargs: Any) -> Artifact:
-        """Rebuild the job from the partial artifact and finish it in place."""
-        art = self.index.get(artifact_id)
-        if not art.partial:
-            raise JobError(f"{artifact_id} is complete; nothing to resume")
-        cls = job_class(art.kind)
-        check_resume_version(art.meta.pipeline_version, cls.pipeline_version)
-        job = cls.from_artifact(art, self.index, **job_kwargs)
-        for backend in job.backends():
-            backend.check_unchanged()
-        return self._execute(job, resume=artifact_id, notes="")
+            notes = f"{notes} [allow_dirty: run from {commit}]".strip()
+        return notes
 
     def pause(self, artifact_id: str) -> None:
         """Ask the process running ``artifact_id`` to stop at the next unit boundary."""
@@ -461,10 +483,12 @@ class JobRunner:
 
     # -- execution ----------------------------------------------------------
 
-    def _execute(self, job: Job, *, resume: str | None, notes: str) -> Artifact:
+    def _execute(self, job: Job, *, resume: str | None, notes: str,
+                 hyperparams: dict[str, Any] | None = None) -> Artifact:
         run_kwargs = dict(kind=job.kind, pipeline=job.pipeline,
                           pipeline_version=job.version, pipeline_repo=job.pipeline_repo,
-                          hyperparams=job.params(), sources=job.sources(),
+                          hyperparams=hyperparams if hyperparams is not None else job.params(),
+                          sources=job.sources(),
                           model_card=job.model_card(), verifier=job.verifier,
                           repo_dir=self.repo_dir, notes=notes, hash_pattern=job.hash_pattern)
         artifact_id: str | None = resume
@@ -503,13 +527,16 @@ class JobRunner:
         lock.acquire()
         try:
             ctx = JobContext(run, self.index, adapter)
-            state.units_done = sum(job.is_done(u, out_dir) for u in units)
+            done_before = {u.key for u in units if job.is_done(u, out_dir)}
+            state.units_done = len(done_before)
             state.write(out_dir)
             adapter.info("%s: %d/%d unit(s) already done", "resume" if previous else "start",
                          state.units_done, state.units_total)
             t_run, n_run = time.monotonic(), 0
             for unit in units:
                 if job.is_done(unit, out_dir):
+                    if unit.key not in done_before:    # written by an earlier unit's run
+                        state.units_done += 1
                     continue
                 if self._pause_requested.is_set() or (out_dir / PAUSE_FILE).exists():
                     state.status, state.current_unit = "paused", None

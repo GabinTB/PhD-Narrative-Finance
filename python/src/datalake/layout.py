@@ -121,3 +121,28 @@ def layout_from_hyperparams(hp: dict[str, Any]) -> Layout:
 
 def layout_of(artifact: Artifact) -> Layout:
     return layout_from_hyperparams(artifact.meta.hyperparams)
+
+
+def add_layout_args(parser: Any, *, default_freq: str | None = DEFAULT_FREQ,
+                    required: bool = True) -> None:
+    """``--partition-freq / --start / --end`` (or legacy ``--start-year / --end-year``)."""
+    parser.add_argument("--partition-freq", default=default_freq, type=check_freq,
+                        help="storage partition = work unit: D, W, M, Q or Y")
+    parser.add_argument("--start", type=date.fromisoformat, help="first day (ISO)")
+    parser.add_argument("--end", type=date.fromisoformat, help="last day (ISO)")
+    parser.add_argument("--start-year", type=int, help="legacy: --start YEAR-01-01")
+    parser.add_argument("--end-year", type=int, help="legacy: --end YEAR-12-31")
+    parser.set_defaults(_layout_required=required)
+
+
+def layout_from_args(args: Any, *, default: Layout | None = None) -> Layout:
+    """The layout of ``add_layout_args`` arguments; missing pieces come from ``default``."""
+    start = args.start or (date(args.start_year, 1, 1) if args.start_year else None)
+    end = args.end or (date(args.end_year, 12, 31) if args.end_year else None)
+    freq = args.partition_freq
+    if default is not None:
+        start, end = start or default.start, end or default.end
+        freq = freq or default.freq
+    if getattr(args, "_layout_required", True) and (start is None or end is None):
+        raise PeriodError("give --start/--end (or --start-year/--end-year)")
+    return Layout(freq or DEFAULT_FREQ, start, end)

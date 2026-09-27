@@ -11,10 +11,9 @@ import polars as pl
 import pytest
 
 from datalake import DatalakeIndex
-from ravenpack.headlines.sentiment import verify_artifact
+from ravenpack.headlines.sentiment import ingest_to_datalake, verify_artifact
 from ravenpack.headlines.sentiment_vendor import (
     COLUMNS,
-    ingest_to_datalake,
     producer,
     raw_month_batches,
     story_scores,

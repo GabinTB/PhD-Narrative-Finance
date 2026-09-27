@@ -23,9 +23,9 @@ end of the month, so a story split across batches (or not contiguous in the file
 is still aggregated once. The month's story set is the headlines artifact's
 (sentiment.align_to_stories); a raw story absent from it raises.
 
-    uv run python -m ravenpack.headlines.sentiment_vendor run --start-year 2000 \
+    uv run jobs start headline_sentiment --source ravenpack --start-year 2000 \
         --end-year 2025 [--headlines-artifact ID] [--raw-dir DIR] [--temp]
-    uv run python -m ravenpack.headlines.sentiment_vendor resume <partial artifact id>
+    uv run jobs resume <partial artifact id> [--opt raw_dir=DIR]
 """
 from __future__ import annotations
 
@@ -34,7 +34,9 @@ import logging
 import os
 import zipfile
 from collections.abc import Iterator
+from datetime import date
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import polars as pl
 import pyarrow as pa
@@ -44,10 +46,15 @@ from datalake.periods import parse_key, periods
 from ravenpack.headlines.sentiment import (
     ID_COL,
     SOURCE_KIND,
+    HeadlineSentimentJob,
     MonthProducer,
-    ingest_to_datalake,
-    resume_partial,
+    job_from_recorded,
+    sentiment_layout,
 )
+
+if TYPE_CHECKING:
+    from datalake import Artifact, DatalakeIndex
+    from datalake.layout import Layout
 
 log = logging.getLogger(__name__)
 
@@ -151,10 +158,45 @@ def producer(raw_dir: Path, block_bytes: int = BLOCK_BYTES) -> MonthProducer:
     return produce
 
 
+RULE = "css+ess_mean+ess_wmean"
+
+
+def _raw_dir(raw_dir: Path | str | None) -> Path:
+    from ravenpack.headlines.ingest import default_raw_dir
+
+    path = Path(raw_dir) if raw_dir else default_raw_dir()
+    if not path.is_dir():
+        raise ValueError(f"raw directory does not exist: {path}")
+    return path
+
+
+def job(headlines: Artifact, layout: Layout, raw_dir: Path, *, temp: bool = False,
+        block_bytes: int = BLOCK_BYTES) -> HeadlineSentimentJob:
+    """The vendor-sentiment job over ``layout`` of ``headlines``."""
+    return HeadlineSentimentJob(headlines, layout, source=SOURCE, columns=COLUMNS,
+                                produce=producer(raw_dir, block_bytes),
+                                extra_hyperparams={"rule": RULE}, notes=f"raw_dir={raw_dir}",
+                                temp=temp)
+
+
+def job_from_args(args, index: DatalakeIndex, headlines: Artifact,
+                  layout: Layout) -> HeadlineSentimentJob:
+    return job(headlines, layout, _raw_dir(args.raw_dir), temp=args.temp)
+
+
+def job_from_artifact(artifact: Artifact, index: DatalakeIndex, *,
+                      raw_dir: Path | str | None = None,
+                      block_bytes: int = BLOCK_BYTES) -> HeadlineSentimentJob:
+    """Resume: the raw directory is the only input not recorded in the hyperparams."""
+    return job_from_recorded(artifact, index, producer(_raw_dir(raw_dir), block_bytes))
+
+
 def main(argv: list[str] | None = None) -> int:
+    """Deprecated entry point: ``jobs start headline_sentiment --source ravenpack ...``."""
     from dotenv import find_dotenv, load_dotenv
 
     from datalake import DatalakeIndex
+    from datalake.jobs import JobRunner
 
     load_dotenv(find_dotenv(usecwd=True))
     logging.basicConfig(level=logging.INFO,
@@ -172,23 +214,20 @@ def main(argv: list[str] | None = None) -> int:
     res = sub.add_parser("resume")
     res.add_argument("artifact_id")
     args = ap.parse_args(argv)
+    log.warning("deprecated: use `jobs start headline_sentiment --source ravenpack` / "
+                "`jobs resume <id>`")
 
-    raw_dir = (Path(args.raw_dir) if args.raw_dir
-               else Path(os.environ["RAW_DATA_PATH"]) / "RavenPack" / "headlines_edge_v1.0")
-    if not raw_dir.is_dir():
-        raise SystemExit(f"raw directory does not exist: {raw_dir}")
     repo_dir = Path(__file__).resolve().parents[4]
     with DatalakeIndex(os.environ["DATALAKE_ROOT"]) as dl:
+        runner = JobRunner(dl, repo_dir=repo_dir, allow_dirty=True)
         if args.cmd == "resume":
-            art = resume_partial(dl, args.artifact_id, producer(raw_dir), repo_dir=repo_dir)
+            art = runner.resume(args.artifact_id, raw_dir=args.raw_dir)
         else:
             hl = (dl.get(args.headlines_artifact) if args.headlines_artifact
                   else dl.latest(SOURCE_KIND))
-            art = ingest_to_datalake(
-                dl, source=SOURCE, columns=COLUMNS, produce=producer(raw_dir), headlines=hl,
-                start_year=args.start_year, end_year=args.end_year,
-                extra_hyperparams={"rule": "css+ess_mean+ess_wmean"},
-                notes=f"raw_dir={raw_dir}", temp=args.temp, repo_dir=repo_dir)
+            layout = sentiment_layout(hl, date(args.start_year, 1, 1),
+                                      date(args.end_year, 12, 31))
+            art = runner.start(job(hl, layout, _raw_dir(args.raw_dir), temp=args.temp))
     print(art.artifact_id)
     return 0
 
