@@ -118,7 +118,14 @@ def utc_now_iso() -> str:
 
 @dataclass
 class ModelCard:
-    """Describes a model used to produce an artifact."""
+    """Describes a model used to produce an artifact.
+
+    ``backend`` names the inference engine that ran the model (``local``,
+    ``tei``, ``embedx``) and ``serving`` holds everything that engine reported
+    about the model it served (a TEI ``/info`` snapshot, an embedx model
+    entry, the local device and dtype) plus the load-time compatibility-check
+    results. Both are ``None`` on cards written before they existed.
+    """
 
     model_id: str
     version: str
@@ -131,13 +138,19 @@ class ModelCard:
     pooling: str | None = None
     trained_on: str | None = None
     notes: str = ""
+    backend: str | None = None
+    serving: dict[str, Any] | None = None
+
+    _NO_SHA_WARNING = ("[warning: private weights with no weights_sha256; "
+                       "third parties cannot verify weight identity]")
 
     def __post_init__(self) -> None:
-        if not self.weights_public and not self.weights_sha256:
+        # Idempotent: from_dict re-runs this on every load, so the warning must
+        # not be appended again when the stored notes already carry it.
+        if (not self.weights_public and not self.weights_sha256
+                and self._NO_SHA_WARNING not in self.notes):
             self.notes = (
-                (self.notes + " " if self.notes else "")
-                + "[warning: private weights with no weights_sha256; "
-                "third parties cannot verify weight identity]"
+                (self.notes + " " if self.notes else "") + self._NO_SHA_WARNING
             ).strip()
 
     @property

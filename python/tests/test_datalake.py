@@ -154,6 +154,27 @@ class TestModelCard:
         card = ModelCard(model_id="m", version="1", repo="r", weights_public=True)
         assert card.notes == ""
 
+    def test_no_sha_warning_not_duplicated_on_reload(self):
+        card = ModelCard(model_id="m", version="1", repo="r", weights_public=False)
+        reloaded = ModelCard.from_dict(ModelCard.from_dict(card.to_dict()).to_dict())
+        assert reloaded.notes.count("warning") == 1
+        assert reloaded == card
+
+    def test_backend_and_serving_roundtrip(self):
+        serving = {"model_id": "/data/m", "model_dtype": "float16",
+                   "model_type": {"embedding": {"pooling": "cls"}}, "checks": {"dim": 384}}
+        card = ModelCard(model_id="m", version="1", repo="r", weights_public=True,
+                         backend="tei", serving=serving)
+        again = ModelCard.from_dict(card.to_dict())
+        assert again.backend == "tei" and again.serving == serving
+
+    def test_card_written_before_serving_fields_still_loads(self, card):
+        old = card.to_dict()
+        del old["backend"], old["serving"]
+        loaded = ModelCard.from_dict(old)
+        assert loaded.backend is None and loaded.serving is None
+        assert loaded == card
+
 
 # ---------------------------------------------------------------------------
 # run() context manager
@@ -517,6 +538,14 @@ class TestSidecars:
                        model_card=card)
         assert "private" in render_readme(meta)
 
+    def test_readme_documents_backend_and_serving(self):
+        card = ModelCard(model_id="m", version="1", repo="r", weights_public=True,
+                         backend="tei", serving={"model_dtype": "float16"})
+        rendered = render_readme(RunMeta(kind="k", pipeline=PIPELINE,
+                                         pipeline_version=VERSION, model_card=card))
+        assert "**Backend**: `tei`" in rendered
+        assert "### Serving" in rendered and '"model_dtype": "float16"' in rendered
+
     def test_readme_lists_inputs(self):
         meta = RunMeta(kind="k", pipeline=PIPELINE, pipeline_version=VERSION,
                        sources=["upstream-artifact-id"])
@@ -588,6 +617,58 @@ class TestRunRecords:
                        extend=first_id) as run:
             (run.out_dir / "extra.parquet").write_bytes(b"more")
         assert index.get(first_id).artifact_id == first_id
+
+
+class TestResume:
+    HP = {"start_year": 2000, "end_year": 2001}
+
+    def _crashed(self, index):
+        with pytest.raises(RuntimeError):
+            with index.run(kind="k", pipeline=PIPELINE, pipeline_version=VERSION,
+                           hyperparams=self.HP) as run:
+                (run.out_dir / "2000.parquet").write_bytes(b"done before the crash")
+                raise RuntimeError("killed")
+        return index.list("k", include_partial=True)[0]
+
+    def test_resume_completes_in_place_and_keeps_history(self, index):
+        crashed = self._crashed(index)
+        assert crashed.partial
+        with index.run(kind="k", pipeline=PIPELINE, pipeline_version=VERSION,
+                       hyperparams=self.HP, resume=crashed.artifact_id) as run:
+            assert run.out_dir == crashed.path
+            (run.out_dir / "2001.parquet").write_bytes(b"after resume")
+        done = index.get(crashed.artifact_id)
+        assert not done.partial and len(done.meta.runs) == 2
+        assert done.meta.runs[0].partial and not done.meta.runs[1].partial
+        assert done.meta.runs[1].notes.startswith("resume of execution 1")
+        assert set(done.file_hashes) == {"2000.parquet", "2001.parquet"}
+
+    def test_resume_refuses_other_hyperparams_kind_or_complete(self, index):
+        crashed = self._crashed(index)
+        with pytest.raises(DatalakeError, match="different hyperparams"):
+            with index.run(kind="k", pipeline=PIPELINE, pipeline_version=VERSION,
+                           hyperparams={"start_year": 1999}, resume=crashed.artifact_id):
+                pass
+        with pytest.raises(DatalakeError, match="not a other"):
+            with index.run(kind="other", pipeline=PIPELINE, pipeline_version=VERSION,
+                           hyperparams=self.HP, resume=crashed.artifact_id):
+                pass
+        complete = _run_producing(index, "k2")
+        with pytest.raises(DatalakeError, match="complete"):
+            with index.run(kind="k2", pipeline=PIPELINE, pipeline_version=VERSION,
+                           resume=complete.artifact_id):
+                pass
+
+    def test_resume_can_crash_again_and_be_resumed(self, index):
+        crashed = self._crashed(index)
+        with pytest.raises(RuntimeError):
+            with index.run(kind="k", pipeline=PIPELINE, pipeline_version=VERSION,
+                           hyperparams=self.HP, resume=crashed.artifact_id):
+                raise RuntimeError("killed again")
+        with index.run(kind="k", pipeline=PIPELINE, pipeline_version=VERSION,
+                       hyperparams=self.HP, resume=crashed.artifact_id):
+            pass
+        assert len(index.get(crashed.artifact_id).meta.runs) == 3
 
 
 class TestExtend:

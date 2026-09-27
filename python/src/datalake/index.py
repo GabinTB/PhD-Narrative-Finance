@@ -270,6 +270,7 @@ class DatalakeIndex:
         notes: str = "",
         hash_pattern: str = "*",
         extend: str | None = None,
+        resume: str | None = None,
     ) -> Iterator[RunHandle]:
         """Register, execute, and finalise one pipeline execution.
 
@@ -277,6 +278,12 @@ class DatalakeIndex:
         append a new RunRecord to an existing complete artifact (e.g. adding
         more years to a finished corpus) -- this preserves the earlier
         execution's commit and timestamps rather than overwriting them.
+
+        Pass `resume=<artifact_id>` to continue a PARTIAL artifact (a crashed or
+        killed run) in place: its kind and hyperparams must equal the ones given
+        here, or DatalakeError is raised -- a resume can never change what the
+        artifact means. The crashed execution stays in the history as partial
+        and a new RunRecord is appended; on clean exit the artifact is complete.
 
         On clean exit the execution's RunRecord is marked complete, outputs are
         hashed, and both sidecars are written.  On exception the record is left
@@ -296,13 +303,31 @@ class DatalakeIndex:
             notes:            Free text recorded on this execution's record.
             hash_pattern:     Glob for which output files to hash.
             extend:           Artifact ID to append a new execution to.
+            resume:           Partial artifact ID to continue in place.
         """
         source_ids = [
             s.artifact_id if isinstance(s, Artifact) else str(s)
             for s in (sources or [])
         ]
 
-        if extend is not None:
+        if extend is not None and resume is not None:
+            raise DatalakeError("give at most one of extend / resume")
+        if resume is not None:
+            existing = self.get(resume)
+            if not existing.partial:
+                raise DatalakeError(f"cannot resume a complete artifact: {resume}. "
+                                    "Use extend=... to add a new execution.")
+            if existing.kind != kind:
+                raise DatalakeError(f"{resume} is a {existing.kind}, not a {kind}")
+            if existing.meta.hyperparams != dict(hyperparams or {}):
+                raise DatalakeError(
+                    f"resume of {resume} with different hyperparams: recorded "
+                    f"{existing.meta.hyperparams}, given {dict(hyperparams or {})}")
+            meta = existing.meta
+            resolved_layer = existing.layer
+            out_dir = existing.path
+            notes = (f"resume of execution {len(meta.runs)}. {notes}").strip()
+        elif extend is not None:
             existing = self.get(extend)
             if existing.partial:
                 raise DatalakeError(

@@ -227,7 +227,13 @@ def render_readme(
             lines.append(f"- **Weights**: private, not distributable (sha256 `{digest}`)")
         if card.notes:
             lines.append(f"- **Notes**: {card.notes}")
+        if card.backend:
+            lines.append(f"- **Backend**: `{card.backend}`")
         lines.append("")
+        if card.serving:
+            lines += ["### Serving", "", "```json",
+                      json.dumps(card.serving, indent=2, sort_keys=True, default=str),
+                      "```", ""]
 
     if meta.sources:
         lines += ["## Inputs", ""]
