@@ -551,7 +551,7 @@ class JobRunner:
                             state.units_done += 1
                         continue
                     if self._pause_requested.is_set() or (out_dir / PAUSE_FILE).exists():
-                        state.status, state.current_unit = "paused", None
+                        state.status, state.current_unit, state.eta = "paused", None, None
                         state.write(out_dir)
                         adapter.info("pause requested: stopping before %s", unit.key)
                         raise JobPaused(unit.key)
@@ -586,6 +586,7 @@ class JobRunner:
             raise
         except BaseException as exc:
             state.status, state.last_error = "failed", f"{type(exc).__name__}: {exc}"
+            state.eta = None
             state.write(out_dir)
             adapter.error("job failed at %s: %s", state.current_unit, state.last_error)
             raise
