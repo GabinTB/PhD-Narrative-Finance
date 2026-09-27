@@ -54,6 +54,7 @@ headline_sentiment = "ravenpack.headlines.sentiment:verify_artifact"
 ravenpack_headlines = "ravenpack.headlines.ingest:IngestJob"
 headline_sentiment = "ravenpack.headlines.sentiment:HeadlineSentimentJob"
 headline_embeddings = "ravenpack.headlines.embed:EmbedJob"
+mu_asof = "ravenpack.headlines.mu_asof:MuAsofJob"
 
 [build-system]
 requires      = ["hatchling"]

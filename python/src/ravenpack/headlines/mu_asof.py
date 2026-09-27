@@ -62,6 +62,8 @@ import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from datalake.jobs import TEMP_SUFFIX, Job, JobContext, Unit, register_job
+from datalake.periods import partition_file
 from nlp.reference_vector import (
     POOLINGS,
     REFERENCE_SCHEMA,
@@ -201,12 +203,7 @@ def compute_daily_stats(
         else:
             result = _month_stats(hl_file, emb_file, pooling, threads)
             if ckpt is not None:
-                tmp = ckpt.with_suffix(".tmp.npz")
-                np.savez(tmp, day=result["day"].to_numpy().astype("datetime64[D]"),
-                         stat=np.asarray(result["day_stat"].to_list(), dtype=np.float64)
-                         .reshape(result.height, -1),
-                         n=result["n"].to_numpy())
-                tmp.replace(ckpt)
+                _save_checkpoint(result, ckpt)
         _accumulate(pooling, result, day_stat, day_cnt)
 
         if i % 20 == 0 or i == len(embedding_files):
@@ -217,6 +214,17 @@ def compute_daily_stats(
     if n_reused:
         log.info("  %d month(s) reused from checkpoints", n_reused)
     return _finish_daily(day_stat, day_cnt, headlines_dir, embeddings_dir)
+
+
+def _save_checkpoint(result: pl.DataFrame, ckpt: Path) -> None:
+    """One partition's per-day aggregates, atomically (float64: a lossless round trip)."""
+    tmp = ckpt.with_suffix(".tmp.npz")
+    stat = (np.asarray(result["day_stat"].to_list(), dtype=np.float64)
+            .reshape(result.height, -1) if result.height
+            else np.empty((0, EMBEDDING_DIM), dtype=np.float64))
+    np.savez(tmp, day=result["day"].to_numpy().astype("datetime64[D]"), stat=stat,
+             n=result["n"].to_numpy())
+    tmp.replace(ckpt)
 
 
 def _month_stats(hl_file: Path, emb_file: Path, pooling: str, threads: int) -> pl.DataFrame:
@@ -308,23 +316,126 @@ def output_name(delay: str, mode: str, pooling: str = "mean") -> str:
     return f"mu_asof_delay-{delay}_mode-{mode}{suffix}.parquet"
 
 
+PIPELINE_VERSION = "v0.2.0"   # v0.2.0: pooling in the hyperparams (mean/min/max)
+
+
+@register_job
+class MuAsofJob(Job):
+    """Dated reference vector of the corpus: one checkpoint per partition, then the series."""
+
+    kind = KIND
+    pipeline_version = PIPELINE_VERSION
+
+    def __init__(self, headlines: Artifact, embeddings: Artifact, delay: str, mode: str, *,
+                 pooling: str = "mean", threads: int = 8, temp: bool = False,
+                 pipeline_version: str | None = None) -> None:
+        validate_window_after_delay(parse_delay(delay), parse_window(mode))
+        if pooling not in POOLINGS:
+            raise ValueError(f"pooling must be one of {POOLINGS}, got {pooling!r}")
+        _check_same_layout(headlines, embeddings)
+        self.headlines, self.embeddings = headlines, embeddings
+        self.delay, self.mode, self.pooling = delay, mode, pooling
+        self.threads, self.temp = threads, temp
+        if pipeline_version is not None:
+            self.pipeline_version = pipeline_version
+
+    def params(self) -> dict[str, Any]:
+        return {"delay": self.delay, "mode": self.mode, "pooling": self.pooling,
+                "dim": EMBEDDING_DIM, "source_headlines": self.headlines.artifact_id,
+                "source_embeddings": self.embeddings.artifact_id}
+
+    def sources(self) -> list[Any]:
+        return [self.headlines, self.embeddings]
+
+    def notes(self) -> str:
+        return (f"source_headlines={self.headlines.artifact_id} "
+                f"source_embeddings={self.embeddings.artifact_id}")
+
+    def units(self) -> list[Unit]:
+        """Every embeddings partition with a headlines partition of the same key."""
+        keys = [p.stem for p in sorted(self.embeddings.path.glob("*.parquet"))]
+        missing = [k for k in keys if not (self.headlines.path / partition_file(k)).exists()]
+        if missing:
+            log.warning("%d embeddings partition(s) have no headlines partition, skipped "
+                        "(e.g. %s)", len(missing), missing[0])
+        return [Unit(k) for k in keys if k not in set(missing)]
+
+    def is_done(self, unit: Unit, out_dir: Path) -> bool:
+        return (out_dir / CHECKPOINT_DIR / f"{unit.key}.npz").exists()
+
+    def run_unit(self, unit: Unit, ctx: JobContext) -> None:
+        """Pass 1 for one partition: per-day aggregates, checkpointed."""
+        name = partition_file(unit.key)
+        ckpt_dir = ctx.out_dir / CHECKPOINT_DIR
+        ckpt_dir.mkdir(exist_ok=True)
+        result = _month_stats(self.headlines.path / name, self.embeddings.path / name,
+                              self.pooling, self.threads)
+        _save_checkpoint(result, ckpt_dir / f"{unit.key}.npz")
+        ctx.log.info("%s  %d day(s) aggregated", unit.key, result.height)
+
+    def finalize(self, ctx: JobContext) -> None:
+        """Pass 2 from the checkpoints (nothing re-queried), then drop them."""
+        _build_series(ctx.run, self.headlines, self.embeddings, self.delay, self.mode,
+                      self.pooling, self.threads)
+
+    @classmethod
+    def from_artifact(cls, artifact: Artifact, index: DatalakeIndex, *,
+                      threads: int = 8) -> MuAsofJob:
+        """Delay, window, pooling and the exact sources come from the artifact."""
+        hp = artifact.meta.hyperparams
+        return cls(index.get(hp["source_headlines"]), index.get(hp["source_embeddings"]),
+                   hp["delay"], hp["mode"], pooling=hp.get("pooling", "mean"),
+                   threads=threads, temp=artifact.meta.pipeline_version.endswith(TEMP_SUFFIX))
+
+    @classmethod
+    def add_cli_args(cls, parser: Any) -> None:
+        parser.add_argument("--delay", required=True,
+                            help="minimum 1 day: '1d', '2W', '3M'; mu(t) uses data before "
+                                 "t - delay")
+        parser.add_argument("--mode", required=True,
+                            help="'expanding', or a rolling window >= 1 week: '4W', '6M'")
+        parser.add_argument("--pooling", default="mean", choices=list(POOLINGS))
+        parser.add_argument("--headlines-artifact", default=None,
+                            help="default: the latest ravenpack_headlines")
+        parser.add_argument("--embeddings-artifact", default=None,
+                            help="default: the latest headline_embeddings")
+        parser.add_argument("--threads", type=int, default=8, help="DuckDB PRAGMA threads")
+        parser.add_argument("--temp", action="store_true", help="agent-created (__TEMP)")
+
+    @classmethod
+    def from_args(cls, args: Any, index: DatalakeIndex) -> MuAsofJob:
+        return cls(*_sources(index, args.headlines_artifact, args.embeddings_artifact),
+                   args.delay, args.mode, pooling=args.pooling, threads=args.threads,
+                   temp=args.temp)
+
+
+def _sources(index: DatalakeIndex, headlines_id: str | None,
+             embeddings_id: str | None) -> tuple[Artifact, Artifact]:
+    return (index.get(headlines_id) if headlines_id else index.latest(SOURCE_HEADLINES_KIND),
+            index.get(embeddings_id) if embeddings_id
+            else index.latest(SOURCE_EMBEDDINGS_KIND))
+
+
 def mu_asof_to_datalake(
     index: "DatalakeIndex",
     delay: str,
     mode: str,
-    pipeline_version: str,
+    pipeline_version: str = PIPELINE_VERSION,
     *,
     pooling: str = "mean",
     pipeline_repo: str | None = None,
     threads: int = 8,
+    headlines_id: str | None = None,
+    embeddings_id: str | None = None,
+    repo_dir: Path | None = None,
 ) -> "Artifact":
-    """Dated reference-vector series for the corpus, registered as a ``mu_asof`` artifact.
+    """Dated reference-vector series for the corpus, registered as a ``mu_asof`` artifact
+    (library entry point; runs ``MuAsofJob``).
 
-    Resolves the latest ``ravenpack_headlines`` and ``headline_embeddings``
-    artifacts via ``index.latest()`` -- never hardcoded paths -- and records
-    both as lineage sources. Writes a single parquet (``output_name``) into
-    the run's output directory, since the series is one daily time series,
-    not a monthly corpus.
+    Sources default to the latest ``ravenpack_headlines`` and
+    ``headline_embeddings`` artifacts (never hardcoded paths) and are recorded
+    as lineage. Writes a single parquet (``output_name``): the series is one
+    daily time series, not a partitioned corpus.
 
     Args:
         index:              Datalake index to register the artifact in.
@@ -333,47 +444,16 @@ def mu_asof_to_datalake(
         pipeline_version:    Semantic version of this pipeline.
         pooling:             "mean", "min" or "max".
         pipeline_repo:       URL of the producing repo.
-        threads:             DuckDB PRAGMA threads for pass 1 (applied
-                             per-month; see compute_daily_stats).
-
-    Returns:
-        The completed Artifact.
+        threads:             DuckDB PRAGMA threads for pass 1 (per partition).
+        headlines_id / embeddings_id: explicit sources (default: latest).
     """
-    validate_window_after_delay(parse_delay(delay), parse_window(mode))
-    if pooling not in POOLINGS:
-        raise ValueError(f"pooling must be one of {POOLINGS}, got {pooling!r}")
+    from datalake.jobs import JobRunner
 
-    headlines_artifact = index.latest(SOURCE_HEADLINES_KIND)
-    embeddings_artifact = index.latest(SOURCE_EMBEDDINGS_KIND)
-
-    hyperparams: dict[str, Any] = {
-        "delay": delay,
-        "mode": mode,
-        "pooling": pooling,
-        "dim": EMBEDDING_DIM,
-        "source_headlines": headlines_artifact.artifact_id,
-        "source_embeddings": embeddings_artifact.artifact_id,
-    }
-    notes = (
-        f"source_headlines={headlines_artifact.artifact_id} "
-        f"source_embeddings={embeddings_artifact.artifact_id}"
-    )
-
-    with index.run(
-        kind=KIND,
-        pipeline=PIPELINE,
-        pipeline_version=pipeline_version,
-        pipeline_repo=pipeline_repo,
-        hyperparams=hyperparams,
-        notes=notes,
-        sources=[headlines_artifact, embeddings_artifact],
-        verifier=KIND,
-        hash_pattern="*.parquet",
-    ) as run:
-        _build_series(run, headlines_artifact, embeddings_artifact, delay, mode, pooling,
-                      threads)
-
-    return index.get(run.artifact_id)
+    job = MuAsofJob(*_sources(index, headlines_id, embeddings_id), delay, mode,
+                    pooling=pooling, threads=threads, pipeline_version=pipeline_version)
+    job.pipeline_repo = pipeline_repo
+    return JobRunner(index, repo_dir=repo_dir, allow_dirty=True,
+                     handle_signals=False).start(job)
 
 
 CHECKPOINT_DIR = "_daily"
@@ -427,27 +507,24 @@ def _build_series(run: Any, headlines_artifact: Artifact, embeddings_artifact: A
     run.note(f"{len(result)} asof dates -> {out_name}")
 
 
-def resume_mu_asof(index: DatalakeIndex, artifact_id: str, *, threads: int = 8) -> Artifact:
-    """Finish a partial ``mu_asof`` artifact from its own hyperparams.
+def resume_mu_asof(index: DatalakeIndex, artifact_id: str, *, threads: int = 8,
+                   repo_dir: Path | None = None) -> Artifact:
+    """Finish a partial ``mu_asof`` artifact from its own hyperparams (``jobs resume``).
 
     Delay, window, pooling and the exact source artifacts come from the artifact
-    (never "latest"); months checkpointed before the interruption are not
+    (never "latest"); partitions checkpointed before the interruption are not
     re-queried; the artifact is completed in place.
     """
+    from datalake.jobs import JobRunner
+
     art = index.get(artifact_id)
     if art.kind != KIND:
         raise ValueError(f"{artifact_id} is a {art.kind}, not a {KIND}")
     if not art.partial:
         raise ValueError(f"{artifact_id} is complete; nothing to resume")
-    hp = art.meta.hyperparams
-    headlines, embeddings = index.get(hp["source_headlines"]), index.get(hp["source_embeddings"])
-    with index.run(kind=KIND, pipeline=art.meta.pipeline,
-                   pipeline_version=art.meta.pipeline_version,
-                   pipeline_repo=art.meta.pipeline_repo, hyperparams=hp,
-                   verifier=KIND, hash_pattern="*.parquet", resume=artifact_id) as run:
-        _build_series(run, headlines, embeddings, hp["delay"], hp["mode"],
-                      hp.get("pooling", "mean"), threads)
-    return index.get(artifact_id)
+    return JobRunner(index, repo_dir=repo_dir, allow_dirty=True, handle_signals=False
+                     ).resume_job(artifact_id, MuAsofJob.from_artifact(art, index,
+                                                                       threads=threads))
 
 
 # ---------------------------------------------------------------------------

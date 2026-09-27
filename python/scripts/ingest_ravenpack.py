@@ -30,10 +30,10 @@ from pathlib import Path
 from dotenv import find_dotenv, load_dotenv
 
 from datalake import DatalakeError, DatalakeIndex
+from ravenpack.headlines.ingest import PIPELINE_VERSION
 
 PIPELINE = "PhD-Narrative-Finance"
 PIPELINE_REPO = "https://github.com/GabinTB/PhD-Narrative-Finance"
-from ravenpack.headlines.ingest import PIPELINE_VERSION  # noqa: E402
 
 log = logging.getLogger(__name__)
 

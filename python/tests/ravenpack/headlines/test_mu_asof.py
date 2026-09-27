@@ -297,7 +297,7 @@ def test_killed_job_resumes_from_checkpoints(tmp_path, monkeypatch):
         return index
 
     ref_index = lake(tmp_path / "ref")
-    ref = mod.mu_asof_to_datalake(ref_index, "1d", "expanding", "v0", threads=1)
+    ref = mod.mu_asof_to_datalake(ref_index, "1d", "expanding", threads=1)
     want = pl.read_parquet(next(ref.path.glob("*.parquet")))
 
     index = lake(tmp_path / "lake")
@@ -311,7 +311,7 @@ def test_killed_job_resumes_from_checkpoints(tmp_path, monkeypatch):
 
     monkeypatch.setattr(mod, "_month_stats", killed_in_february)
     with pytest.raises(RuntimeError, match="killed"):
-        mod.mu_asof_to_datalake(index, "1d", "expanding", "v0", threads=1)
+        mod.mu_asof_to_datalake(index, "1d", "expanding", threads=1)
     part = index.list("mu_asof", include_partial=True)[0]
     assert part.partial
     assert [p.name for p in (part.path / mod.CHECKPOINT_DIR).glob("*.npz")] == ["2000-01.npz"]
