@@ -47,11 +47,10 @@ import polars as pl
 
 from datalake import Artifact, DatalakeError, DatalakeIndex
 from datalake.meta import git_commit
-from narrative_scoring.calibration import load_mu_asof
 from narrative_scoring.config import ScoringConfig, SentimentSplit
-from narrative_scoring.corrections import Correction
 from narrative_scoring.partitions import (
     MonthlyNullPartitionWriter,
+    SkipClosedDays,
     load_partitions,
     month_range_days,
     months_between,
@@ -61,6 +60,7 @@ from narrative_scoring.primitives import (
     PARAPHRASE_JSONL,
     TAXONOMY_CSV,
     PrimitiveTable,
+    embeddings_digest,
     file_sha1,
     load_primitive_table,
 )
@@ -77,17 +77,20 @@ from narrative_scoring.streaming import (
     ParquetSentimentSource,
 )
 from narrative_scoring.tau_asof import (
+    DELAY,
     WINDOW_DEFAULT,
     TauSeriesProvider,
     build_tau_rows,
     latest_cutoff,
 )
+from nlp.corrections import Correction
+from nlp.reference_vector import load_reference_series
 
 log = logging.getLogger(__name__)
 
 PIPELINE = "PhD-Narrative-Finance"
 PIPELINE_REPO = "https://github.com/GabinTB/PhD-Narrative-Finance"
-PIPELINE_VERSION = "v2.1.0"
+PIPELINE_VERSION = "v2.2.0"   # v2.2.0: nlp embeddings, P digest in ids, provenance
 TEMP_SUFFIX = "__TEMP"
 
 KIND_TAXONOMY = "narrative_taxonomy"
@@ -102,6 +105,8 @@ KIND_SENTIMENT = "headline_sentiment"
 AGENT_KINDS = (KIND_PARTITIONS, KIND_TAU_ASOF, KIND_NARRATIVE_DAILY, KIND_DAY_DIAGNOSTICS)
 
 TAU_ASOF_FILE = "tau_asof.parquet"
+RUN_CONFIG_FILE = "run_config.json"      # everything a resume needs, written at run start
+PROVENANCE_FILE = "embeddings_provenance.json"
 PARAPHRASE_STYLES = ("headline", "semantic")
 X_MIN_MONTHS = 2          # earliest scorable start = earliest data + X_MIN_MONTHS (spec)
 X_FULL_MONTHS = 61        # 60-partition rolling window + the 1M delay
@@ -123,13 +128,18 @@ def _version(temp: bool) -> str:
 # Lookup by family + config; agent marking
 # ---------------------------------------------------------------------------
 
-def latest_matching(dl: DatalakeIndex, kind: str, **hyperparams: Any) -> Artifact:
+def latest_matching(dl: DatalakeIndex, kind: str, *, partial: bool = False,
+                    **hyperparams: Any) -> Artifact:
     """Complete artifact of ``kind`` whose hyperparams contain ``hyperparams``, with the most
-    recent finished execution (so an extended series beats an older rebuild and vice versa)."""
-    matches = [art for art in dl.list(kind)
+    recent finished execution (so an extended series beats an older rebuild and vice versa).
+    ``partial=True`` looks for an interrupted (partial) one instead."""
+    pool = ([a for a in dl.list(kind, include_partial=True) if a.partial] if partial
+            else dl.list(kind))
+    matches = [art for art in pool
                if all(art.meta.hyperparams.get(k) == v for k, v in hyperparams.items())]
     if not matches:
-        raise DatalakeError(f"no complete {kind} artifact matching {hyperparams}")
+        state = "partial" if partial else "complete"
+        raise DatalakeError(f"no {state} {kind} artifact matching {hyperparams}")
     return max(matches, key=lambda a: (a.meta.run_end or a.meta.run_start, a.artifact_id))
 
 
@@ -237,18 +247,37 @@ def load_registered_table(art: Artifact, style: str, *,
 # f0_monthly_partitions / tau_asof lookups
 # ---------------------------------------------------------------------------
 
-def partitions_params(config: ScoringConfig, table: PrimitiveTable, seed: int,
+def embedding_key(P: np.ndarray, primitive_meta: dict[str, Any] | None) -> str:
+    """What produced the primitive-text embeddings: the lookup key of every family
+    built from scores against them (partitions, tau_asof, narrative_daily).
+
+    The embedder identity digest from the cache sidecar (model, backend, dtype,
+    served model, pooling, dim; the texts are already in the taxonomy hashes), so
+    a cache rebuilt with the same recipe keeps extending the same artifacts, and
+    another recipe (e.g. bf16 -> fp16, TEI -> local) never does. An in-memory P
+    without a sidecar falls back to its byte digest.
+    """
+    if primitive_meta and primitive_meta.get("identity_digest"):
+        return str(primitive_meta["identity_digest"])
+    return "bytes-" + embeddings_digest(P)
+
+
+def partitions_params(config: ScoringConfig, table: PrimitiveTable, emb_key: str, seed: int,
                       temp: bool) -> dict[str, Any]:
-    return {**_taxonomy_params(table), "f0_config_id": config.f0_digest(),
+    return {**_taxonomy_params(table), "embeddings_id": emb_key,
+            "f0_config_id": config.f0_digest(),
             "mode": config.mode.value, "pooling": config.paraphrase_pooling.value,
             "trim_frac": config.trim_frac, "draws_per_headline": config.null_draws_per_headline,
             "seed": seed, "agent_created": temp}
 
 
 def find_partitions(dl: DatalakeIndex, config: ScoringConfig, table: PrimitiveTable,
-                    seed: int = 0, temp: bool = False) -> Artifact | None:
+                    emb_key: str, seed: int = 0, temp: bool = False) -> Artifact | None:
+    """The partitions artifact for this config, taxonomy AND embedding recipe
+    (``embedding_key``): null draws are scores against P."""
     try:
         return latest_matching(dl, KIND_PARTITIONS, f0_config_id=config.f0_digest(),
+                               embeddings_id=emb_key,
                                taxonomy_sha1=table.taxonomy_sha1[:12],
                                paraphrase_sha1=table.paraphrase_sha1[:12], seed=seed,
                                agent_created=temp)
@@ -256,21 +285,78 @@ def find_partitions(dl: DatalakeIndex, config: ScoringConfig, table: PrimitiveTa
         return None
 
 
-def tau_params(config: ScoringConfig, table: PrimitiveTable, window: str, seed: int,
-               temp: bool) -> dict[str, Any]:
-    return {**_taxonomy_params(table), "f0_config_id": config.f0_digest(), "window": window,
+def tau_params(config: ScoringConfig, table: PrimitiveTable, emb_key: str, window: str,
+               seed: int, temp: bool) -> dict[str, Any]:
+    return {**_taxonomy_params(table), "embeddings_id": emb_key,
+            "f0_config_id": config.f0_digest(), "window": window,
             "alpha": config.alpha, "mode": config.mode.value,
             "pooling": config.paraphrase_pooling.value, "seed": seed,
             "min_month_draws": config.min_month_draws, "agent_created": temp}
 
 
 def find_tau_asof(dl: DatalakeIndex, config: ScoringConfig, table: PrimitiveTable,
-                  window: str = WINDOW_DEFAULT, seed: int = 0,
+                  emb_key: str, window: str = WINDOW_DEFAULT, seed: int = 0,
                   temp: bool = False) -> Artifact | None:
     try:
-        return latest_matching(dl, KIND_TAU_ASOF, **tau_params(config, table, window, seed, temp))
+        return latest_matching(dl, KIND_TAU_ASOF,
+                               **tau_params(config, table, emb_key, window, seed, temp))
     except DatalakeError:
         return None
+
+
+def embeddings_provenance(P: np.ndarray, primitive_meta: dict[str, Any] | None,
+                          headline_embeddings: Artifact | None) -> dict[str, Any]:
+    """What produced both sides of S = H @ P.T: the primitive-text embeddings (the
+    cache sidecar: backend, serving metadata, checks) and the headline embeddings
+    artifact with its model card."""
+    card = headline_embeddings.meta.model_card if headline_embeddings is not None else None
+    return {
+        "embedding_key": embedding_key(P, primitive_meta),
+        "primitive_embeddings": {"digest": embeddings_digest(P), "shape": list(P.shape),
+                                 **(primitive_meta or {"note": "in-memory P, no sidecar"})},
+        "headline_embeddings": None if headline_embeddings is None else {
+            "artifact_id": headline_embeddings.artifact_id,
+            "model_card": card.to_dict() if card is not None else None},
+    }
+
+
+def _latest_or_none(dl: DatalakeIndex, kind: str) -> Artifact | None:
+    try:
+        return dl.latest(kind)
+    except DatalakeError:
+        return None
+
+
+def record_provenance(out_dir: Path, provenance: dict[str, Any]) -> None:
+    """Append this run's embedding provenance to the artifact's history.
+
+    An extended artifact keeps one entry per run. When the recipe is the same but
+    the bytes of P differ from the previous run (e.g. the cache was rebuilt through
+    a non-bit-reproducible server), the artifact keeps extending and a warning is
+    logged, so the change is visible in the log and in the history.
+    """
+    path = Path(out_dir) / PROVENANCE_FILE
+    history: list[dict[str, Any]] = []
+    if path.exists():
+        previous = json.loads(path.read_text())
+        history = previous.get("runs", [previous])
+    if history:
+        before = history[-1].get("primitive_embeddings", {}).get("digest")
+        after = provenance["primitive_embeddings"]["digest"]
+        if before and before != after:
+            log.warning("%s: extended with primitive embeddings of the same recipe (%s) but "
+                        "different bytes (digest %s -> %s)", Path(out_dir).name,
+                        provenance["embedding_key"], before, after)
+    from datalake.artifact import utc_now_iso
+
+    history.append({"recorded_at": utc_now_iso(), **provenance})
+    path.write_text(json.dumps({"runs": history}, indent=2, sort_keys=True, default=str))
+
+
+def write_run_config(out_dir: Path, run_config: dict[str, Any]) -> None:
+    """Everything ``resume_scoring`` needs to rerun the same pipeline, at run start."""
+    (Path(out_dir) / RUN_CONFIG_FILE).write_text(
+        json.dumps(run_config, indent=2, sort_keys=True, default=str))
 
 
 def load_tau_series(art: Artifact | None) -> pl.DataFrame:
@@ -284,10 +370,13 @@ def load_tau_series(art: Artifact | None) -> pl.DataFrame:
 # ---------------------------------------------------------------------------
 
 def headline_source(upstream: DatalakeIndex, chunk_size: int = 8_192, threads: int = 8,
-                    sentiment: Artifact | None = None,
-                    sentiment_column: str = "") -> ParquetHeadlineSource:
-    """The latest headlines + embeddings, with one column of ``sentiment`` joined in."""
-    hl, em = upstream.latest(KIND_HEADLINES), upstream.latest(KIND_EMBEDDINGS)
+                    sentiment: Artifact | None = None, sentiment_column: str = "", *,
+                    headlines: Artifact | None = None,
+                    embeddings: Artifact | None = None) -> ParquetHeadlineSource:
+    """Headlines + embeddings (the latest, or the given ones), with one column of
+    ``sentiment`` joined in."""
+    hl = headlines or upstream.latest(KIND_HEADLINES)
+    em = embeddings or upstream.latest(KIND_EMBEDDINGS)
     sent = None
     if sentiment is not None:
         check_sentiment(sentiment, headlines_id=hl.artifact_id, column=sentiment_column)
@@ -356,11 +445,11 @@ def earliest_headline_day(headlines: Artifact) -> date:
     return row[0]
 
 
-def _mu_inputs(upstream: DatalakeIndex, config: ScoringConfig):
+def _mu_inputs(upstream: DatalakeIndex, config: ScoringConfig, mu_id: str | None = None):
     if config.mode is Correction.RAW:
         return None, None
-    mu_art = upstream.latest(KIND_MU_ASOF)
-    return mu_art, load_mu_asof(next(mu_art.path.glob("*.parquet")))
+    mu_art = upstream.get(mu_id) if mu_id else upstream.latest(KIND_MU_ASOF)
+    return mu_art, load_reference_series(next(mu_art.path.glob("*.parquet")))
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +461,7 @@ def build_tau_asof(
     upstream: DatalakeIndex | None = None, window: str = WINDOW_DEFAULT, seed: int = 0,
     today: date | None = None, rebuild: bool = False, temp: bool = False,
     partitions_art: Artifact | None = None, taxonomy_id: str | None = None,
+    primitive_meta: dict[str, Any] | None = None, mu_id: str | None = None,
 ) -> Artifact | None:
     """Append every cutoff <= today - 1M not yet in the series (or rebuild it all).
 
@@ -382,7 +472,8 @@ def build_tau_asof(
     (partial until its run closes, hence invisible to ``find_partitions``).
     """
     upstream = upstream or dl
-    parts_art = partitions_art or find_partitions(dl, config, table, seed, temp)
+    emb_key = embedding_key(P, primitive_meta)
+    parts_art = partitions_art or find_partitions(dl, config, table, emb_key, seed, temp)
     if parts_art is None:
         log.info("tau_asof: no %s artifact yet for this config", KIND_PARTITIONS)
         return None
@@ -395,17 +486,23 @@ def build_tau_asof(
         log.info("tau_asof: no partition old enough as of %s (needs month_end <= today - 1M)",
                  today)
         return None
-    mu_art, mu_df = _mu_inputs(upstream, config)
+    mu_art, mu_df = _mu_inputs(upstream, config, mu_id)
 
-    hp = tau_params(config, table, window, seed, temp)
+    hp = tau_params(config, table, emb_key, window, seed, temp)
     existing: Artifact | None = None
     prior = pl.DataFrame(schema=TAU_ASOF_SCHEMA)
     if rebuild:
         from datalake.artifact import utc_now_iso
         hp = {**hp, "rebuilt_at": utc_now_iso()}
     else:
-        existing = find_tau_asof(dl, config, table, window, seed, temp)
-        prior = load_tau_series(existing)
+        existing = find_tau_asof(dl, config, table, emb_key, window, seed, temp)
+        interrupted = None
+        if existing is None:                       # a tau job killed mid-run: continue it
+            try:
+                interrupted = latest_matching(dl, KIND_TAU_ASOF, partial=True, **hp)
+            except DatalakeError:
+                interrupted = None
+        prior = load_tau_series(existing or interrupted)
     all_cutoffs = parts.filter(pl.col("MONTH_END") <= cutoff)["MONTH_END"].to_list()
     done = set(prior["MONTH_END"].to_list())
     todo = [c for c in all_cutoffs if c not in done]
@@ -413,10 +510,13 @@ def build_tau_asof(
         return existing
 
     sources = [parts_art] + ([mu_art] if mu_art else []) + ([taxonomy_id] if taxonomy_id else [])
+    if rebuild:
+        interrupted = None
     with dl.run(kind=KIND_TAU_ASOF, pipeline=PIPELINE, pipeline_version=_version(temp),
                 pipeline_repo=PIPELINE_REPO, hyperparams=hp, repo_dir=_repo_dir(),
                 sources=sources, verifier=KIND_TAU_ASOF, hash_pattern="*.parquet",
-                extend=existing.artifact_id if existing else None) as run:
+                extend=existing.artifact_id if existing else None,
+                resume=interrupted.artifact_id if interrupted else None) as run:
         new_rows = build_tau_rows(
             parts, config, table, P, mu_df, mu_asof_id=mu_art.artifact_id if mu_art else None,
             cutoffs=todo, window=window, seed=seed, partitions_id=parts_art.artifact_id,
@@ -425,6 +525,8 @@ def build_tau_asof(
         tmp = run.out_dir / (TAU_ASOF_FILE + ".tmp")
         out.write_parquet(tmp, compression="zstd")
         tmp.replace(run.out_dir / TAU_ASOF_FILE)
+        record_provenance(run.out_dir, embeddings_provenance(
+            P, primitive_meta, _latest_or_none(upstream, KIND_EMBEDDINGS)))
         last = out.row(-1, named=True)
         run.note(f"{len(todo)} cutoff(s) added through {cutoff}; latest tau_empirical="
                  f"{last['TAU_EMPIRICAL']:.4f} tau_gauss={last['TAU_GAUSS']:.4f} "
@@ -432,14 +534,26 @@ def build_tau_asof(
     return dl.get(run.artifact_id)
 
 
-def calibration_as_of(dl: DatalakeIndex, config: ScoringConfig, table: PrimitiveTable, *,
-                      upstream: DatalakeIndex | None = None, window: str = WINDOW_DEFAULT,
-                      seed: int = 0, temp: bool = False) -> TauSeriesProvider:
-    """The CalibrationProvider over whatever tau_asof rows exist right now (possibly none)."""
+def calibration_as_of(dl: DatalakeIndex, config: ScoringConfig, table: PrimitiveTable,
+                      emb_key: str, *, upstream: DatalakeIndex | None = None,
+                      window: str = WINDOW_DEFAULT, seed: int = 0,
+                      temp: bool = False, mu_id: str | None = None,
+                      as_of: date | None = None) -> TauSeriesProvider:
+    """The CalibrationProvider over the tau_asof rows that exist right now (possibly none).
+
+    ``as_of`` restricts them to the rows the monthly job had built by that day
+    (cutoffs <= as_of - 1M, ``latest_cutoff``): a replay, a rerun of an earlier range
+    or a resumed run then sees exactly what the live loop saw, even when the series
+    already holds later rows.
+    """
     upstream = upstream or dl
-    mu_art, mu_df = _mu_inputs(upstream, config)
-    tau_art = find_tau_asof(dl, config, table, window, seed, temp)
-    return TauSeriesProvider(load_tau_series(tau_art), mu_df,
+    mu_art, mu_df = _mu_inputs(upstream, config, mu_id)
+    tau_art = find_tau_asof(dl, config, table, emb_key, window, seed, temp)
+    tau_df = load_tau_series(tau_art)
+    if as_of is not None:
+        limit = (pd.Timestamp(as_of) - DELAY).date()
+        tau_df = tau_df.filter(pl.col("MONTH_END") <= limit)
+    return TauSeriesProvider(tau_df, mu_df,
                              tau_source_id=tau_art.artifact_id if tau_art else "",
                              mu_asof_id=mu_art.artifact_id if mu_art else None)
 
@@ -459,7 +573,8 @@ def score_range_to_datalake(
     keep_primitive_daily: bool = False, threads: int = 8,
     rss_budget_gb: float | None = 30.0, use_kernel: bool | None = None,
     temp: bool = False, label: str = "", taxonomy_id: str | None = None,
-    sentiment: Artifact | None = None,
+    sentiment: Artifact | None = None, primitive_meta: dict[str, Any] | None = None,
+    inputs: dict[str, str | None] | None = None, resume: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Score [start, end] chronologically through the live machinery.
 
@@ -476,12 +591,32 @@ def score_range_to_datalake(
     is checked against the headlines artifact and cited in the lineage. The null
     partitions and tau never see sentiment.
 
+    ``primitive_meta`` is the primitive-embedding cache sidecar (backend, serving
+    metadata, checks); with the headline-embeddings model card it is written to
+    every artifact of the run (``embeddings_provenance.json``) and to the run
+    metadata. The embedding recipe (``embedding_key``) is part of every lookup key,
+    so partitions / tau built from other embeddings are never reused.
+
+    ``inputs`` pins the upstream artifacts (``headlines``, ``embeddings``,
+    ``mu_asof`` ids) instead of the latest ones; ``resume`` (``narrative_daily``,
+    ``day_diagnostics``, ``partitions`` ids of an interrupted run) continues that
+    run in place -- use ``resume_scoring``, which reads both from the run itself.
+    A resumed run skips every month whose narrative_daily file exists, re-scores the
+    rest, and never feeds a null draw twice: partitions checkpoint their open
+    month at every closed day (with the RNG state), and days already closed there
+    are re-scored for narrative_daily only. The outputs equal an uninterrupted run.
+
     Returns a summary dict with the artifact ids and counts.
     """
     upstream = upstream or dl
     if end < start:
         raise ValueError("end before start")
-    hl, em = upstream.latest(KIND_HEADLINES), upstream.latest(KIND_EMBEDDINGS)
+    inputs = inputs or {}
+    hl = upstream.get(inputs["headlines"]) if inputs.get("headlines") \
+        else upstream.latest(KIND_HEADLINES)
+    em = upstream.get(inputs["embeddings"]) if inputs.get("embeddings") \
+        else upstream.latest(KIND_EMBEDDINGS)
+    mu_id = inputs.get("mu_asof")
     split = config.sentiment_split is SentimentSplit.SIGN
     if split != (sentiment is not None):
         raise ValueError("a sentiment artifact is required iff sentiment_split=sign")
@@ -489,8 +624,9 @@ def score_range_to_datalake(
         check_sentiment(sentiment, headlines_id=hl.artifact_id,
                         column=config.sentiment_column, source=config.sentiment_source)
     source = source or headline_source(upstream, threads=threads, sentiment=sentiment,
-                                       sentiment_column=config.sentiment_column)
-    mu_art, _ = _mu_inputs(upstream, config)
+                                       sentiment_column=config.sentiment_column,
+                                       headlines=hl, embeddings=em)
+    mu_art, _ = _mu_inputs(upstream, config, mu_id)
 
     earliest = earliest_headline_day(hl)
     x_min = (pd.Timestamp(earliest) + pd.DateOffset(months=X_MIN_MONTHS)).date()
@@ -502,16 +638,20 @@ def score_range_to_datalake(
     if end < start:
         log.warning("nothing to score: end %s precedes the shifted start %s", end, start)
 
-    parts_art = find_partitions(dl, config, table, seed, temp)
+    emb_key = embedding_key(P, primitive_meta)
+    parts_art = (dl.get(resume["partitions"]) if resume
+                 else find_partitions(dl, config, table, emb_key, seed, temp))
     have = (set(load_partitions(parts_art.path)["MONTH_END"].to_list())
             if parts_art else set())
     # months that end before the first mu_asof row can never be corrected, hence never
     # yield a partition: not walked at all
-    first_mu = _mu_inputs(upstream, config)[1]
+    first_mu = _mu_inputs(upstream, config, mu_id)[1]
     first_correctable = first_mu["DATE"].min() if first_mu is not None else earliest
     months = [(y, m) for (y, m) in months_between(earliest, end)
               if month_range_days(y, m)[-1] >= first_correctable]
-    hp = {**_taxonomy_params(table), "config_id": config.digest(),
+    provenance = embeddings_provenance(P, primitive_meta, em)
+    hp = {**_taxonomy_params(table), "embeddings_id": emb_key,
+          "config_id": config.digest(),
           "f0_config_id": config.f0_digest(), "mode": config.mode.value,
           "pooling": config.paraphrase_pooling.value, "q": config.q,
           "split": config.sentiment_split.value, "window": window, "seed": seed,
@@ -530,19 +670,45 @@ def score_range_to_datalake(
 
     run_kw = dict(pipeline=PIPELINE, pipeline_version=_version(temp),
                   pipeline_repo=PIPELINE_REPO, repo_dir=_repo_dir())
+    resume = resume or {}
+    pt_partial = bool(parts_art) and parts_art.partial
     with dl.run(kind=KIND_NARRATIVE_DAILY, hyperparams=hp, sources=nd_sources,
-                verifier=KIND_NARRATIVE_DAILY, hash_pattern="*", **run_kw) as nd_run, \
+                verifier=KIND_NARRATIVE_DAILY, hash_pattern="*",
+                resume=resume.get("narrative_daily"), **run_kw) as nd_run, \
          dl.run(kind=KIND_DAY_DIAGNOSTICS, hyperparams=hp, sources=nd_sources,
-                verifier=KIND_DAY_DIAGNOSTICS, hash_pattern="*", **run_kw) as dg_run, \
-         dl.run(kind=KIND_PARTITIONS, hyperparams=partitions_params(config, table, seed, temp),
+                verifier=KIND_DAY_DIAGNOSTICS, hash_pattern="*",
+                resume=resume.get("day_diagnostics"), **run_kw) as dg_run, \
+         dl.run(kind=KIND_PARTITIONS, hyperparams=partitions_params(config, table, emb_key, seed,
+                                                                temp),
                 sources=sources, verifier=KIND_PARTITIONS, hash_pattern="*.parquet",
-                extend=parts_art.artifact_id if parts_art else None, **run_kw) as pt_run:
+                extend=parts_art.artifact_id if parts_art and not pt_partial else None,
+                resume=parts_art.artifact_id if pt_partial else None, **run_kw) as pt_run:
+        for out_dir in (nd_run.out_dir, dg_run.out_dir, pt_run.out_dir):
+            record_provenance(out_dir, provenance)
+        if not resume:
+            write_run_config(nd_run.out_dir, {
+                "config": config.to_dict(), "start": start.isoformat(),
+                "end": end.isoformat(), "window": window, "seed": seed, "label": label,
+                "temp": temp, "keep_primitive_daily": keep_primitive_daily,
+                "taxonomy_artifact_id": taxonomy_id,
+                "sentiment_artifact_id": sentiment.artifact_id if sentiment else None,
+                "inputs": {"headlines": hl.artifact_id, "embeddings": em.artifact_id,
+                           "mu_asof": mu_art.artifact_id if mu_art else None},
+                "primitive_embeddings": {
+                    "embedding_key": emb_key,
+                    "paraphrase_style": config.paraphrase_style.value,
+                    "model_card": (primitive_meta or {}).get("model_card")},
+                "artifacts": {"narrative_daily": nd_run.artifact_id,
+                              "day_diagnostics": dg_run.artifact_id,
+                              "partitions": pt_run.artifact_id},
+            })
         writer = ParquetMonthWriter(nd_run.out_dir, dg_run.out_dir)
-        sink = MonthlyNullPartitionWriter(
+        partition_writer = MonthlyNullPartitionWriter(
             pt_run.out_dir, config=config, table=table, seed=seed,
             input_ids={"headlines": hl.artifact_id, "embeddings": em.artifact_id,
                        "mu_asof": mu_art.artifact_id if mu_art else None},
             code_version=pt_run.record.pipeline_commit)
+        sink = SkipClosedDays(partition_writer) if resume else partition_writer
         last_metadata = None
         for (y, m) in months:
             all_days = month_range_days(y, m)
@@ -556,13 +722,17 @@ def score_range_to_datalake(
                 mode = "score"
             if not days:
                 continue
+            if resume and mode == "score" and \
+                    (nd_run.out_dir / f"{y}-{m:02d}.parquet").exists():
+                continue                          # finished before the interruption
             # (1) the monthly tau job, as of the first day of this month
             tau_art = build_tau_asof(dl, config, table, P, upstream=upstream, window=window,
                                      seed=seed, today=date(y, m, 1), temp=temp,
                                      partitions_art=dl.get(pt_run.artifact_id),
-                                     taxonomy_id=taxonomy_id)
-            cal = calibration_as_of(dl, config, table, upstream=upstream, window=window,
-                                    seed=seed, temp=temp)
+                                     taxonomy_id=taxonomy_id, primitive_meta=primitive_meta,
+                                     mu_id=mu_id)
+            cal = calibration_as_of(dl, config, table, emb_key, upstream=upstream, window=window,
+                                    seed=seed, temp=temp, mu_id=mu_id, as_of=date(y, m, 1))
             if tau_art is not None:
                 summary["tau_rows"] = load_tau_series(tau_art)
             log.info("month %d-%02d: %s, %d day(s), tau rows available: %d",
@@ -575,6 +745,7 @@ def score_range_to_datalake(
                 use_kernel=use_kernel, threads=threads, rss_budget_gb=rss_budget_gb,
                 seed=seed, code_version=nd_run.record.pipeline_commit,
                 sentiment_artifact_id=sentiment.artifact_id if sentiment else None,
+                embeddings_provenance=provenance,
                 extra_metadata={"narrative_daily_id": nd_run.artifact_id,
                                 "day_diagnostics_id": dg_run.artifact_id,
                                 "partitions_id": pt_run.artifact_id})
@@ -595,9 +766,70 @@ def score_range_to_datalake(
         dg_run.note(f"{summary['n_days_scored']} day(s)")
     summary.update(narrative_daily_id=nd_run.artifact_id, day_diagnostics_id=dg_run.artifact_id,
                    partitions_id=pt_run.artifact_id)
-    tau_art = find_tau_asof(dl, config, table, window, seed, temp)
+    tau_art = find_tau_asof(dl, config, table, emb_key, window, seed, temp)
     summary["tau_asof_id"] = tau_art.artifact_id if tau_art else None
     return summary
+
+
+def resume_scoring(
+    dl: DatalakeIndex, narrative_daily_id: str, *, upstream: DatalakeIndex | None = None,
+    cache_dir: Path, threads: int = 8, chunk_size: int = 8_192,
+    rss_budget_gb: float | None = 30.0, use_kernel: bool | None = None, embedder: Any = None,
+) -> dict[str, Any]:
+    """Continue an interrupted scoring run from the run alone.
+
+    Everything comes from the run's ``run_config.json`` (written at its start):
+    config, dates, window, seed, taxonomy artifact, sentiment artifact, the exact
+    upstream inputs (never "latest"), and the ids of its narrative_daily /
+    day_diagnostics / partitions artifacts. The primitive-text embedder is rebuilt
+    from the recorded model card and must serve the same model (a remote server's
+    metadata is read first); its embeddings come from the recipe-keyed cache.
+    Only throughput knobs come from the caller.
+    """
+    from datalake import ModelCard
+    from nlp.embedding import embedder_from_card
+
+    upstream = upstream or dl
+    nd = dl.get(narrative_daily_id)
+    if nd.kind != KIND_NARRATIVE_DAILY:
+        raise ValueError(f"{narrative_daily_id} is a {nd.kind}, not a {KIND_NARRATIVE_DAILY}")
+    if not nd.partial:
+        raise ValueError(f"{narrative_daily_id} is complete; nothing to resume")
+    path = nd.path / RUN_CONFIG_FILE
+    if not path.exists():
+        raise ValueError(f"{narrative_daily_id} has no {RUN_CONFIG_FILE} (written before "
+                         "resume support); it cannot be resumed")
+    rc = json.loads(path.read_text())
+    config = ScoringConfig(**rc["config"])
+    tax_art = resolve_taxonomy([dl, upstream], artifact_id=rc["taxonomy_artifact_id"])
+    table = load_registered_table(tax_art, rc["primitive_embeddings"]["paraphrase_style"])
+    card = rc["primitive_embeddings"]["model_card"]
+    if embedder is None:
+        if card is None:
+            raise ValueError("the run recorded no primitive-embedding model card")
+        embedder = embedder_from_card(ModelCard.from_dict(card))
+    from narrative_scoring.primitives import embed_primitive_texts
+
+    P, meta = embed_primitive_texts(table, cache_dir, embedder=embedder)
+    if embedding_key(P, meta) != rc["primitive_embeddings"]["embedding_key"]:
+        raise ValueError("the primitive-embedding recipe differs from the one the run started with")
+    sentiment = None
+    if rc.get("sentiment_artifact_id"):
+        sentiment = next(ix.get(rc["sentiment_artifact_id"]) for ix in (dl, upstream)
+                         if ix.exists(rc["sentiment_artifact_id"]))
+    inputs = rc["inputs"]
+    source = headline_source(upstream, chunk_size=chunk_size, threads=threads,
+                             sentiment=sentiment, sentiment_column=config.sentiment_column,
+                             headlines=upstream.get(inputs["headlines"]),
+                             embeddings=upstream.get(inputs["embeddings"]))
+    log.info("resuming %s (%s -> %s)", narrative_daily_id, rc["start"], rc["end"])
+    return score_range_to_datalake(
+        dl, date.fromisoformat(rc["start"]), date.fromisoformat(rc["end"]), config,
+        table=table, P=P, upstream=upstream, source=source, window=rc["window"],
+        seed=rc["seed"], keep_primitive_daily=rc["keep_primitive_daily"], threads=threads,
+        rss_budget_gb=rss_budget_gb, use_kernel=use_kernel, temp=rc["temp"],
+        label=rc["label"], taxonomy_id=rc["taxonomy_artifact_id"], sentiment=sentiment,
+        primitive_meta=meta, inputs=inputs, resume=rc["artifacts"])
 
 
 # ---------------------------------------------------------------------------

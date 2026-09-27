@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
 
-from narrative_scoring.corrections import Correction
+from nlp.corrections import Correction
 
 SPEC_PATH = "python/doc/narratives.md"
 
@@ -69,6 +69,7 @@ class SentimentSplit(str, Enum):
 SENTIMENT_ALL = "all"
 SENTIMENT_NONE = "none"
 SENTIMENT_COLUMN_PREFIX = "SENT_"
+SENTIMENT_SCORE_COLUMN = "SENT_SCORE"     # the nlp Sentimeter score, the default split column
 
 
 @dataclass(frozen=True)
@@ -210,6 +211,9 @@ class RunMetadata:
     seed: int
     code_version: str | None
     sentiment_artifact_id: str | None = None   # headline_sentiment artifact read by the split
+    # what produced both sides of S = H @ P.T: primitive-text embeddings (backend,
+    # serving metadata, checks) and the headline_embeddings artifact + model card
+    embeddings_provenance: dict[str, Any] | None = None
     config_id: str = ""
     f0_config_id: str = ""
     spec: str = SPEC_PATH

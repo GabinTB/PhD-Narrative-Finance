@@ -10,9 +10,6 @@ path it took; rebuild after any Python-version or venv change.
 
 * ``select_aggregate_rowwise`` -- the canonical scorer (selection.py +
   aggregation.py fused), flag ``HAVE_SELECT``.
-* ``gate_aggregate_rowwise`` -- the older tau-then-percentile gate used only
-  by the experimental Ray/GPU track (spec_pipeline.py, ray_hybrid.py), flag
-  ``HAVE_FUSED``.
 """
 from __future__ import annotations
 
@@ -29,13 +26,4 @@ except Exception as exc:  # noqa: BLE001 - any import failure must degrade, not 
     HAVE_SELECT = False
     log.debug("select_aggregate kernel unavailable (%s); using the numpy path", exc)
 
-try:
-    from narrative_scoring._kernels.fused_gate import gate_aggregate_rowwise  # noqa: F401
-
-    HAVE_FUSED = True
-except Exception as exc:  # noqa: BLE001
-    gate_aggregate_rowwise = None  # type: ignore[assignment]
-    HAVE_FUSED = False
-    log.debug("fused_gate kernel unavailable (%s)", exc)
-
-__all__ = ["select_aggregate_rowwise", "HAVE_SELECT", "gate_aggregate_rowwise", "HAVE_FUSED"]
+__all__ = ["select_aggregate_rowwise", "HAVE_SELECT"]

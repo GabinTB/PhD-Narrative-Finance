@@ -5,12 +5,12 @@ The pipeline never reads a calibration value directly. It asks a
 AS OF the day being scored, and the provider enforces the point-in-time
 rule:
 
-* ``mu_for(day)`` returns the mu_asof row for ``day`` itself (exact date)
-  or, when that day has no row, the latest row strictly before it. A row
-  dated after ``day`` is never used. The mu_asof artifact already embeds its
-  own delay (its row for t is built from headlines strictly before
-  t - delay), so "row dated <= day" is the whole guarantee needed here;
-  how mu_asof is computed is not this module's business.
+* ``mu_for(day)`` returns the reference-vector row (``mu_asof`` series) for
+  ``day`` itself (exact date) or, when that day has no row, the latest row
+  strictly before it. A row dated after ``day`` is never used. The series
+  already embeds its own delay (its row for t pools headlines up to
+  t - delay), so "row dated <= day" is the whole guarantee needed here; how
+  the reference is computed is ``nlp.reference_vector``'s business.
 * ``tau_for(day)`` returns a ``TauRecord`` whose calibration window ended
   strictly before ``day``; otherwise ``LookaheadError``.
 
@@ -24,28 +24,12 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass
 from datetime import date
-from pathlib import Path
 from typing import Protocol
 
-import numpy as np
-import polars as pl
+from nlp.corrections import LookaheadError
+from nlp.reference_vector import ReferenceValue
 
-
-class LookaheadError(ValueError):
-    """A calibration value dated at or after the day it would be used for."""
-
-
-@dataclass(frozen=True)
-class MuRecord:
-    """The mu_asof row actually used for a scoring day."""
-
-    date: date               # the row's DATE (<= the scoring day)
-    mu: np.ndarray           # raw pooled mean (not unit norm)
-    mu_hat: np.ndarray       # unit direction
-
-    @property
-    def norm(self) -> float:
-        return float(np.linalg.norm(self.mu.astype(np.float64)))
+__all__ = ["CalibrationProvider", "LookaheadError", "ReferenceValue", "TauRecord"]
 
 
 @dataclass(frozen=True)
@@ -87,28 +71,6 @@ class CalibrationProvider(Protocol):
     tau_source_id: str
     tau_policy: str
 
-    def mu_for(self, day: date) -> MuRecord | None: ...
+    def mu_for(self, day: date) -> ReferenceValue | None: ...
 
     def tau_for(self, day: date) -> TauRecord: ...
-
-
-# ---------------------------------------------------------------------------
-# mu_asof lookup
-# ---------------------------------------------------------------------------
-
-def load_mu_asof(path: Path) -> pl.DataFrame:
-    """Read a mu_asof parquet (DATE, MU, MU_HAT, N), sorted by DATE."""
-    return pl.read_parquet(path).sort("DATE")
-
-
-def resolve_mu_asof(mu_df: pl.DataFrame, day: date) -> MuRecord:
-    """Exact-date row for ``day``, else the latest row before it. Never a later row."""
-    candidates = mu_df.filter(pl.col("DATE") <= day)
-    if candidates.is_empty():
-        raise LookaheadError(f"mu_asof has no row at or before {day}")
-    row = candidates.sort("DATE").row(-1, named=True)
-    return MuRecord(
-        date=row["DATE"],
-        mu=np.asarray(row["MU"], dtype=np.float32),
-        mu_hat=np.asarray(row["MU_HAT"], dtype=np.float32),
-    )

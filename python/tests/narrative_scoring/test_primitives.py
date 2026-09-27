@@ -9,7 +9,6 @@ import polars as pl
 import pytest
 
 from narrative_scoring.config import PoolRule
-from narrative_scoring.corrections import Correction, apply_mode
 from narrative_scoring.primitives import (
     load_primitive_table,
     orphan_pole_candidates,
@@ -19,6 +18,7 @@ from narrative_scoring.primitives import (
     to_text_major,
 )
 from narrative_scoring.schema import EMBEDDING_DIM
+from nlp.corrections import Correction, apply_mode
 
 from .conftest import TAX_NAME, toy_rows, unit_rows, vendor_rows, write_toy_taxonomy
 

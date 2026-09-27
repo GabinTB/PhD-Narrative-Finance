@@ -10,7 +10,7 @@ import polars as pl
 import pytest
 
 from narrative_scoring._kernels import HAVE_SELECT
-from narrative_scoring.calibration import LookaheadError, TauRecord, resolve_mu_asof
+from narrative_scoring.calibration import LookaheadError, TauRecord
 from narrative_scoring.config import (
     AggRule,
     PoolRule,
@@ -18,7 +18,6 @@ from narrative_scoring.config import (
     SentimentSplit,
     n_candidates_for,
 )
-from narrative_scoring.corrections import Correction, apply_mode
 from narrative_scoring.partitions import MonthlyNullPartitionWriter, load_partitions
 from narrative_scoring.pipeline import ParquetMonthWriter, date_range, score_dates
 from narrative_scoring.primitives import primitive_scores, scoring_matrix
@@ -31,6 +30,8 @@ from narrative_scoring.validation import (
     reference_select,
     summarize,
 )
+from nlp.corrections import Correction, apply_mode
+from nlp.reference_vector import resolve_reference
 
 from .conftest import FixedTauProvider, unit_rows
 
@@ -194,7 +195,7 @@ def test_mu_resolves_as_of_day_never_after(world):
     assert cal.mu_for(d[1]).date == D0 + timedelta(days=1)          # exact row
     assert cal.mu_for(d[2]).date == D0 + timedelta(days=1)          # carried forward
     with pytest.raises(LookaheadError):
-        resolve_mu_asof(world["mu_df"], D0 - timedelta(days=100))
+        resolve_reference(world["mu_df"], D0 - timedelta(days=100))
     frozen = FixedTauProvider(_tau(0.25), world["mu_df"], freeze_mu_at=D0 - timedelta(days=1))
     assert frozen.mu_for(d[2]).date == D0 - timedelta(days=1)
     assert frozen.mu_policy.startswith("frozen@")

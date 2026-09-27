@@ -5,7 +5,9 @@ Canonical scorer (spec: python/doc/narratives.md, owner rulings on top of it):
   - config.py        ScoringConfig / RunMetadata, pooling, aggregation and sentiment enums.
   - primitives.py    Primitive table (CSV + JSONL joined on the sha1 path hash),
                      primitive-text embeddings, scoring matrix, pooled scores.
-  - corrections.py   RAW / R1 / R2 (apply_mode: the same transform on both sides).
+
+Everything before scoring is NLP and lives in the ``nlp`` package: embedding
+backends, RAW / R1 / R2 corrections (``nlp.corrections``), sentiment.
   - f0.py            F0: per-headline trim, t-digest + Welford pool, N_eff, tau formulas.
   - warmup.py        N_eff / spectrum computation (run inside the monthly tau job).
   - partitions.py    Monthly null partitions (f0_monthly_partitions artifact).
@@ -26,6 +28,4 @@ Sentiment scores are produced outside this package, as headline_sentiment artifa
   - validation.py    Dense reference implementations, derived views, summaries.
   - _kernels/        Optional compiled fused kernel (asserted equal to numpy).
 
-Suspended (Ray/GPU track): gpu_scoring.py, ray_hybrid.py, _kernels/fused_gate.pyx;
-the two modules raise NotImplementedError on import and their tests are skipped.
 """

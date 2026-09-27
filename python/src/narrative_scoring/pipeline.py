@@ -16,7 +16,7 @@ differs. Per day, in order:
     1. mu / mu_hat as of the day (calibration.mu_for), tau as of the day
        (calibration.tau_for) -- both refuse to look ahead;
     2. the mode-corrected scoring matrix for that mu (cached per mu date);
-    3. for each bounded chunk of headline embeddings: apply_mode, S = H @ P.T
+    3. for each bounded chunk of headline embeddings: mode.correct, S = H @ P.T
        with paraphrase pooling, then select + aggregate into the day's
        accumulators (compiled kernel when built, numpy otherwise -- same
        numbers), sample the chunk's null draws into the month partition, and
@@ -52,12 +52,7 @@ import polars as pl
 
 from narrative_scoring._kernels import HAVE_SELECT, select_aggregate_rowwise
 from narrative_scoring.aggregation import DayAccumulator, headline_narrative_scores
-from narrative_scoring.calibration import (
-    CalibrationProvider,
-    LookaheadError,
-    MuRecord,
-    TauRecord,
-)
+from narrative_scoring.calibration import CalibrationProvider, LookaheadError, TauRecord
 from narrative_scoring.config import (
     PERCENTILE_AXIS,
     SENTIMENT_ALL,
@@ -67,7 +62,6 @@ from narrative_scoring.config import (
     SentimentSplit,
     n_candidates_for,
 )
-from narrative_scoring.corrections import Correction, apply_mode
 from narrative_scoring.f0 import n_keep, n_trim, sample_null_draws, trim_threshold
 from narrative_scoring.partitions import NullDrawSink
 from narrative_scoring.primitives import (
@@ -90,6 +84,8 @@ from narrative_scoring.streaming import (
     prefetch,
     rss_gb,
 )
+from nlp.corrections import Correction
+from nlp.reference_vector import ReferenceValue
 
 log = logging.getLogger(__name__)
 
@@ -308,6 +304,7 @@ def score_dates(
     code_version: str | None = None,
     extra_metadata: dict[str, Any] | None = None,
     sentiment_artifact_id: str | None = None,
+    embeddings_provenance: dict[str, Any] | None = None,
 ) -> ScoringResult:
     """Score every day in ``dates`` (sorted, de-duplicated) with point-in-time inputs.
 
@@ -332,6 +329,8 @@ def score_dates(
         seed: recorded; the scorer itself is deterministic (null sampling is seeded by the sink).
         sentiment_artifact_id: the headline_sentiment artifact behind ``source``'s sentiment
             (split runs); recorded in the metadata and in day_diagnostics.
+        embeddings_provenance: what produced the primitive and headline embeddings
+            (``artifacts.embeddings_provenance``); recorded in the run metadata.
     Days with no headlines are skipped (listed in ``skipped_days``) but still closed
     in the null sink, so a month with quiet days can complete.
     """
@@ -363,7 +362,7 @@ def score_dates(
 
     matrix_cache: dict[date | None, np.ndarray] = {}
 
-    def scoring_matrix_for(mu: MuRecord | None) -> np.ndarray:
+    def scoring_matrix_for(mu: ReferenceValue | None) -> np.ndarray:
         key = mu.date if mu is not None else None
         if key not in matrix_cache:
             matrix_cache.clear()          # one live matrix at a time; mu changes monotonically
@@ -488,7 +487,7 @@ def score_dates(
             first_tau = first_tau or current["tau_rec"]
         mu, state = current["mu"], current["state"]
         X = chunk.embeddings
-        H = apply_mode(X, config.mode, mu.mu if mu else None, mu.mu_hat if mu else None)
+        H, _ = config.mode.correct(X, mu, as_of=day)     # raises on a future-dated mu
         S = primitive_scores(H, current["P_scoring"], n_prim, table.n_texts,
                              config.paraphrase_pooling)
         if current["tau32"] is None:             # null-only day
@@ -558,6 +557,7 @@ def score_dates(
         n_eff=first_tau.n_eff,
         seed=seed, code_version=code_version if code_version is not None else _git_revision(),
         sentiment_artifact_id=sentiment_artifact_id,
+        embeddings_provenance=embeddings_provenance,
         config_id=config.digest(), f0_config_id=config.f0_digest(),
         extra={"source": source.describe(), "scoring_path": "kernel" if use_kernel else "numpy",
                "first_tau_record": first_tau.to_dict(), **(extra_metadata or {})},

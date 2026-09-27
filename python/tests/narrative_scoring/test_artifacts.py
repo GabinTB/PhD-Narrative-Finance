@@ -1,6 +1,7 @@
 """The one scoring path on a sandbox datalake: cold start, monthly tau job, TEMP marking."""
 from __future__ import annotations
 
+import json
 import logging
 import time
 from datetime import date
@@ -101,7 +102,20 @@ class TestScoreRange:
             assert "__TEMP" in art.artifact_id and art.meta.hyperparams["agent_created"] is True
             assert A.is_agent_created(art)
         assert sorted(nd.file_hashes) == ["2008-04.parquet", "2008-05.parquet",
-                                          "2008-06.parquet", "run_metadata.json"]
+                                          "2008-06.parquet", A.PROVENANCE_FILE,
+                                          A.RUN_CONFIG_FILE, "run_metadata.json"]
+        # embedding provenance next to every artifact of the run, and in the run metadata
+        digest = A.embeddings_digest(toy_embeddings)
+        key = A.embedding_key(toy_embeddings, None)
+        for art in (nd, dg, pt, ta):
+            prov = json.loads((art.path / A.PROVENANCE_FILE).read_text())["runs"][-1]
+            assert prov["primitive_embeddings"]["digest"] == digest
+            assert prov["embedding_key"] == key
+            assert prov["headline_embeddings"]["artifact_id"] == \
+                lake.latest(A.KIND_EMBEDDINGS).artifact_id
+            assert art.meta.hyperparams["embeddings_id"] == key
+        run_meta = json.loads((nd.path / "run_metadata.json").read_text())
+        assert run_meta["embeddings_provenance"]["primitive_embeddings"]["digest"] == digest
         assert pl.read_parquet(nd.path / "2008-04.parquet").schema == NARRATIVE_DAILY_SCHEMA
         assert pl.read_parquet(dg.path / "2008-04.parquet").schema == DAY_DIAGNOSTICS_SCHEMA
         assert sorted(pt.file_hashes) == [f"2008-0{m}.parquet" for m in (2, 3, 4, 5, 6)]
@@ -150,7 +164,8 @@ class TestScoreRange:
                                   table=toy_table, P=toy_embeddings,
                                   source=_source(toy_table, toy_embeddings, months),
                                   use_kernel=False, temp=True)
-        base = A.find_tau_asof(lake, cfg, toy_table, "5Y", 0, temp=True)
+        key = A.embedding_key(toy_embeddings, None)
+        base = A.find_tau_asof(lake, cfg, toy_table, key, "5Y", 0, temp=True)
         a = pl.read_parquet(base.path / A.TAU_ASOF_FILE)
         assert a["MONTH_END"].to_list() == [date(2008, 2, 29)]   # built as of April 1
         time.sleep(1.1)                       # artifact timestamps have second precision
@@ -159,7 +174,8 @@ class TestScoreRange:
         assert rebuilt.artifact_id != base.artifact_id and "__TEMP" in rebuilt.artifact_id
         b = pl.read_parquet(rebuilt.path / A.TAU_ASOF_FILE)
         assert a.equals(b)                                      # byte-identical rows
-        assert A.find_tau_asof(lake, cfg, toy_table, "5Y", 0, temp=True).artifact_id == \
+        assert A.find_tau_asof(lake, cfg, toy_table, key, "5Y", 0,
+                               temp=True).artifact_id == \
             rebuilt.artifact_id
         assert A.build_tau_asof(lake, cfg, toy_table, toy_embeddings, today=date(2008, 4, 1),
                                 temp=True).artifact_id == rebuilt.artifact_id   # up to date
@@ -175,18 +191,21 @@ class TestScoreRange:
         A.score_range_to_datalake(lake, date(2008, 3, 1), date(2008, 3, 31), cfg,
                                   table=toy_table, P=toy_embeddings, source=src,
                                   use_kernel=False, temp=False)          # an "owner" run
-        owner = A.find_partitions(lake, cfg, toy_table, temp=False)
+        key = A.embedding_key(toy_embeddings, None)
+        owner = A.find_partitions(lake, cfg, toy_table, key, temp=False)
         assert owner is not None and "__TEMP" not in owner.artifact_id
         assert owner.meta.hyperparams["agent_created"] is False
         assert not A.is_agent_created(owner)
-        assert A.find_partitions(lake, cfg, toy_table, temp=True) is None   # separate lineage
+        assert A.find_partitions(lake, cfg, toy_table, key,
+                                 temp=True) is None                  # separate lineage
         marked = A.mark_temp_deprecated(lake, owner.artifact_id, "superseded by owner run")
         assert marked.deprecated and marked.meta.deprecation_reason.startswith(
             "superseded by owner run")
         assert A.TEMP_NOTE in marked.meta.notes and A.is_agent_created(marked)
         assert marked.artifact_id == owner.artifact_id             # ids are frozen
         assert owner.path.exists() and marked.file_hashes == owner.file_hashes  # nothing deleted
-        assert A.find_partitions(lake, cfg, toy_table, temp=False) is None   # deprecated hidden
+        assert A.find_partitions(lake, cfg, toy_table, key,
+                                 temp=False) is None                 # deprecated hidden
         assert "delete" not in A.__all__ and not hasattr(A, "delete")
 
     def test_end_before_shifted_start_scores_nothing(self, lake, toy_table, toy_embeddings, cfg,
@@ -203,11 +222,128 @@ class TestScoreRange:
                                       table=toy_table, P=toy_embeddings, use_kernel=False)
 
 
+def _meta(recipe: str) -> dict:
+    return {"identity_digest": recipe, "identity": {"backend": {"dtype": recipe}}}
+
+
+def test_embedding_recipe_decides_reuse(lake, toy_table, toy_embeddings, cfg, caplog):
+    """Partitions / tau are extended only with embeddings of the same recipe (model,
+    backend, dtype, ...). Same recipe with different bytes (a TEI cache rebuild)
+    keeps extending, with a warning and a provenance history entry; another
+    recipe opens its own artifacts."""
+    months = [(2008, m) for m in range(1, 5)]
+    s = A.score_range_to_datalake(lake, date(2008, 1, 1), date(2008, 3, 31), cfg,
+                                  table=toy_table, P=toy_embeddings,
+                                  source=_source(toy_table, toy_embeddings, months),
+                                  use_kernel=False, temp=True, primitive_meta=_meta("tei-fp16"))
+    noisy = toy_embeddings.copy()
+    noisy[0, 0] += 5e-4                                      # same recipe, rebuilt bytes
+    with caplog.at_level(logging.WARNING):
+        s2 = A.score_range_to_datalake(lake, date(2008, 4, 1), date(2008, 4, 30), cfg,
+                                       table=toy_table, P=noisy,
+                                       source=_source(toy_table, noisy, months),
+                                       use_kernel=False, temp=True,
+                                       primitive_meta=_meta("tei-fp16"))
+    assert s2["partitions_id"] == s["partitions_id"]                  # extended, not rebuilt
+    assert any("different bytes" in r.message for r in caplog.records)
+    history = json.loads((lake.get(s2["partitions_id"]).path / A.PROVENANCE_FILE)
+                         .read_text())["runs"]
+    assert [h["primitive_embeddings"]["digest"] for h in history] == [
+        A.embeddings_digest(toy_embeddings), A.embeddings_digest(noisy)]
+
+    assert A.find_partitions(lake, cfg, toy_table, "local-fp32", temp=True) is None
+    assert A.find_tau_asof(lake, cfg, toy_table, "local-fp32", temp=True) is None
+    s3 = A.score_range_to_datalake(lake, date(2008, 1, 1), date(2008, 3, 31), cfg,
+                                   table=toy_table, P=toy_embeddings,
+                                   source=_source(toy_table, toy_embeddings, months),
+                                   use_kernel=False, temp=True,
+                                   primitive_meta=_meta("local-fp32"))
+    assert s3["partitions_id"] != s["partitions_id"]
+
+
+class _Killed(Exception):
+    pass
+
+
+class _DiesOn(InMemoryHeadlineSource):
+    """An in-memory source whose read of ``kill_day`` kills the run."""
+
+    kill_day = None
+
+    def iter_day(self, day):
+        if day == self.kill_day:
+            raise _Killed(f"killed on {day}")
+        yield from super().iter_day(day)
+
+
+def _frames(art) -> dict:
+    return {p.name: pl.read_parquet(p) for p in sorted(art.path.glob("*.parquet"))}
+
+
+def test_killed_scoring_run_resumes_to_identical_outputs(tmp_path, toy_table, toy_embeddings,
+                                                         cfg):
+    """Kill a run in the middle of a month (after its partition checkpointed some closed
+    days and after earlier months were written), resume it in place: every
+    narrative_daily / day_diagnostics / partition / tau file equals an uninterrupted run."""
+    months = [(2008, m) for m in range(1, 7)]
+    kw = dict(table=toy_table, P=toy_embeddings, window="5Y", use_kernel=False, temp=True)
+
+    ref_lake = _make_lake(tmp_path / "ref")
+    ref = A.score_range_to_datalake(ref_lake, date(2008, 1, 1), date(2008, 6, 30), cfg,
+                                    source=_source(toy_table, toy_embeddings, months), **kw)
+
+    lake = _make_lake(tmp_path / "lake")
+    base = _source(toy_table, toy_embeddings, months)
+    dying = _DiesOn(base.days, chunk_size=5, source_id="toy")
+    dying.kill_day = date(2008, 5, 15)
+    with pytest.raises(_Killed):
+        A.score_range_to_datalake(lake, date(2008, 1, 1), date(2008, 6, 30), cfg,
+                                  source=dying, **kw)
+    nd_part = lake.list(A.KIND_NARRATIVE_DAILY, include_partial=True)[0]
+    assert nd_part.partial and sorted(_frames(nd_part)) == ["2008-04.parquet"]
+    rc = json.loads((nd_part.path / A.RUN_CONFIG_FILE).read_text())
+    pt_part = lake.get(rc["artifacts"]["partitions"])
+    assert pt_part.partial and (pt_part.path / "_open").exists()     # May checkpointed
+
+    s = A.score_range_to_datalake(
+        lake, date.fromisoformat(rc["start"]), date.fromisoformat(rc["end"]), cfg,
+        source=_source(toy_table, toy_embeddings, months), inputs=rc["inputs"],
+        resume=rc["artifacts"], **kw)
+    assert s["narrative_daily_id"] == nd_part.artifact_id
+    for kind_id, ref_id in ((s["narrative_daily_id"], ref["narrative_daily_id"]),
+                            (s["day_diagnostics_id"], ref["day_diagnostics_id"]),
+                            (s["partitions_id"], ref["partitions_id"]),
+                            (s["tau_asof_id"], ref["tau_asof_id"])):
+        got, want = _frames(lake.get(kind_id)), _frames(ref_lake.get(ref_id))
+        assert sorted(got) == sorted(want)
+        for name in want:
+            drop = [c for c in ("RSS_GB_BEFORE", "RSS_GB_AFTER", "SECONDS", "RSS_PEAK_GB",
+                                "CODE_VERSION")                 # run-specific, not results
+                    if c in want[name].columns]
+            assert got[name].drop(drop).equals(want[name].drop(drop)), (kind_id, name)
+    done = lake.get(s["narrative_daily_id"])
+    assert not done.partial and len(done.meta.runs) == 2
+
+
+def test_resume_scoring_refuses_runs_without_run_config(lake, tmp_path, toy_table,
+                                                        toy_embeddings, cfg):
+    with pytest.raises(_Killed):
+        dying = _DiesOn(_source(toy_table, toy_embeddings, [(2008, 3)]).days, chunk_size=5)
+        dying.kill_day = date(2008, 3, 3)
+        A.score_range_to_datalake(lake, date(2008, 3, 1), date(2008, 3, 31), cfg,
+                                  table=toy_table, P=toy_embeddings, source=dying,
+                                  use_kernel=False, temp=True)
+    nd = lake.list(A.KIND_NARRATIVE_DAILY, include_partial=True)[0]
+    (nd.path / A.RUN_CONFIG_FILE).unlink()
+    with pytest.raises(ValueError, match="cannot be resumed"):
+        A.resume_scoring(lake, nd.artifact_id, cache_dir=tmp_path)
+
+
 def test_latest_matching_and_missing(lake, toy_table, cfg):
     with pytest.raises(DatalakeError):
         A.latest_matching(lake, A.KIND_TAU_ASOF, f0_config_id="nope")
-    assert A.find_tau_asof(lake, cfg, toy_table) is None
     P = np.zeros((toy_table.n_primitives * toy_table.n_texts, EMBEDDING_DIM), np.float32)
+    assert A.find_tau_asof(lake, cfg, toy_table, A.embedding_key(P, None)) is None
     assert A.build_tau_asof(lake, cfg, toy_table, P) is None
     assert A.earliest_headline_day(lake.latest(A.KIND_HEADLINES)) == EARLIEST
 

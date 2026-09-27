@@ -9,9 +9,7 @@ import numpy as np
 import polars as pl
 import pytest
 
-from narrative_scoring.calibration import LookaheadError, resolve_mu_asof
 from narrative_scoring.config import ScoringConfig
-from narrative_scoring.corrections import Correction
 from narrative_scoring.f0 import TDigest, gaussian_tau, tail_probability
 from narrative_scoring.partitions import (
     MonthlyNullPartitionWriter,
@@ -29,6 +27,8 @@ from narrative_scoring.tau_asof import (
     window_offset,
 )
 from narrative_scoring.warmup import compute_warmup
+from nlp.corrections import Correction, LookaheadError
+from nlp.reference_vector import resolve_reference
 
 from .test_pipeline import _mu_df
 
@@ -166,7 +166,7 @@ class TestTauAsof:
         assert len(sel) == 3
         D = TDigest.merge([partition_digest(p) for p in sel])
         # warmup pinned per cutoff from the mu row available then
-        mu = resolve_mu_asof(MU_DF, date(2008, 6, 30))
+        mu = resolve_reference(MU_DF, date(2008, 6, 30))
         warm, _ = compute_warmup(toy_table, toy_embeddings, cfg, mu)
         assert r["N_EFF"] == warm.n_eff and r["MU_DATE"] == date(2008, 6, 1)
         assert r["EFFECTIVE_RANK"] == warm.effective_rank
@@ -293,7 +293,7 @@ class TestTauSeriesProvider:
 class TestWarmup:
     def test_compute(self, toy_table, toy_embeddings):
         cfg = ScoringConfig()
-        mu = resolve_mu_asof(MU_DF, date(2008, 6, 1))
+        mu = resolve_reference(MU_DF, date(2008, 6, 1))
         rec, spec = compute_warmup(toy_table, toy_embeddings, cfg, mu, mu_asof_id="mu-1")
         assert 1.0 <= rec.n_eff <= rec.effective_rank <= toy_table.n_primitives
         assert 0 < rec.lambda1_share <= 1 and rec.n_eigenvalues == toy_table.n_primitives
@@ -309,7 +309,7 @@ class TestWarmup:
         from narrative_scoring.primitives import representative_matrix
 
         cfg = ScoringConfig()
-        mu = resolve_mu_asof(MU_DF, date(2008, 6, 1))
+        mu = resolve_reference(MU_DF, date(2008, 6, 1))
         rec, _ = compute_warmup(toy_table, toy_embeddings, cfg, mu)
         D = representative_matrix(toy_embeddings, toy_table, cfg.mode, mu.mu, mu.mu_hat)
         assert rec.n_eff == pytest.approx(compute_n_eff(D), rel=1e-12)

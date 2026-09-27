@@ -25,8 +25,8 @@ import numpy as np
 import polars as pl
 
 from narrative_scoring.config import PoolRule
-from narrative_scoring.corrections import Correction, apply_mode, l2_normalise
 from narrative_scoring.schema import EMBEDDING_DIM
+from nlp.corrections import Correction, l2_normalise
 
 log = logging.getLogger(__name__)
 
@@ -269,7 +269,7 @@ def orphan_pole_candidates(table: PrimitiveTable) -> pl.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Primitive-text embeddings (local cache; never a datalake artifact)
+# Primitive-text embeddings (local cache keyed by texts + embedder identity)
 # ---------------------------------------------------------------------------
 
 def texts_digest(table: PrimitiveTable) -> str:
@@ -280,32 +280,27 @@ def embed_primitive_texts(
     table: PrimitiveTable,
     cache_dir: Path,
     *,
-    batch_size: int = 256,
-    device: str = "embedx",
-) -> np.ndarray:
-    """(n_primitives * n_texts, dim) L2-normalised primitive-text embeddings, primitive-major.
+    backend: str = "tei",
+    dtype: str = "float16",
+    embedder: Any = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """(n_primitives * n_texts, dim) unit primitive-text embeddings, primitive-major,
+    and their provenance (the cache sidecar: backend, serving metadata, checks).
 
-    Cached locally by a digest of the exact text list, so any taxonomy or
-    master-inclusion change busts the cache.
+    Embedded by an ``nlp.embedding.Embedder`` (``backend`` / ``dtype``, or a ready
+    ``embedder``) and cached by ``nlp.embedding.embed_texts_cached``, keyed by the
+    exact text list AND the embedder identity: a taxonomy change, or a change of
+    backend / dtype / served model, is a cache miss, never a silent reuse.
     """
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    path = cache_dir / f"primitive_texts__{texts_digest(table)}.npy"
-    if path.exists():
-        log.info("primitive-text embeddings: cache hit %s", path.name)
-        return np.load(path)
+    from nlp.embedding import embed_texts_cached, load_embedder
 
-    from ravenpack.headlines.embed import load_embedding_model
-
-    log.info("embedding %d primitive texts via %s ...", len(table.texts), device)
-    model = load_embedding_model(Path("."), device=device)
-    vectors = np.asarray(model.encode(table.texts, batch_size=batch_size), dtype=np.float32)
+    embedder = embedder or load_embedder(backend, dtype)
+    vectors, meta = embed_texts_cached(table.texts, embedder, Path(cache_dir),
+                                       prefix="primitive_texts")
     expected = (len(table.texts), EMBEDDING_DIM)
     if vectors.shape != expected:
-        raise ValueError(f"encode returned {vectors.shape}, expected {expected}")
-    vectors = l2_normalise(vectors)
-    np.save(path, vectors)
-    return vectors
+        raise ValueError(f"primitive embeddings have shape {vectors.shape}, expected {expected}")
+    return l2_normalise(vectors), meta
 
 
 def embeddings_digest(P: np.ndarray) -> str:
@@ -344,7 +339,7 @@ def scoring_matrix(
         raise ValueError(
             f"P has shape {P.shape}, expected {(table.n_primitives * table.n_texts, EMBEDDING_DIM)}"
         )
-    P_mode = apply_mode(to_text_major(P, table.n_texts), mode, mu, mu_hat)
+    P_mode = mode.correct(to_text_major(P, table.n_texts), (mu, mu_hat))
     if pooling is PoolRule.MEAN:
         return np.ascontiguousarray(
             P_mode.reshape(table.n_texts, table.n_primitives, EMBEDDING_DIM).mean(axis=0)
@@ -377,6 +372,6 @@ def representative_matrix(P: np.ndarray, table: PrimitiveTable, mode: Correction
 
     Used only to compute N_eff (f0.gram_spectrum) in the monthly tau job.
     """
-    P_mode = apply_mode(to_text_major(P, table.n_texts), mode, mu, mu_hat)
+    P_mode = mode.correct(to_text_major(P, table.n_texts), (mu, mu_hat))
     mean = P_mode.reshape(table.n_texts, table.n_primitives, EMBEDDING_DIM).mean(axis=0)
     return l2_normalise(mean)

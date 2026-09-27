@@ -5,9 +5,10 @@
                                                      --taxonomy Evergreen_v5
     uv run python -m narrative_scoring.jobs score    --from 2004-01-01 --to 2004-12-31 \
                                                      --split sign --sentiment-source finbert \
-                                                     --sentiment-column SENT_BAND \
+                                                     --sentiment-column SENT_SCORE \
                                                      --neutral-eps 0.3333333
     uv run python -m narrative_scoring.jobs tau-asof [--window 5Y | expanding] [--today ...]
+    uv run python -m narrative_scoring.jobs resume <partial narrative_daily artifact id>
     uv run python -m narrative_scoring.jobs mark-temp <artifact_id> [...]
 
 ``register-taxonomy`` validates {NAME}_taxonomy.authored.csv + both paraphrase JSONLs from
@@ -19,8 +20,14 @@ family is resolved by the taxonomy hash).
 
 ``--split sign`` adds pos/neg(/neu) rows from one SENT_* column of a ``headline_sentiment``
 artifact: ``--sentiment-source NAME`` (latest of that producer built on the scored headlines)
-or ``--sentiment-artifact ID`` (an exact one), plus ``--sentiment-column`` (required) and
-``--neutral-eps``. Source and column enter config_id; the artifact is cited in the lineage.
+or ``--sentiment-artifact ID`` (an exact one), plus ``--sentiment-column`` (default
+SENT_SCORE, the Sentimeter score) and ``--neutral-eps``. Source and column enter config_id;
+the artifact is cited in the lineage.
+
+Primitive texts are embedded through ``nlp`` (``--embedding-backend`` tei | local | embedx,
+``--embedding-dtype`` float16 | float32; default TEI fp16), cached locally by texts +
+embedder identity; the embedding provenance is written into every artifact of the run and
+the primitive-embedding digest is part of every lookup key.
 
 ``score`` is the one scoring path: it replays the live loop over the dates
 in order (monthly tau_asof job, then the days), enforcing the 1-month delay
@@ -44,13 +51,14 @@ from pathlib import Path
 
 from narrative_scoring.config import (
     SENTIMENT_NONE,
+    SENTIMENT_SCORE_COLUMN,
     ParaphraseStyle,
     PoolRule,
     ScoringConfig,
     SentimentSplit,
     default_pooling,
 )
-from narrative_scoring.corrections import Correction
+from nlp.corrections import Correction
 
 log = logging.getLogger("narrative_scoring.jobs")
 
@@ -70,7 +78,8 @@ def _config(args: argparse.Namespace) -> ScoringConfig:
         q=args.q, jump_cut=args.jump_cut, sentiment_split=SentimentSplit(args.split),
         neutral_eps=args.neutral_eps,
         sentiment_source=_sentiment_source_name(args),
-        sentiment_column=args.sentiment_column or "",
+        sentiment_column=args.sentiment_column or (
+            SENTIMENT_SCORE_COLUMN if args.split == "sign" else ""),
         min_month_draws=args.min_month_draws, gap_alert_threshold=args.gap_alert_threshold,
         label=args.label,
     )
@@ -116,7 +125,8 @@ def _indexes(args: argparse.Namespace):
 
 
 def _table_and_embeddings(args: argparse.Namespace, dl, upstream):
-    """The chosen registered taxonomy, its primitive table and primitive-text embeddings."""
+    """The chosen registered taxonomy, its primitive table, primitive-text embeddings
+    and their provenance (backend, serving metadata, checks)."""
     from narrative_scoring.artifacts import load_registered_table, resolve_taxonomy
     from narrative_scoring.primitives import embed_primitive_texts
 
@@ -126,7 +136,9 @@ def _table_and_embeddings(args: argparse.Namespace, dl, upstream):
     table = load_registered_table(art, args.style)
     cache = (Path(args.embedding_cache) if args.embedding_cache
              else _env("CACHE_PATH") / "narrative_scoring")
-    return art, table, embed_primitive_texts(table, cache, device=args.device)
+    P, meta = embed_primitive_texts(table, cache, backend=args.embedding_backend,
+                                    dtype=args.embedding_dtype)
+    return art, table, P, meta
 
 
 def cmd_register_taxonomy(args: argparse.Namespace) -> int:
@@ -147,7 +159,7 @@ def cmd_score(args: argparse.Namespace) -> int:
     dl, upstream = _indexes(args)
     config = _config(args)
     sentiment = _sentiment(args, config, dl, upstream)
-    tax_art, table, P = _table_and_embeddings(args, dl, upstream)
+    tax_art, table, P, p_meta = _table_and_embeddings(args, dl, upstream)
     source = headline_source(upstream, chunk_size=args.chunk_size, threads=args.threads,
                              sentiment=sentiment, sentiment_column=config.sentiment_column)
     summary = score_range_to_datalake(
@@ -155,7 +167,7 @@ def cmd_score(args: argparse.Namespace) -> int:
         table=table, P=P, upstream=upstream, source=source, window=args.window,
         seed=args.seed, threads=args.threads, rss_budget_gb=args.rss_budget_gb,
         temp=args.temp, label=args.label, taxonomy_id=tax_art.artifact_id,
-        sentiment=sentiment)
+        sentiment=sentiment, primitive_meta=p_meta)
     for k in ("start", "end", "n_days_scored", "n_days_null_only", "peak_rss_gb",
               "months_finalised", "narrative_daily_id", "day_diagnostics_id",
               "partitions_id", "tau_asof_id"):
@@ -168,12 +180,29 @@ def cmd_tau_asof(args: argparse.Namespace) -> int:
 
     dl, upstream = _indexes(args)
     config = _config(args)
-    tax_art, table, P = _table_and_embeddings(args, dl, upstream)
+    tax_art, table, P, p_meta = _table_and_embeddings(args, dl, upstream)
     art = build_tau_asof(dl, config, table, P, upstream=upstream, window=args.window,
                          seed=args.seed, rebuild=args.rebuild, temp=args.temp,
-                         taxonomy_id=tax_art.artifact_id,
+                         taxonomy_id=tax_art.artifact_id, primitive_meta=p_meta,
                          today=date.fromisoformat(args.today) if args.today else None)
     print(art.artifact_id if art else "no partition old enough yet")
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    """Everything (config, dates, taxonomy, inputs, embedder) is read from the run; the
+    primitive-embedding backend must still serve the recorded model."""
+    from narrative_scoring.artifacts import resume_scoring
+
+    dl, upstream = _indexes(args)
+    cache = (Path(args.embedding_cache) if args.embedding_cache
+             else _env("CACHE_PATH") / "narrative_scoring")
+    summary = resume_scoring(dl, args.artifact_id, upstream=upstream, cache_dir=cache,
+                             threads=args.threads, chunk_size=args.chunk_size,
+                             rss_budget_gb=args.rss_budget_gb)
+    for k in ("start", "end", "n_days_scored", "n_days_null_only", "narrative_daily_id",
+              "partitions_id", "tau_asof_id"):
+        print(f"{k}={summary[k]}")
     return 0
 
 
@@ -214,11 +243,16 @@ def main(argv: list[str] | None = None) -> int:
     common.add_argument("--sentiment-artifact", default=None,
                         help="exact headline_sentiment artifact id (overrides the source)")
     common.add_argument("--sentiment-column", default=None,
-                        help="SENT_* column of the sentiment artifact (split runs)")
+                        help="SENT_* column of the sentiment artifact (split runs; "
+                             "default SENT_SCORE)")
     common.add_argument("--min-month-draws", type=int, default=20_000_000)
     common.add_argument("--gap-alert-threshold", type=float, default=0.05)
     common.add_argument("--label", default="")
-    common.add_argument("--device", default="embedx")
+    common.add_argument("--embedding-backend", default="tei",
+                        choices=["tei", "local", "embedx"],
+                        help="engine for the primitive-text embeddings (default: tei)")
+    common.add_argument("--embedding-dtype", default="float16",
+                        help="compute dtype of the primitive-text embeddings (default: float16)")
     common.add_argument("--embedding-cache", default=None)
     common.add_argument("--threads", type=int, default=8)
     common.add_argument("--chunk-size", type=int, default=8_192)
@@ -241,6 +275,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--rebuild", action="store_true")
     p.add_argument("--today", default=None)
     p.set_defaults(fn=cmd_tau_asof)
+    p = sub.add_parser("resume", help="continue an interrupted score run from the run alone")
+    p.add_argument("artifact_id", help="the partial narrative_daily artifact of the run")
+    p.add_argument("--threads", type=int, default=8)
+    p.add_argument("--chunk-size", type=int, default=8_192)
+    p.add_argument("--rss-budget-gb", type=float, default=30.0)
+    p.add_argument("--embedding-cache", default=None)
+    p.set_defaults(fn=cmd_resume)
     p = sub.add_parser("mark-temp")
     p.add_argument("artifact_ids", nargs="+")
     p.add_argument("--reason", default="superseded by owner run")

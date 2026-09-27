@@ -17,11 +17,11 @@ from dataclasses import asdict, dataclass
 
 import numpy as np
 
-from narrative_scoring.calibration import MuRecord
 from narrative_scoring.config import ScoringConfig
-from narrative_scoring.corrections import Correction
 from narrative_scoring.f0 import Spectrum, gram_spectrum
 from narrative_scoring.primitives import PrimitiveTable, embeddings_digest, representative_matrix
+from nlp.corrections import Correction
+from nlp.reference_vector import ReferenceValue
 
 
 @dataclass(frozen=True)
@@ -48,7 +48,7 @@ class WarmupRecord:
 
 
 def compute_warmup(
-    table: PrimitiveTable, P: np.ndarray, config: ScoringConfig, mu: MuRecord | None, *,
+    table: PrimitiveTable, P: np.ndarray, config: ScoringConfig, mu: ReferenceValue | None, *,
     mu_asof_id: str | None = None,
 ) -> tuple[WarmupRecord, Spectrum]:
     """Spectrum of the corrected primitive Gram matrix under ``mu`` (None only for RAW)."""

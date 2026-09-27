@@ -97,11 +97,12 @@ class FixedTauProvider:
     tau_policy = "test-fixed"
 
     def __init__(self, tau, mu_df=None, mu_asof_id=None, freeze_mu_at=None):
-        from narrative_scoring.calibration import LookaheadError, resolve_mu_asof
+        from nlp.corrections import LookaheadError
+        from nlp.reference_vector import resolve_reference
 
         self.tau, self.mu_df, self.mu_asof_id = tau, mu_df, mu_asof_id
-        self._resolve, self._lookahead = resolve_mu_asof, LookaheadError
-        self._frozen = (resolve_mu_asof(mu_df, freeze_mu_at)
+        self._resolve, self._lookahead = resolve_reference, LookaheadError
+        self._frozen = (resolve_reference(mu_df, freeze_mu_at)
                         if freeze_mu_at and mu_df is not None else None)
         self.freeze_mu_at = freeze_mu_at
 

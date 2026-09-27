@@ -39,7 +39,7 @@ nothing else happens.
 
 Reader: ``TauSeriesProvider.tau_for(day)`` returns the latest row with
 MONTH_END strictly before ``day``, else ``LookaheadError`` -- the same
-guarantee as ``resolve_mu_asof``.
+guarantee as ``resolve_reference``.
 """
 from __future__ import annotations
 
@@ -52,14 +52,15 @@ import numpy as np
 import pandas as pd
 import polars as pl
 
-from narrative_scoring.calibration import LookaheadError, MuRecord, TauRecord, resolve_mu_asof
+from narrative_scoring.calibration import LookaheadError, TauRecord
 from narrative_scoring.config import ScoringConfig
-from narrative_scoring.corrections import Correction
 from narrative_scoring.f0 import TDigest, Welford, gaussian_tau, tail_probability
 from narrative_scoring.partitions import month_end, partition_digest, partition_welford
 from narrative_scoring.primitives import PrimitiveTable
 from narrative_scoring.schema import TAU_ASOF_SCHEMA
 from narrative_scoring.warmup import compute_warmup
+from nlp.corrections import Correction
+from nlp.reference_vector import ReferenceValue, resolve_reference
 
 log = logging.getLogger(__name__)
 
@@ -139,9 +140,9 @@ def build_tau_rows(
     rows = []
     for cutoff in sorted(set(cutoffs)):
         # -- warmup at this cutoff: the mu row available as of the cutoff ---------
-        mu: MuRecord | None = None
+        mu: ReferenceValue | None = None
         if config.mode is not Correction.RAW:
-            mu = resolve_mu_asof(mu_df, cutoff)
+            mu = resolve_reference(mu_df, cutoff)
         warm, _ = compute_warmup(table, P, config, mu, mu_asof_id=mu_asof_id)
         p_tail = tail_probability(config.alpha, warm.n_eff)
 
@@ -225,19 +226,19 @@ class TauSeriesProvider:
 
     def __post_init__(self) -> None:
         self.tau_df = self.tau_df.sort("MONTH_END")
-        self._mu_cache: dict[date, MuRecord] = {}
+        self._mu_cache: dict[date, ReferenceValue] = {}
         self._tau_cache: dict[date, TauRecord] = {}
 
     @property
     def mu_policy(self) -> str:
         return "none" if self.mu_df is None else "as_of_day"
 
-    def mu_for(self, day: date) -> MuRecord | None:
+    def mu_for(self, day: date) -> ReferenceValue | None:
         if self.mu_df is None:
             return None
         rec = self._mu_cache.get(day)
         if rec is None:
-            rec = resolve_mu_asof(self.mu_df, day)
+            rec = resolve_reference(self.mu_df, day)
             self._mu_cache[day] = rec
         return rec
 

@@ -64,7 +64,7 @@ def main() -> int:
             extra_link_args=link,
             define_macros=[("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")],
         )
-        for stem in ("select_aggregate", "fused_gate")
+        for stem in ("select_aggregate",)
     ]
     sys.argv = [sys.argv[0], "build_ext", "--inplace"]
     setup(

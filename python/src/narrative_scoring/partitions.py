@@ -291,3 +291,48 @@ def months_between(start: date, end: date) -> list[tuple[int, int]]:
 def month_range_days(y: int, m: int) -> list[date]:
     first = date(y, m, 1)
     return [first + timedelta(days=i) for i in range(month_days(y, m))]
+
+
+class SkipClosedDays:
+    """Null sink for a RESUMED run: never feeds a day twice.
+
+    The partition writer checkpoints its open month at every closed day (draw
+    summaries, closed days, RNG state) and reloads it on start. A resumed run
+    re-scores the unfinished month for narrative_daily; its days already closed
+    in the checkpoint -- or in an already final partition -- get a scratch RNG and
+    their draws are dropped (draws only feed partitions, never the day's scores).
+    The remaining days continue the saved RNG stream, so the partition equals the
+    one an uninterrupted run would have written.
+    """
+
+    def __init__(self, writer: MonthlyNullPartitionWriter) -> None:
+        self.writer = writer
+        self._scratch = np.random.default_rng(0)
+
+    def _closed(self, day: date) -> bool:
+        key = (day.year, day.month)
+        if (self.writer.out_dir / partition_file(*key)).exists():
+            return True
+        st = self.writer.states.get(key)
+        return st is not None and day in st.days_covered
+
+    def rng_for(self, day: date) -> np.random.Generator:
+        return self._scratch if self._closed(day) else self.writer.rng_for(day)
+
+    def add_draws(self, day: date, draws: np.ndarray, n_available: int, n_headlines: int) -> None:
+        if not self._closed(day):
+            self.writer.add_draws(day, draws, n_available, n_headlines)
+
+    def close_day(self, day: date, rss_gb: float) -> None:
+        if not self._closed(day):
+            self.writer.close_day(day, rss_gb)
+
+    def finalise_before(self, day: date) -> list[Path]:
+        return self.writer.finalise_before(day)
+
+    def flush_open(self) -> None:
+        self.writer.flush_open()
+
+    @property
+    def finalised(self) -> list[Path]:
+        return self.writer.finalised
