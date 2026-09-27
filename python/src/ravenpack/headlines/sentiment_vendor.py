@@ -135,7 +135,10 @@ def producer(raw_dir: Path, block_bytes: int = BLOCK_BYTES) -> MonthProducer:
 
     The partition key (``2008-01``, ``2008-01-15``, ``2008-W03``, ``2008Q1``...)
     gives the period; the scores come from every raw month CSV it spans (the
-    caller aligns them to the partition's own stories). The last two raw
+    caller aligns them to the partition's own stories). A D / W partition holds
+    part of a raw month, so its scores are first restricted to its own stories;
+    M / Q / Y hold whole months, where a raw story missing from the partition
+    still raises in the alignment. The last two raw
     months' scores are cached, so daily or weekly partitions read each raw
     month once.
     """
@@ -154,7 +157,11 @@ def producer(raw_dir: Path, block_bytes: int = BLOCK_BYTES) -> MonthProducer:
         period = parse_key(headlines_partition.stem)
         months = [(m.first.year, m.first.month) for m in periods(period.first, period.last, "M")]
         frames = [month_scores(y, m, tag) for y, m in months]
-        return frames[0] if len(frames) == 1 else pl.concat(frames)
+        scores = frames[0] if len(frames) == 1 else pl.concat(frames)
+        if period.freq in ("D", "W"):       # narrower than its raw months: its own stories
+            ids = pl.read_parquet(headlines_partition, columns=[ID_COL])
+            scores = scores.join(ids, on=ID_COL, how="semi")
+        return scores
     return produce
 
 

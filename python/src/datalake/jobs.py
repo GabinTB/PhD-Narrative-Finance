@@ -261,10 +261,10 @@ class JobState:
     unit_seconds: dict[str, float] = field(default_factory=dict)
 
     def write(self, out_dir: Path) -> None:
-        self.updated_at = utc_now_iso()
-        tmp = Path(out_dir) / (STATE_FILE + ".tmp")
-        tmp.write_text(json.dumps(asdict(self), indent=2, sort_keys=True, default=str))
-        tmp.replace(Path(out_dir) / STATE_FILE)
+        """Written by the job's own thread only (the heartbeat lives in ``job.lock``)."""
+        self.updated_at = self.heartbeat_at = utc_now_iso()
+        _write_atomic(Path(out_dir) / STATE_FILE,
+                      json.dumps(asdict(self), indent=2, sort_keys=True, default=str))
 
     @classmethod
     def read(cls, out_dir: Path) -> JobState | None:
@@ -280,14 +280,23 @@ def _age_s(iso: str) -> float:
     return (datetime.now(timezone.utc) - datetime.fromisoformat(iso)).total_seconds()
 
 
+def _write_atomic(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` via a writer-unique temp file and an atomic rename."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_text(text)
+        tmp.replace(path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 class JobLock:
     """``job.lock`` holder with a heartbeat thread (see module docstring for limits)."""
 
-    def __init__(self, out_dir: Path, *, heartbeat_s: float, stale_after_s: float,
-                 on_beat: Any = None) -> None:
+    def __init__(self, out_dir: Path, *, heartbeat_s: float, stale_after_s: float) -> None:
         self.path = Path(out_dir) / LOCK_FILE
         self.heartbeat_s, self.stale_after_s = heartbeat_s, stale_after_s
-        self.on_beat = on_beat
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -309,7 +318,7 @@ class JobLock:
                                 f"pid {held.get('pid')} (heartbeat {age:.0f}s ago)") from None
             log.warning("taking over a stale lock on %s (holder %s pid %s, heartbeat %.0fs ago)",
                         self.path.parent.name, held.get("host"), held.get("pid"), age)
-            self.path.write_text(self._payload())
+            _write_atomic(self.path, self._payload())
         else:
             with os.fdopen(fd, "w") as fh:
                 fh.write(self._payload())
@@ -319,9 +328,7 @@ class JobLock:
     def _beat(self) -> None:
         while not self._stop.wait(self.heartbeat_s):
             try:
-                self.path.write_text(self._payload())
-                if self.on_beat is not None:
-                    self.on_beat()
+                _write_atomic(self.path, self._payload())    # a reader never sees half a lock
             except OSError as exc:            # the mount hiccuped; the next beat retries
                 log.warning("heartbeat write failed: %s", exc)
 
@@ -527,8 +534,7 @@ class JobRunner:
         adapter = _UnitAdapter(logging.getLogger(f"job.{job.kind}"),
                                {"kind": job.kind, "artifact": run.artifact_id,
                                 "host": state.host, "unit": "-"})
-        lock = JobLock(out_dir, heartbeat_s=self.heartbeat_s, stale_after_s=self.stale_after_s,
-                       on_beat=lambda: self._beat(state, out_dir))
+        lock = JobLock(out_dir, heartbeat_s=self.heartbeat_s, stale_after_s=self.stale_after_s)
         lock.acquire()
         try:
             ctx = JobContext(run, self.index, adapter)
@@ -589,10 +595,6 @@ class JobRunner:
                 root.removeHandler(handler)
                 handler.close()
                 root.setLevel(previous_level)
-
-    def _beat(self, state: JobState, out_dir: Path) -> None:
-        state.heartbeat_at = utc_now_iso()
-        state.write(out_dir)
 
     def _log_handler(self, out_dir: Path) -> logging.Handler | None:
         if not self.log_file:
