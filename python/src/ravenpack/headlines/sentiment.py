@@ -217,11 +217,10 @@ def resume_partial(index: DatalakeIndex, artifact_id: str, produce: MonthProduce
     """Finish a partial ``headline_sentiment`` artifact in place, then mark it complete.
 
     Parameters come from the artifact's own hyperparams (headlines id, years,
-    columns), so a resume cannot silently change what the artifact means.
+    columns), so a resume cannot silently change what the artifact means; the
+    datalake refuses any other hyperparams (``DatalakeIndex.run(resume=...)``).
+    Months already written are skipped.
     """
-    from datalake.artifact import utc_now_iso
-    from datalake.meta import git_commit, hash_directory, write_sidecars
-
     art = index.get(artifact_id)
     if art.kind != KIND:
         raise ValueError(f"{artifact_id} is a {art.kind}, not a {KIND}")
@@ -230,19 +229,15 @@ def resume_partial(index: DatalakeIndex, artifact_id: str, produce: MonthProduce
     hp = art.meta.hyperparams
     headlines = index.get(hp["headlines_id"])
     columns = hp["columns"].split(",")
-    n = fill_months(produce, headlines.path, art.path,
-                    month_names(hp["start_year"], hp["end_year"]), columns)
-    file_hashes = hash_directory(art.path, pattern="*.parquet")
-    if not file_hashes:
-        raise RuntimeError(f"still no output in {art.path} after resume")
-    record = art.meta.runs[-1]
-    record.partial = False
-    record.run_end = utc_now_iso()
-    record.pipeline_commit = git_commit(repo_dir)
-    record.produced = sorted(file_hashes)
-    record.notes = f"{record.notes} resumed: {n} month(s) written".strip()
-    write_sidecars(art.path, art.meta, file_hashes)
-    index._upsert(art.meta, art.layer, art.path, file_hashes)   # same as embed_headlines.py
+    with index.run(kind=KIND, pipeline=art.meta.pipeline,
+                   pipeline_version=art.meta.pipeline_version,
+                   pipeline_repo=art.meta.pipeline_repo, hyperparams=hp, repo_dir=repo_dir,
+                   verifier=KIND, hash_pattern="*.parquet", resume=artifact_id) as run:
+        n = fill_months(produce, headlines.path, run.out_dir,
+                        month_names(hp["start_year"], hp["end_year"]), columns)
+        if not any(run.out_dir.glob("*.parquet")):
+            raise RuntimeError(f"still no output in {run.out_dir} after resume")
+        run.note(f"{n} month(s) written")
     return index.get(artifact_id)
 
 

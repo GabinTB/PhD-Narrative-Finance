@@ -95,8 +95,9 @@ def main() -> int:
             raw_dir = Path(raw_data_path) / "RavenPack" / "headlines_edge_v1.0"
 
     with DatalakeIndex(root) as index:
-        if args.resume:
-            artifact = _resume(index, args.resume, raw_dir, args.raw_chunk_rows, args.log_every)
+        resume_id = args.resume or (args.artifact_id if args.command == "resume" else None)
+        if resume_id:
+            artifact = _resume(index, resume_id, raw_dir, args.raw_chunk_rows, args.log_every)
         elif args.start_year and args.end_year:
             if raw_dir is None or not raw_dir.is_dir():
                 log.error("raw directory does not exist: %s", raw_dir)
@@ -136,8 +137,6 @@ def _fresh(index, raw_dir, start_year, end_year, pipeline_version, raw_chunk_row
 
 def _resume(index, artifact_id, raw_dir_override, raw_chunk_rows, log_every):
     """Resume a partial run, inferring all params from the artifact metadata."""
-    from datalake.artifact import utc_now_iso
-    from datalake.meta import META_FILENAME, README_FILENAME, git_commit, hash_file, write_sidecars
     from ravenpack.headlines.ingest import ingest_range
 
     try:
@@ -180,76 +179,30 @@ def _resume(index, artifact_id, raw_dir_override, raw_chunk_rows, log_every):
         log.error("raw directory does not exist: %s", raw_dir)
         return None
 
-    out_dir = artifact.path
-    already_done = len(list(out_dir.glob("*.parquet")))
+    from ravenpack.headlines.ingest import KIND
+
     expected_months = (end_year - start_year + 1) * 12
-    remaining = expected_months - already_done
-
-    log.info(
-        "resuming %s | start_year=%d end_year=%d | %d/%d months done, %d remaining",
-        artifact_id, start_year, end_year, already_done, expected_months, remaining,
-    )
-
-    ingest_range(
-        raw_dir=raw_dir,
-        out_dir=out_dir,
-        start_year=start_year,
-        end_year=end_year,
-        raw_chunk_rows=raw_chunk_rows,
-        log_every=log_every,
-        overwrite=False,
-    )
-
-    n_months = len(list(out_dir.glob("*.parquet")))
-    if n_months == 0:
-        log.error("still no output after resume -- check raw_dir and year range")
-        return None
-
-    if n_months < expected_months:
-        log.warning(
-            "%d/%d months present -- some months may be missing from raw zips",
-            n_months, expected_months,
-        )
-
-    # Hash with progress -- this runs over GDrive FUSE and takes several minutes.
-    _EXCLUDE = frozenset({META_FILENAME, README_FILENAME})
-    parquet_files = sorted(
-        p for p in out_dir.iterdir()
-        if p.is_file() and p.name.endswith(".parquet") and p.name not in _EXCLUDE
-    )
-    log.info(
-        "hashing %d files -- this may take several minutes over a network mount",
-        len(parquet_files),
-    )
-    file_hashes: dict = {}
-    for i, path in enumerate(parquet_files, 1):
-        digest, size = hash_file(path)
-        file_hashes[path.name] = {"algorithm": "blake2b", "digest": digest, "size_bytes": size}
-        if i % 20 == 0 or i == len(parquet_files):
-            log.info("  hashed %d/%d files", i, len(parquet_files))
-
-    # Update the last RunRecord directly -- partial, run_end, pipeline_commit
-    # are fields on RunRecord, not on RunMeta (which exposes them as computed
-    # properties).  Setting them on RunMeta would be silently ignored.
-    last_record = artifact.meta.runs[-1]
-    last_record.partial = False
-    last_record.run_end = utc_now_iso()
-    last_record.pipeline_commit = git_commit()
-    last_record.produced = sorted(file_hashes.keys())
-    last_record.notes = (
-        (last_record.notes + " " if last_record.notes else "")
-        + f"Resumed after interruption. {n_months}/{expected_months} monthly files."
-    ).strip()
-
-    write_sidecars(out_dir, artifact.meta, file_hashes)
-    index._upsert(artifact.meta, artifact.layer, out_dir, file_hashes)
-
-    log.info(
-        "resume complete: %s (%d/%d files)",
-        artifact.artifact_id, n_months, expected_months,
-    )
-    return index.get(artifact.artifact_id)
-
+    log.info("resuming %s | start_year=%d end_year=%d | %d/%d months done",
+             artifact_id, start_year, end_year,
+             len(list(artifact.path.glob("*.parquet"))), expected_months)
+    # The datalake reopens the partial artifact only with its own hyperparams and
+    # completes it in place (a new execution record; the crashed one is kept).
+    with index.run(kind=KIND, pipeline=artifact.meta.pipeline,
+                   pipeline_version=artifact.meta.pipeline_version,
+                   pipeline_repo=artifact.meta.pipeline_repo, hyperparams=recorded,
+                   verifier=artifact.meta.verifier, hash_pattern="*.parquet",
+                   resume=artifact_id) as run:
+        ingest_range(raw_dir=raw_dir, out_dir=run.out_dir, start_year=start_year,
+                     end_year=end_year, raw_chunk_rows=raw_chunk_rows, log_every=log_every,
+                     overwrite=False)
+        n_months = len(list(run.out_dir.glob("*.parquet")))
+        if n_months == 0:
+            raise RuntimeError("still no output after resume -- check raw_dir and year range")
+        if n_months < expected_months:
+            log.warning("%d/%d months present -- some months may be missing from raw zips",
+                        n_months, expected_months)
+        run.note(f"Resumed after interruption. {n_months}/{expected_months} monthly files.")
+    return index.get(artifact_id)
 
 if __name__ == "__main__":
     sys.exit(main())

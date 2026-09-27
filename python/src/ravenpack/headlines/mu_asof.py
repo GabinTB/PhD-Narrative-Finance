@@ -1,20 +1,23 @@
-"""Asof pooled-mean headline embedding pipeline (mu_asof).
+"""RavenPack corpus job for the dated reference vector (datalake kind ``mu_asof``).
 
-Computes, for each observed calendar day t, the pooled mean embedding vector
-over headlines strictly before the cutoff date ``t - delay`` -- expanding
-(all history) or rolling (a fixed-length window) -- plus its unit direction.
+The reference vector itself -- pooling (mean / min / max), delay, window and
+the point-in-time rule -- is ``nlp.reference_vector.ReferenceVector``. This
+module is the RavenPack I/O around it: per-day aggregates of the headline
+embeddings computed in DuckDB one month at a time, then
+``ReferenceVector.from_daily(...).series(days)`` for every observed day.
 
-mu_asof(t) never uses data from [t - delay, t]: mean-centering or direction-
-removing downstream cosine scores against mu_asof(t) keeps the pipeline
-stateless-windowed and look-ahead-free.
+For each observed day t the value pools the headlines of the days in
+``(cutoff - window, cutoff]``, ``cutoff = t - delay`` (delay >= 1 day, so
+day t itself is never used; see ``nlp.reference_vector``).
 
 Output layout: one parquet per artifact (a daily time series, not a monthly
-corpus), named ``mu_asof_delay-{delay}_mode-{mode}.parquet``, with columns
-(``schema.MU_ASOF_SCHEMA``):
+corpus), named ``mu_asof_delay-{delay}_mode-{mode}[_pooling-{pooling}].parquet``
+(the pooling suffix only for min / max), with columns
+(``nlp.reference_vector.REFERENCE_SCHEMA``):
 
     DATE      Date
-    MU        Array(Float32, 384)   -- raw pooled mean vector (not normalized)
-    MU_HAT    Array(Float32, 384)   -- unit mean direction: MU / ||MU||
+    MU        Array(Float32, 384)   -- raw pooled vector (mean / min / max; not normalized)
+    MU_HAT    Array(Float32, 384)   -- unit direction: MU / ||MU||
     N         Int64                 -- headlines contributing to this day
 
 MU is what mean-centering (subtract mu, renormalize) needs; MU_HAT is what
@@ -29,16 +32,18 @@ Two-pass design, adapted from the lab repo's ``mu_asof.py``:
      file (identically named ``YYYY-MM.parquet`` in both artifacts) to get
      each headline's day. UNNEST + generate_subscripts explodes each
      embedding into (day, pos, val) rows, then a hash aggregation over
-     (day, pos) gives that month's per-day, per-dimension sums and counts in
-     one shot. Joining month-by-month rather than the full corpus at once is
-     deliberate: a single cross-corpus join (312 x 312 files) was tried
+     (day, pos) gives that month's per-day, per-dimension SUM (mean pooling)
+     or MIN / MAX, and counts, in one shot. Joining month-by-month rather
+     than the full corpus at once is deliberate: a single cross-corpus join
+     (312 x 312 files) was tried
      first and spilled past 100GB of DuckDB temp storage over GDrive FUSE.
      A calendar day never spans two monthly files, so restricting each join
      to one month is exact, not an approximation -- and keeps each join
      trivially small.
-  2. Cumulative sums over a complete daily calendar grid (missing days
-     zero-filled), then an O(n_days) asof lookup per day. Everything here
-     operates on a (n_days, 384) array -- trivial memory/compute.
+  2. ``ReferenceVector.from_daily``: prefix sums (mean) or a sparse table
+     (rolling min / max) over the complete daily grid, then one vectorised
+     query for every asof date. Everything here operates on a (n_days, 384)
+     array -- trivial memory/compute.
 
 A fresh ``duckdb.connect()`` is used per month rather than the module-level
 ``duckdb.sql()`` or one shared connection: a shared connection accumulates
@@ -46,9 +51,7 @@ state across calls and was the source of an OOM bug in an earlier pipeline.
 """
 from __future__ import annotations
 
-import argparse
 import logging
-import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -59,7 +62,15 @@ import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from ravenpack.headlines.schema import EMBEDDING_DIM, MU_ASOF_SCHEMA
+from nlp.reference_vector import (
+    POOLINGS,
+    REFERENCE_SCHEMA,
+    ReferenceVector,
+    parse_delay,
+    parse_window,
+    validate_window_after_delay,
+)
+from ravenpack.headlines.schema import EMBEDDING_DIM
 
 if TYPE_CHECKING:
     from datalake import Artifact, DatalakeIndex
@@ -81,11 +92,9 @@ _MAX_DATE_GAP_DAYS = 5
 # Float32 tolerance for the unit-norm check on MU_HAT.
 _UNIT_NORM_TOL = 1e-5
 
-_PERIOD_RE = re.compile(r"^(\d+)([dWM])$")
-
 
 # ---------------------------------------------------------------------------
-# Arrow schema for the ParquetWriter -- derived from MU_ASOF_SCHEMA so the
+# Arrow schema for the ParquetWriter -- derived from REFERENCE_SCHEMA so the
 # written table and the writer schema are guaranteed to agree.
 # ---------------------------------------------------------------------------
 
@@ -95,89 +104,29 @@ _ARROW_SCHEMA: pa.Schema | None = None
 def _arrow_schema() -> pa.Schema:
     global _ARROW_SCHEMA
     if _ARROW_SCHEMA is None:
-        _ARROW_SCHEMA = pl.DataFrame(schema=MU_ASOF_SCHEMA).to_arrow().schema
+        _ARROW_SCHEMA = pl.DataFrame(schema=REFERENCE_SCHEMA).to_arrow().schema
     return _ARROW_SCHEMA
 
 
 # ---------------------------------------------------------------------------
-# Period parsing -- ported exactly from the lab repo's mu_asof.py
+# Pass 1: per-calendar-day aggregate vector and count, one month at a time, in SQL
 # ---------------------------------------------------------------------------
 
-def parse_period(spec: str, allowed_units: str) -> tuple[int, str]:
-    m = _PERIOD_RE.match(spec)
-    if not m or int(m.group(1)) <= 0:
-        raise argparse.ArgumentTypeError(
-            f"invalid period '{spec}', expected e.g. '5d', '2W', '3M' (n > 0)"
-        )
-    n, unit = int(m.group(1)), m.group(2)
-    if unit not in allowed_units:
-        raise argparse.ArgumentTypeError(
-            f"period '{spec}' uses unit '{unit}', allowed units here are {list(allowed_units)}"
-        )
-    return n, unit
+_SQL_AGG = {"mean": "SUM(val)::DOUBLE", "min": "MIN(val)::DOUBLE", "max": "MAX(val)::DOUBLE"}
 
 
-def offset_of(n: int, unit: str) -> pd.DateOffset:
-    return {
-        "d": pd.DateOffset(days=n),
-        "W": pd.DateOffset(weeks=n),
-        "M": pd.DateOffset(months=n),
-    }[unit]
+def _merge_day(pooling: str, cur: np.ndarray, new: np.ndarray) -> np.ndarray:
+    if pooling == "mean":
+        return cur + new
+    return np.minimum(cur, new) if pooling == "min" else np.maximum(cur, new)
 
 
-def parse_delay(spec: str) -> pd.DateOffset:
-    """Minimum granularity is 1 day: 'Xd', 'XW', 'XM' all allowed."""
-    n, unit = parse_period(spec, allowed_units="dWM")
-    return offset_of(n, unit)
-
-
-def parse_mode(spec: str) -> str | pd.DateOffset:
-    """'expanding', or a rolling window >= 1 week: 'XW', 'XM' (no days)."""
-    if spec == "expanding":
-        return "expanding"
-    n, unit = parse_period(spec, allowed_units="WM")
-    return offset_of(n, unit)
-
-
-def _offset_days(offset: pd.DateOffset, anchor: pd.Timestamp) -> int:
-    """Calendar-day length of a DateOffset, anchored at a fixed reference date.
-
-    Exact for day/week offsets; month offsets are measured by their actual
-    calendar length from the anchor, matching how offsets are applied
-    elsewhere in this module (``t - delay``, ``cutoff - window``).
-    """
-    return (anchor - (anchor - offset)).days
-
-
-def validate_window_after_delay(delay: pd.DateOffset, mode: str | pd.DateOffset) -> None:
-    """Raise if a rolling window would not fully clear the delay period.
-
-    mu_asof(t) is defined as data strictly before ``t - delay``, over the
-    last ``window`` of history. If the window is not longer than the delay,
-    the window's start would fall inside [t - delay, t) -- i.e. the estimate
-    would include data the delay was meant to exclude. No-op for expanding
-    mode, which has no window to compare.
-    """
-    if mode == "expanding":
-        return
-    anchor = pd.Timestamp("2000-01-01")
-    delay_days = _offset_days(delay, anchor)
-    window_days = _offset_days(mode, anchor)
-    if window_days <= delay_days:
-        raise ValueError(
-            f"rolling window ({window_days}d) must be longer than the delay "
-            f"({delay_days}d); a window this short would look inside the delay period"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Pass 1: per-calendar-day sum vector and count, one month at a time, in SQL
-# ---------------------------------------------------------------------------
-
-def compute_daily_sums(
+def compute_daily_stats(
     headlines_dir: Path,
     embeddings_dir: Path,
+    pooling: str = "mean",
     threads: int = 8,
+    checkpoint_dir: Path | None = None,
 ) -> tuple[pd.DatetimeIndex, np.ndarray, np.ndarray]:
     """Per-month DuckDB join + aggregate, accumulated across months in Python.
 
@@ -192,10 +141,10 @@ def compute_daily_sums(
 
     A day never spans two monthly files, so restricting the join to
     same-month files is exact (not an approximation): the per-day
-    (sum_vector, count) pairs from each month are simply merged into a
-    running Python dict keyed by day. This deliberately avoids a single
-    cross-corpus join (all headlines x all embeddings at once), which spills
-    to disk past available memory once the corpus spans decades.
+    (aggregate, count) pairs from each month are merged into a running Python
+    dict keyed by day. This deliberately avoids a single cross-corpus join
+    (all headlines x all embeddings at once), which spills to disk past
+    available memory once the corpus spans decades.
 
     MAX(n_vals) doubles as the per-day headline count: every headline
     contributes exactly one value at each position, so it's free, no second
@@ -207,22 +156,35 @@ def compute_daily_sums(
         embeddings_dir: Directory of the headline_embeddings artifact
                         (RP_STORY_ID, EMBEDDING), one parquet per month with
                         the same file names as headlines_dir.
+        pooling:        "mean" (per-day SUM), "min" or "max" (per-day
+                        elementwise MIN / MAX).
         threads:        DuckDB PRAGMA threads, applied to each month's
                         (fresh) connection.
+        checkpoint_dir: When given, each month's per-day aggregates are saved
+                        there (``YYYY-MM.npz``, atomically) as soon as its query
+                        finishes, and months already saved are loaded instead
+                        of queried -- an interrupted pass resumes where it stopped.
 
     Returns:
-        (days, sum_matrix, count_vector): days is the sorted index of
-        calendar days with at least one headline; sum_matrix has shape
-        (len(days), 384) in float64; count_vector has shape (len(days),).
+        (days, stat_matrix, count_vector): days is the sorted index of
+        calendar days with at least one headline; stat_matrix has shape
+        (len(days), 384) in float64 (sums, mins or maxs); count_vector has
+        shape (len(days),).
     """
+    if pooling not in POOLINGS:
+        raise ValueError(f"pooling must be one of {POOLINGS}, got {pooling!r}")
     headlines_dir = Path(headlines_dir)
     embeddings_dir = Path(embeddings_dir)
     embedding_files = sorted(embeddings_dir.glob("*.parquet"))
     if not embedding_files:
         raise RuntimeError(f"no embedding parquet files found under {embeddings_dir}")
 
-    day_sum: dict[Any, np.ndarray] = {}
+    day_stat: dict[Any, np.ndarray] = {}
     day_cnt: dict[Any, int] = {}
+
+    if checkpoint_dir is not None:
+        Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    n_reused = 0
 
     for i, emb_file in enumerate(embedding_files, 1):
         hl_file = headlines_dir / emb_file.name
@@ -230,201 +192,121 @@ def compute_daily_sums(
             log.warning("no headlines file matching %s, skipping", emb_file.name)
             continue
 
-        conn = duckdb.connect()
-        try:
-            conn.execute(f"PRAGMA threads={threads}")
-            result = conn.sql(f"""
-                WITH joined AS (
-                    SELECT
-                        CAST(h.TIMESTAMP_UTC AS DATE) AS day,
-                        e.EMBEDDING
-                    FROM read_parquet('{hl_file}') h
-                    JOIN read_parquet('{emb_file}') e
-                      ON h.RP_STORY_ID = e.RP_STORY_ID
-                ),
-                exploded AS (
-                    SELECT
-                        day,
-                        UNNEST(EMBEDDING)                  AS val,
-                        generate_subscripts(EMBEDDING, 1)  AS pos
-                    FROM joined
-                ),
-                per_pos AS (
-                    SELECT day, pos, SUM(val)::DOUBLE AS s, COUNT(*) AS n_vals
-                    FROM exploded
-                    GROUP BY day, pos
-                )
-                SELECT
-                    day,
-                    array_agg(s ORDER BY pos) AS day_sum,
-                    MAX(n_vals)                AS n
-                FROM per_pos
-                GROUP BY day
-                ORDER BY day
-            """).pl()
-        finally:
-            conn.close()
-
-        for row in result.iter_rows(named=True):
-            d = row["day"]
-            v = np.asarray(row["day_sum"], dtype=np.float64)
-            if d in day_sum:
-                # A day should never actually span two monthly files, but
-                # merge rather than overwrite in case it ever does.
-                day_sum[d] += v
-                day_cnt[d] += row["n"]
-            else:
-                day_sum[d] = v
-                day_cnt[d] = row["n"]
+        ckpt = (Path(checkpoint_dir) / f"{emb_file.stem}.npz") if checkpoint_dir else None
+        if ckpt is not None and ckpt.exists():
+            saved = np.load(ckpt)
+            result = pl.DataFrame({"day": saved["day"].astype("datetime64[D]"),
+                                   "day_stat": list(saved["stat"]), "n": saved["n"]})
+            n_reused += 1
+        else:
+            result = _month_stats(hl_file, emb_file, pooling, threads)
+            if ckpt is not None:
+                tmp = ckpt.with_suffix(".tmp.npz")
+                np.savez(tmp, day=result["day"].to_numpy().astype("datetime64[D]"),
+                         stat=np.asarray(result["day_stat"].to_list(), dtype=np.float64)
+                         .reshape(result.height, -1),
+                         n=result["n"].to_numpy())
+                tmp.replace(ckpt)
+        _accumulate(pooling, result, day_stat, day_cnt)
 
         if i % 20 == 0 or i == len(embedding_files):
             log.info(
                 "  joined %d/%d months (%s) -> %d calendar days so far",
-                i, len(embedding_files), emb_file.name, len(day_sum),
+                i, len(embedding_files), emb_file.name, len(day_stat),
             )
+    if n_reused:
+        log.info("  %d month(s) reused from checkpoints", n_reused)
+    return _finish_daily(day_stat, day_cnt, headlines_dir, embeddings_dir)
 
-    if not day_sum:
+
+def _month_stats(hl_file: Path, emb_file: Path, pooling: str, threads: int) -> pl.DataFrame:
+    """One month's per-day aggregate (day, day_stat, n) via a fresh DuckDB connection."""
+    conn = duckdb.connect()
+    try:
+        conn.execute(f"PRAGMA threads={threads}")
+        result = conn.sql(f"""
+            WITH joined AS (
+                SELECT
+                    CAST(h.TIMESTAMP_UTC AS DATE) AS day,
+                    e.EMBEDDING
+                FROM read_parquet('{hl_file}') h
+                JOIN read_parquet('{emb_file}') e
+                  ON h.RP_STORY_ID = e.RP_STORY_ID
+            ),
+            exploded AS (
+                SELECT
+                    day,
+                    UNNEST(EMBEDDING)                  AS val,
+                    generate_subscripts(EMBEDDING, 1)  AS pos
+                FROM joined
+            ),
+            per_pos AS (
+                SELECT day, pos, {_SQL_AGG[pooling]} AS s, COUNT(*) AS n_vals
+                FROM exploded
+                GROUP BY day, pos
+            )
+            SELECT
+                day,
+                array_agg(s ORDER BY pos) AS day_stat,
+                MAX(n_vals)                AS n
+            FROM per_pos
+            GROUP BY day
+            ORDER BY day
+        """).pl()
+    finally:
+        conn.close()
+    return result
+
+
+def _accumulate(pooling: str, result: pl.DataFrame, day_stat: dict[Any, np.ndarray],
+                day_cnt: dict[Any, int]) -> None:
+    for row in result.iter_rows(named=True):
+        d = row["day"]
+        v = np.asarray(row["day_stat"], dtype=np.float64)
+        if d in day_stat:
+            # A day should never actually span two monthly files, but
+            # merge rather than overwrite in case it ever does.
+            day_stat[d] = _merge_day(pooling, day_stat[d], v)
+            day_cnt[d] += row["n"]
+        else:
+            day_stat[d] = v
+            day_cnt[d] = row["n"]
+
+
+def _finish_daily(day_stat: dict[Any, np.ndarray], day_cnt: dict[Any, int],
+                  headlines_dir: Path, embeddings_dir: Path,
+                  ) -> tuple[pd.DatetimeIndex, np.ndarray, np.ndarray]:
+    if not day_stat:
         raise RuntimeError(
             f"no headlines found joining headlines={headlines_dir} "
             f"embeddings={embeddings_dir}"
         )
 
-    # day_sum/day_cnt are keyed by datetime.date (DuckDB's CAST(... AS DATE)
+    # day_stat/day_cnt are keyed by datetime.date (DuckDB's CAST(... AS DATE)
     # comes back as datetime.date via polars). pd.DatetimeIndex(...) converts
     # those keys to pd.Timestamp for the returned index, so look back up by
-    # d.date() rather than d itself -- indexing day_sum[d] directly raises
+    # d.date() rather than d itself -- indexing day_stat[d] directly raises
     # KeyError (Timestamp != date, even for the same calendar day).
-    days = pd.DatetimeIndex(sorted(day_sum.keys()))
-    sum_matrix = np.stack([day_sum[d.date()] for d in days]).astype(np.float64)
+    days = pd.DatetimeIndex(sorted(day_stat.keys()))
+    stat_matrix = np.stack([day_stat[d.date()] for d in days]).astype(np.float64)
     count_vector = np.array([day_cnt[d.date()] for d in days], dtype=np.int64)
 
     log.info(
         "%d calendar days, %d total headlines, %s -> %s",
         len(days), int(count_vector.sum()), days.min().date(), days.max().date(),
     )
-    return days, sum_matrix, count_vector
-
-
-# ---------------------------------------------------------------------------
-# Pass 2: complete daily grid, cumulative sums, asof lookup
-# ---------------------------------------------------------------------------
-
-def build_cumulative(
-    days: pd.DatetimeIndex,
-    sums: np.ndarray,
-    counts: np.ndarray,
-) -> tuple[pd.DatetimeIndex, np.ndarray, np.ndarray]:
-    """Zero-fill every calendar day between the first and last observed day,
-    so a delay/window in weeks or months maps to an exact calendar-date
-    lookup rather than an N-observations-back lookup.
-
-    Returns (full_grid, cumsum_ext, cumcount_ext), prefixed with a zero
-    row/entry: index 0 means "no history yet", index i >= 1 means
-    "cumulative up to and including full_grid[i - 1]".
-    """
-    full_grid = pd.date_range(days.min(), days.max(), freq="D")
-    n = len(full_grid)
-
-    sum_full = np.zeros((n, EMBEDDING_DIM), dtype=np.float64)
-    count_full = np.zeros(n, dtype=np.int64)
-    idx = full_grid.get_indexer(days)
-    sum_full[idx] = sums
-    count_full[idx] = counts
-
-    cumsum_ext = np.vstack(
-        [np.zeros((1, EMBEDDING_DIM), dtype=np.float64), np.cumsum(sum_full, axis=0)]
-    )
-    cumcount_ext = np.concatenate([[0], np.cumsum(count_full)])
-    return full_grid, cumsum_ext, cumcount_ext
-
-
-def _asof_index(date: pd.Timestamp, grid_start: pd.Timestamp, n: int) -> int:
-    """Index into cumsum_ext/cumcount_ext for `date`, clipped to [0, n].
-
-    Before grid_start clips to 0 (no history); at/after the last grid day
-    clips to n (all available history).
-    """
-    offset = (pd.Timestamp(date).normalize() - grid_start).days
-    return int(np.clip(offset + 1, 0, n))
-
-
-def compute_mu_asof(
-    asof_dates: pd.DatetimeIndex,
-    grid_start: pd.Timestamp,
-    cumsum_ext: np.ndarray,
-    cumcount_ext: np.ndarray,
-    delay: pd.DateOffset,
-    mode: str | pd.DateOffset,
-) -> pl.DataFrame:
-    """Apply delay + window to the cumulative arrays for each asof date.
-
-    For each t in asof_dates: cutoff = t - delay. In expanding mode the
-    window is [grid_start, cutoff); in rolling mode it is
-    [cutoff - window, cutoff). A date with zero headlines in its window (no
-    history yet, or an all-zero-count window) is skipped, not emitted with a
-    NaN/zero row.
-
-    The unit direction MU_HAT is formed by normalizing the pooled SUM vector
-    and only then dividing by N is applied separately for MU -- normalizing
-    the sum first avoids computing the mean and re-normalizing it, and gives
-    the identical direction since MU_HAT = mu_t/||mu_t|| = (mu_t/n)/||mu_t/n||
-    for n > 0.
-
-    Returns:
-        pl.DataFrame matching schema.MU_ASOF_SCHEMA (DATE, MU, MU_HAT, N).
-    """
-    n = cumcount_ext.shape[0] - 1
-    rows_date: list[Any] = []
-    rows_mu: list[np.ndarray] = []
-    rows_mu_hat: list[np.ndarray] = []
-    rows_n: list[int] = []
-    n_skipped = 0
-    n_degenerate = 0
-
-    for t in asof_dates:
-        cutoff = t - delay
-        end = _asof_index(cutoff, grid_start, n)
-        start = 0 if mode == "expanding" else _asof_index(cutoff - mode, grid_start, n)
-
-        n_t = int(cumcount_ext[end] - cumcount_ext[start])
-        if n_t == 0:
-            n_skipped += 1
-            continue
-
-        mu_t = cumsum_ext[end] - cumsum_ext[start]
-        norm = np.linalg.norm(mu_t)
-        if norm == 0.0:
-            # Contributing embeddings summed to exactly zero: no defined unit
-            # direction. Never seen with real embeddings, but guards against
-            # a division by zero rather than silently emitting NaN.
-            n_degenerate += 1
-            continue
-
-        rows_date.append(pd.Timestamp(t).date())
-        rows_mu.append((mu_t / n_t).astype(np.float32))
-        rows_mu_hat.append((mu_t / norm).astype(np.float32))
-        rows_n.append(n_t)
-
-    if n_skipped:
-        log.warning(
-            "%d/%d asof dates skipped: no headlines available before the delay cutoff",
-            n_skipped, len(asof_dates),
-        )
-    if n_degenerate:
-        log.warning(
-            "%d/%d asof dates skipped: pooled sum vector was exactly zero (no defined direction)",
-            n_degenerate, len(asof_dates),
-        )
-
-    return pl.DataFrame(
-        {"DATE": rows_date, "MU": rows_mu, "MU_HAT": rows_mu_hat, "N": rows_n},
-        schema=MU_ASOF_SCHEMA,
-    )
+    return days, stat_matrix, count_vector
 
 
 # ---------------------------------------------------------------------------
 # Datalake-aware entry point
 # ---------------------------------------------------------------------------
+
+def output_name(delay: str, mode: str, pooling: str = "mean") -> str:
+    """Series file name; mean keeps the historical name, min / max are suffixed."""
+    suffix = "" if pooling == "mean" else f"_pooling-{pooling}"
+    return f"mu_asof_delay-{delay}_mode-{mode}{suffix}.parquet"
+
 
 def mu_asof_to_datalake(
     index: "DatalakeIndex",
@@ -432,32 +314,34 @@ def mu_asof_to_datalake(
     mode: str,
     pipeline_version: str,
     *,
+    pooling: str = "mean",
     pipeline_repo: str | None = None,
     threads: int = 8,
 ) -> "Artifact":
-    """Full mu_asof pipeline: resolve sources, run both passes, register the artifact.
+    """Dated reference-vector series for the corpus, registered as a ``mu_asof`` artifact.
 
     Resolves the latest ``ravenpack_headlines`` and ``headline_embeddings``
     artifacts via ``index.latest()`` -- never hardcoded paths -- and records
-    both as lineage sources. Writes a single parquet
-    (``mu_asof_delay-{delay}_mode-{mode}.parquet``) into the run's output
-    directory, since mu_asof is one daily time series, not a monthly corpus.
+    both as lineage sources. Writes a single parquet (``output_name``) into
+    the run's output directory, since the series is one daily time series,
+    not a monthly corpus.
 
     Args:
         index:              Datalake index to register the artifact in.
         delay:               Delay spec, e.g. "1M" ('Xd'/'XW'/'XM').
         mode:                Window spec: "expanding" or 'XW'/'XM'.
         pipeline_version:    Semantic version of this pipeline.
+        pooling:             "mean", "min" or "max".
         pipeline_repo:       URL of the producing repo.
         threads:             DuckDB PRAGMA threads for pass 1 (applied
-                             per-month; see compute_daily_sums).
+                             per-month; see compute_daily_stats).
 
     Returns:
         The completed Artifact.
     """
-    delay_offset = parse_delay(delay)
-    mode_value = parse_mode(mode)
-    validate_window_after_delay(delay_offset, mode_value)
+    validate_window_after_delay(parse_delay(delay), parse_window(mode))
+    if pooling not in POOLINGS:
+        raise ValueError(f"pooling must be one of {POOLINGS}, got {pooling!r}")
 
     headlines_artifact = index.latest(SOURCE_HEADLINES_KIND)
     embeddings_artifact = index.latest(SOURCE_EMBEDDINGS_KIND)
@@ -465,6 +349,7 @@ def mu_asof_to_datalake(
     hyperparams: dict[str, Any] = {
         "delay": delay,
         "mode": mode,
+        "pooling": pooling,
         "dim": EMBEDDING_DIM,
         "source_headlines": headlines_artifact.artifact_id,
         "source_embeddings": embeddings_artifact.artifact_id,
@@ -485,42 +370,73 @@ def mu_asof_to_datalake(
         verifier=KIND,
         hash_pattern="*.parquet",
     ) as run:
-        log.info("pass 1/2: daily embedding sums (SQL join, per month)")
-        days, sums, counts = compute_daily_sums(
-            headlines_artifact.path,
-            embeddings_artifact.path,
-            threads=threads,
-        )
-
-        grid, cumsum_ext, cumcount_ext = build_cumulative(days, sums, counts)
-
-        log.info(
-            "pass 2/2: mu_asof for %d asof dates, delay=%s mode=%s",
-            len(days), delay, mode,
-        )
-        result = compute_mu_asof(
-            days, grid[0], cumsum_ext, cumcount_ext, delay_offset, mode_value,
-        )
-
-        if result.is_empty():
-            raise RuntimeError(
-                f"mu_asof produced no rows for delay={delay} mode={mode}; "
-                "every asof date was skipped (no headlines before the delay cutoff)"
-            )
-
-        out_name = f"mu_asof_delay-{delay}_mode-{mode}.parquet"
-        out_path = run.out_dir / out_name
-        tmp = out_path.with_suffix(".parquet.tmp")
-        try:
-            pq.write_table(result.to_arrow().cast(_arrow_schema()), tmp, compression="zstd")
-        except BaseException:
-            tmp.unlink(missing_ok=True)
-            raise
-        tmp.replace(out_path)
-
-        run.note(f"{len(result)} asof dates -> {out_name}")
+        _build_series(run, headlines_artifact, embeddings_artifact, delay, mode, pooling,
+                      threads)
 
     return index.get(run.artifact_id)
+
+
+CHECKPOINT_DIR = "_daily"
+
+
+def _build_series(run: Any, headlines_artifact: Artifact, embeddings_artifact: Artifact,
+                  delay: str, mode: str, pooling: str, threads: int) -> None:
+    """Both passes into ``run.out_dir``; pass 1 is checkpointed per month so an
+    interrupted run resumes without re-querying finished months."""
+    ckpt_dir = run.out_dir / CHECKPOINT_DIR
+    log.info("pass 1/2: daily embedding %s aggregates (SQL join, per month)", pooling)
+    days, stats, counts = compute_daily_stats(
+        headlines_artifact.path, embeddings_artifact.path, pooling=pooling, threads=threads,
+        checkpoint_dir=ckpt_dir,
+    )
+    log.info("pass 2/2: reference series for %d asof dates, delay=%s mode=%s pooling=%s",
+             len(days), delay, mode, pooling)
+    aggregate = {"mean": "sums", "min": "mins", "max": "maxs"}[pooling]
+    reference = ReferenceVector.from_daily(
+        days, counts, **{aggregate: stats}, pooling=pooling, delay=delay, window=mode,
+    )
+    result = reference.series(days)
+    if result.is_empty():
+        raise RuntimeError(
+            f"mu_asof produced no rows for delay={delay} mode={mode}; "
+            "every asof date was skipped (no headlines before the delay cutoff)"
+        )
+    out_name = output_name(delay, mode, pooling)
+    out_path = run.out_dir / out_name
+    tmp = out_path.with_suffix(".parquet.tmp")
+    try:
+        pq.write_table(result.to_arrow().cast(_arrow_schema()), tmp, compression="zstd")
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    tmp.replace(out_path)
+    for f in ckpt_dir.glob("*.npz"):                  # the series is written: drop checkpoints
+        f.unlink()
+    ckpt_dir.rmdir()
+    run.note(f"{len(result)} asof dates -> {out_name}")
+
+
+def resume_mu_asof(index: DatalakeIndex, artifact_id: str, *, threads: int = 8) -> Artifact:
+    """Finish a partial ``mu_asof`` artifact from its own hyperparams.
+
+    Delay, window, pooling and the exact source artifacts come from the artifact
+    (never "latest"); months checkpointed before the interruption are not
+    re-queried; the artifact is completed in place.
+    """
+    art = index.get(artifact_id)
+    if art.kind != KIND:
+        raise ValueError(f"{artifact_id} is a {art.kind}, not a {KIND}")
+    if not art.partial:
+        raise ValueError(f"{artifact_id} is complete; nothing to resume")
+    hp = art.meta.hyperparams
+    headlines, embeddings = index.get(hp["source_headlines"]), index.get(hp["source_embeddings"])
+    with index.run(kind=KIND, pipeline=art.meta.pipeline,
+                   pipeline_version=art.meta.pipeline_version,
+                   pipeline_repo=art.meta.pipeline_repo, hyperparams=hp,
+                   verifier=KIND, hash_pattern="*.parquet", resume=artifact_id) as run:
+        _build_series(run, headlines, embeddings, hp["delay"], hp["mode"],
+                      hp.get("pooling", "mean"), threads)
+    return index.get(artifact_id)
 
 
 # ---------------------------------------------------------------------------
@@ -532,7 +448,7 @@ def verify_artifact(artifact: "Artifact") -> "list[Finding]":
 
     Registered as the ``mu_asof`` entry point. Checks:
       - hyperparams record both source artifact IDs (-> ERROR if missing)
-      - exactly one parquet file, readable, non-empty, matching MU_ASOF_SCHEMA
+      - exactly one parquet file, readable, non-empty, matching REFERENCE_SCHEMA
       - N is positive on every row (-> ERROR otherwise)
       - MU_HAT is unit-norm within float32 tolerance, |1 - ||mu_hat||^2| < 1e-5
         (-> ERROR otherwise)
@@ -573,11 +489,11 @@ def verify_artifact(artifact: "Artifact") -> "list[Finding]":
         findings.append(Finding(Severity.ERROR, aid, f"{path.name}: file is empty"))
         return findings
 
-    if df.schema != MU_ASOF_SCHEMA:
+    if df.schema != REFERENCE_SCHEMA:
         findings.append(Finding(
             Severity.ERROR, aid,
             f"{path.name}: schema mismatch (got {dict(df.schema)}, "
-            f"expected {dict(MU_ASOF_SCHEMA)})",
+            f"expected {dict(REFERENCE_SCHEMA)})",
         ))
         return findings
 

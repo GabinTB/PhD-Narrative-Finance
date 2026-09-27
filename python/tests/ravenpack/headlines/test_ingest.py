@@ -461,3 +461,40 @@ class TestIngestToDatalake:
                 index, raw_dir, 2010, 2010, pipeline_version="v0.1.0",
             )
             assert index.latest(KIND).artifact_id == produced.artifact_id
+
+
+def test_script_resume_completes_a_killed_ingest(tmp_path, monkeypatch):
+    """scripts/ingest_ravenpack.py resume: params from the artifact, completed in place."""
+    import importlib.util
+
+    import ravenpack.headlines.ingest as ingest_mod
+
+    spec = importlib.util.spec_from_file_location(
+        "ingest_script", Path(__file__).resolve().parents[3] / "scripts" / "ingest_ravenpack.py")
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+
+    raw_all, raw_jan = tmp_path / "raw", tmp_path / "raw_jan"
+    raw_all.mkdir()
+    raw_jan.mkdir()
+    for month in (1, 2):
+        _make_zip(raw_all, 2010, month, _make_two_story_df())
+    _make_zip(raw_jan, 2010, 1, _make_two_story_df())
+    real = ingest_mod.ingest_range
+
+    def killed_after_january(**kw):
+        real(**{**kw, "raw_dir": raw_jan})
+        raise RuntimeError("killed")
+
+    with DatalakeIndex(tmp_path / "dl") as index:
+        monkeypatch.setattr(ingest_mod, "ingest_range", killed_after_january)
+        with pytest.raises(RuntimeError, match="killed"):
+            ingest_to_datalake(index, raw_all, 2010, 2010, pipeline_version="v0.1.0")
+        monkeypatch.setattr(ingest_mod, "ingest_range", real)
+        part = index.list(KIND, include_partial=True)[0]
+        assert part.partial and [p.name for p in part.path.glob("*.parquet")] == \
+            ["2010-01.parquet"]
+        done = script._resume(index, part.artifact_id, raw_all, 2_000_000, 100_000)
+        assert not done.partial and done.artifact_id == part.artifact_id
+        assert {"2010-01.parquet", "2010-02.parquet"} <= set(done.file_hashes)
+        assert len(done.meta.runs) == 2

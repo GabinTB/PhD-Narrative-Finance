@@ -4,6 +4,11 @@
 Usage:
     python scripts/compute_mu_asof.py --delay 1M --mode expanding --pipeline-version v0.1.0
     python scripts/compute_mu_asof.py --delay 1d --mode 8W --pipeline-version v0.1.0 -v
+    python scripts/compute_mu_asof.py --resume <partial mu_asof artifact id>
+
+``--resume`` finishes an interrupted run from the artifact alone (delay, window,
+pooling and the exact source artifacts are read from it); months whose daily
+aggregates were checkpointed before the interruption are not re-queried.
 
 Resolves the latest ``ravenpack_headlines`` and ``headline_embeddings``
 artifacts via the datalake index (never hardcoded paths). There is no
@@ -34,14 +39,18 @@ def main() -> int:
     )
     ap.add_argument("--env", default=".env")
     ap.add_argument("--datalake-root", help="overrides $DATALAKE_ROOT")
+    ap.add_argument("--resume", metavar="ARTIFACT_ID",
+                    help="finish a partial mu_asof artifact (all params read from it)")
     ap.add_argument(
-        "--delay", required=True,
+        "--delay",
         help="minimum 1 day: '1d', '2W', '3M'. mu(t) uses data strictly before t - delay.",
     )
     ap.add_argument(
-        "--mode", required=True,
+        "--mode",
         help="'expanding', or a rolling window >= 1 week: '4W', '6M' (no day-granularity windows).",
     )
+    ap.add_argument("--pooling", default="mean", choices=["mean", "min", "max"],
+                    help="reference-vector pooling over each window (default: mean)")
     ap.add_argument("--pipeline-version", default=PIPELINE_VERSION)
     ap.add_argument("--threads", type=int, default=8, help="DuckDB PRAGMA threads")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -61,13 +70,20 @@ def main() -> int:
         log.error("DATALAKE_ROOT must be set (in .env, environment, or --datalake-root)")
         return 1
 
-    from ravenpack.headlines.mu_asof import PIPELINE_REPO, mu_asof_to_datalake
+    from ravenpack.headlines.mu_asof import PIPELINE_REPO, mu_asof_to_datalake, resume_mu_asof
 
+    if not args.resume and not (args.delay and args.mode):
+        ap.error("--delay and --mode are required for a fresh run")
     with DatalakeIndex(root) as index:
+        if args.resume:
+            artifact = resume_mu_asof(index, args.resume, threads=args.threads)
+            print(f"\nartifact: {artifact.artifact_id}")
+            return 0
         artifact = mu_asof_to_datalake(
             index,
             delay=args.delay,
             mode=args.mode,
+            pooling=args.pooling,
             pipeline_version=args.pipeline_version,
             pipeline_repo=PIPELINE_REPO,
             threads=args.threads,

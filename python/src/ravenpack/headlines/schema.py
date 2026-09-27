@@ -37,6 +37,8 @@ from __future__ import annotations
 import polars as pl
 import pyarrow as pa
 
+from nlp.reference_vector import REFERENCE_SCHEMA
+
 # ---------------------------------------------------------------------------
 # Embedding dimensionality
 # ---------------------------------------------------------------------------
@@ -150,17 +152,10 @@ EMBEDDING_SCHEMA: pl.Schema = pl.Schema(
 # ---------------------------------------------------------------------------
 # mu_asof parquet schema (one row per asof date)
 #
-# Output of the mu_asof pipeline (mu_asof.py): the per-day pooled mean
-# headline embedding, both raw (MU, for mean centering) and unit-normalized
-# (MU_HAT, for direction removal), plus the headline count contributing to
-# each day's estimate.
+# Output of the mu_asof pipeline (mu_asof.py): the per-day pooled reference
+# vector, both raw (MU, for mean centering) and unit-normalized (MU_HAT, for
+# direction removal), plus the headline count contributing to each day's
+# estimate. The single definition lives with the reference vector.
 # ---------------------------------------------------------------------------
 
-MU_ASOF_SCHEMA: pl.Schema = pl.Schema(
-    {
-        "DATE":    pl.Date,
-        "MU":      pl.Array(pl.Float32, EMBEDDING_DIM),
-        "MU_HAT":  pl.Array(pl.Float32, EMBEDDING_DIM),
-        "N":       pl.Int64,
-    }
-)
+MU_ASOF_SCHEMA: pl.Schema = REFERENCE_SCHEMA

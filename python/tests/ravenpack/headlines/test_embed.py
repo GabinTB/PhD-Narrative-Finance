@@ -10,7 +10,10 @@ Covers:
     write, null-headline handling (row kept, not dropped)
   - embed_range: one parquet per source month, resumability (skip existing),
     overwrite
-  - model_dir_sha256: deterministic and sensitive to content / file set
+  - embed_to_datalake: end to end on a temp lake with an nlp Embedder over a
+    fake backend -- the card carries backend / serving / checks, backend and
+    dtype are in the artifact id
+  - resume guard: refuses a different backend or dtype; per-month model check
   - verify_artifact: clean set, missing month, unexpected parquet, bad schema
 """
 from __future__ import annotations
@@ -23,11 +26,13 @@ import numpy as np
 import polars as pl
 import pytest
 
+from nlp.backends.base import Backend, EmbeddingConfig, IncompatibleModelError, unit_rows
+from nlp.embedding import Embedder
 from ravenpack.headlines.embed import (
     embed_month,
     embed_range,
-    load_embedding_model,
-    model_dir_sha256,
+    embed_to_datalake,
+    resume_embedding,
     verify_artifact,
 )
 from ravenpack.headlines.schema import EMBEDDING_DIM, EMBEDDING_SCHEMA
@@ -249,69 +254,123 @@ class TestEmbedRange:
 
 
 # ---------------------------------------------------------------------------
-# model_dir_sha256
+# embed_to_datalake / resume guard / per-month model check (nlp Embedder)
 # ---------------------------------------------------------------------------
 
 
-class TestModelDirSha256:
-    def _make_model_dir(self, root: Path) -> Path:
-        d = root / "model"
-        (d / "sub").mkdir(parents=True)
-        (d / "config.json").write_bytes(b'{"dim": 384}')
-        (d / "sub" / "pytorch_model.bin").write_bytes(b"\x00\x01\x02weights")
-        return d
+class FakeBackend(Backend):
+    name = "fake"
 
-    def test_deterministic(self, tmp_path: Path):
-        d = self._make_model_dir(tmp_path)
-        assert model_dir_sha256(d) == model_dir_sha256(d)
+    def __init__(self, dtype="float16"):
+        super().__init__(dtype)
+        self.checks = 0
+        self.switched = False
 
-    def test_changes_when_file_bytes_change(self, tmp_path: Path):
-        d = self._make_model_dir(tmp_path)
-        before = model_dir_sha256(d)
-        (d / "config.json").write_bytes(b'{"dim": 385}')
-        assert model_dir_sha256(d) != before
+    def embedding_config(self):
+        return EmbeddingConfig(EMBEDDING_DIM, "cls")
 
-    def test_changes_when_file_added(self, tmp_path: Path):
-        d = self._make_model_dir(tmp_path)
-        before = model_dir_sha256(d)
-        (d / "vocab.txt").write_bytes(b"hello")
-        assert model_dir_sha256(d) != before
+    def embed(self, texts):
+        return unit_rows(np.stack([FakeModel().vector_for(t) for t in texts]))
 
-    def test_raises_on_empty_dir(self, tmp_path: Path):
-        (tmp_path / "empty").mkdir()
-        with pytest.raises(FileNotFoundError):
-            model_dir_sha256(tmp_path / "empty")
+    def info(self):
+        return {"engine": "fake", "served": "tiny"}
+
+    def check_unchanged(self):
+        self.checks += 1
+        if self.switched:
+            raise IncompatibleModelError("model changed mid-run")
 
 
-# ---------------------------------------------------------------------------
-# load_embedding_model
-# ---------------------------------------------------------------------------
+def _register_source(index, root: Path):
+    with index.run(kind="ravenpack_headlines", pipeline="test", pipeline_version="v0",
+                   hyperparams={"start_year": 2000, "end_year": 2000}) as run:
+        for name in ("2000-01", "2000-02"):
+            _write_source_month(run.out_dir / f"{name}.parquet",
+                                [f"{name}-S{i}" for i in range(3)],
+                                [f"{name} headline {i}" for i in range(3)])
+    return index.get(run.artifact_id)
 
 
-class TestLoadEmbeddingModel:
-    def test_device_embedx_returns_remote_model_without_loading_ravenbert(
-        self, tmp_path: Path, monkeypatch
-    ):
-        import sys
+class TestEmbedToDatalake:
+    def test_end_to_end_card_and_id(self, tmp_path: Path):
+        from datalake import DatalakeIndex
 
-        monkeypatch.setenv("EMBEDX_BASE_URL", "http://10.10.10.2:8477/v1")
-        monkeypatch.setenv("EMBEDX_MODEL", "/models/rb")
+        with DatalakeIndex(tmp_path / "lake") as index:
+            src = _register_source(index, tmp_path)
+            backend = FakeBackend("float16")
+            embedder = Embedder(backend, model_id="ravenbert")
+            art = embed_to_datalake(index, "v0.2.0", embedder=embedder)
+        assert sorted(p.name for p in art.path.glob("*.parquet")) == [
+            "2000-01.parquet", "2000-02.parquet"]
+        card = art.meta.model_card
+        assert card.model_id == "ravenbert" and card.backend == "fake"
+        assert card.serving["served"] == "tiny" and card.serving["checks"]["dtype"] == "float16"
+        assert art.meta.hyperparams["backend"] == "fake"
+        assert art.meta.hyperparams["dtype"] == "float16"
+        assert "dtypefloat16" in art.artifact_id and src.artifact_id in art.meta.sources
+        assert backend.checks == 2                       # one model check per month
+        X = np.stack(pl.read_parquet(art.path / "2000-01.parquet")["EMBEDDING"].to_list())
+        np.testing.assert_allclose(np.linalg.norm(X.astype(np.float32), axis=1), 1.0, atol=2e-3)
 
-        # Poison ravenbert's model loader: if load_embedding_model's embedx
-        # branch ever reached it, this would raise -- proving it does not.
-        class _Poisoned:
-            def from_path(self, *a, **kw):
-                raise AssertionError("device='embedx' must never load ravenbert locally")
+    def test_model_switch_mid_run_stops_the_job(self, tmp_path: Path):
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+        for name in ("2000-01", "2000-02"):
+            _write_source_month(src_dir / f"{name}.parquet", [f"{name}-S0"], [f"{name} h"])
+        backend = FakeBackend()
+        embedder = Embedder(backend)
+        backend.switched = True
+        with pytest.raises(IncompatibleModelError):
+            embed_range(embedder, src_dir, tmp_path / "out", 2000, 2000)
 
-        fake_module = SimpleNamespace(EmbeddingModel=_Poisoned())
-        monkeypatch.setitem(sys.modules, "ravenbert.embedding.model", fake_module)
 
-        from ravenpack.headlines.embedx_client import RemoteEmbeddingModel
+class CrashingBackend(FakeBackend):
+    """Dies on its n-th embed call (after the construction probe)."""
 
-        model = load_embedding_model(tmp_path, device="embedx")
-        assert isinstance(model, RemoteEmbeddingModel)
-        assert model.base_url == "http://10.10.10.2:8477/v1"
-        assert model.model == "/models/rb"
+    def __init__(self, dtype="float16", die_at=None):
+        super().__init__(dtype)
+        self.calls, self.die_at = 0, die_at
+
+    def embed(self, texts):
+        self.calls += 1
+        if self.die_at is not None and self.calls == self.die_at:
+            raise RuntimeError("killed mid-run")
+        return super().embed(texts)
+
+
+class TestResume:
+    def _crashed(self, tmp_path):
+        from datalake import DatalakeIndex
+
+        index = DatalakeIndex(tmp_path / "lake")
+        _register_source(index, tmp_path)
+        with pytest.raises(RuntimeError, match="killed"):
+            embed_to_datalake(index, "v0.2.0", embedder=Embedder(CrashingBackend(die_at=3)))
+        return index, index.list("headline_embeddings", include_partial=True)[0]
+
+    def test_resume_finishes_in_place(self, tmp_path):
+        index, part = self._crashed(tmp_path)
+        assert part.partial and [p.name for p in part.path.glob("*.parquet")] == ["2000-01.parquet"]
+        done = resume_embedding(index, part.artifact_id, embedder=Embedder(CrashingBackend()))
+        assert not done.partial and done.artifact_id == part.artifact_id
+        assert sorted(done.file_hashes) == ["2000-01.parquet", "2000-02.parquet"]
+        assert len(done.meta.runs) == 2 and done.meta.runs[0].partial
+
+    def test_resume_refuses_another_model(self, tmp_path):
+        index, part = self._crashed(tmp_path)
+        with pytest.raises(IncompatibleModelError, match="dtype"):
+            resume_embedding(index, part.artifact_id,
+                             embedder=Embedder(CrashingBackend(dtype="float32")))
+        assert index.get(part.artifact_id).partial                  # untouched
+
+    def test_complete_artifact_is_not_resumed(self, tmp_path):
+        from datalake import DatalakeIndex
+
+        index = DatalakeIndex(tmp_path / "lake")
+        _register_source(index, tmp_path)
+        art = embed_to_datalake(index, "v0.2.0", embedder=Embedder(CrashingBackend()))
+        with pytest.raises(ValueError, match="complete"):
+            resume_embedding(index, art.artifact_id, embedder=Embedder(CrashingBackend()))
 
 
 # ---------------------------------------------------------------------------

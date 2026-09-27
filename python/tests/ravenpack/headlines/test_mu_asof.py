@@ -1,19 +1,17 @@
-"""Tests for ravenpack.headlines.mu_asof.
+"""Tests for ravenpack.headlines.mu_asof (the RavenPack corpus job).
 
-No real GDrive/production data needed: ``compute_daily_sums`` (pass 1) is
-exercised with DuckDB monkeypatched out (a fake connection returning
-synthetic per-month polars results) -- everything downstream of it
-(``build_cumulative``, ``compute_mu_asof``) is driven from synthetic
-``(days, sums, counts)`` triples built by hand.
+No real GDrive/production data needed. ``compute_daily_stats`` (pass 1) is
+exercised both with DuckDB monkeypatched out (merge logic) and against real
+DuckDB on tiny parquet files (SUM / MIN / MAX per day). Pass 2 is
+``nlp.reference_vector.ReferenceVector``, tested in tests/nlp, including
+its equivalence with the original mu_asof algorithm.
 
 Covers:
-  - compute_daily_sums: datetime.date dict keys vs. the pd.Timestamp days
-    index returned (regression for a KeyError on lookup)
-  - build_cumulative: zero-filling, cumsum shape, the prefixed zero row
-  - compute_mu_asof: expanding mode, rolling mode, delay skipping days with no
-    data, MU_HAT unit-norm for every output row, N matches expected counts
+  - compute_daily_stats: datetime.date dict keys vs. the pd.Timestamp days
+    index returned (regression for a KeyError on lookup), month merging,
+    per-pooling SQL aggregates
+  - output_name: historical name for mean, suffixed for min / max
   - verify_artifact: unit-norm check, gap detection, N > 0 check
-  - Period parsing: valid/invalid specs, rolling > delay validation
 """
 from __future__ import annotations
 
@@ -26,21 +24,11 @@ import pandas as pd
 import polars as pl
 import pytest
 
-from ravenpack.headlines.mu_asof import (
-    build_cumulative,
-    compute_daily_sums,
-    compute_mu_asof,
-    offset_of,
-    parse_delay,
-    parse_mode,
-    parse_period,
-    validate_window_after_delay,
-    verify_artifact,
-)
+from ravenpack.headlines.mu_asof import compute_daily_stats, output_name, verify_artifact
 from ravenpack.headlines.schema import EMBEDDING_DIM, MU_ASOF_SCHEMA
 
 # ---------------------------------------------------------------------------
-# compute_daily_sums
+# compute_daily_stats
 # ---------------------------------------------------------------------------
 
 
@@ -65,10 +53,10 @@ class _FakeDuckDBConn:
         return None
 
 
-class TestComputeDailySums:
+class TestComputeDailyStats:
     def test_date_key_type_does_not_raise(self, tmp_path: Path, monkeypatch):
         """Regression: DuckDB's CAST(... AS DATE) comes back as datetime.date
-        via polars, so day_sum/day_cnt are keyed by datetime.date. Building
+        via polars, so day_stat/day_cnt are keyed by datetime.date. Building
         the returned index as pd.DatetimeIndex(sorted(day_sum.keys())) yields
         pd.Timestamp entries -- indexing day_sum[d] with those Timestamps
         directly raised KeyError (Timestamp != date, even for the same day).
@@ -82,7 +70,7 @@ class TestComputeDailySums:
 
         result = pl.DataFrame({
             "day": [date(2000, 1, 1), date(2000, 1, 2)],
-            "day_sum": [[1.0] * EMBEDDING_DIM, [2.0] * EMBEDDING_DIM],
+            "day_stat": [[1.0] * EMBEDDING_DIM, [2.0] * EMBEDDING_DIM],
             "n": [3, 5],
         })
         monkeypatch.setattr(
@@ -90,7 +78,7 @@ class TestComputeDailySums:
             lambda: _FakeDuckDBConn(result),
         )
 
-        days, sums, counts = compute_daily_sums(headlines_dir, embeddings_dir, threads=1)
+        days, sums, counts = compute_daily_stats(headlines_dir, embeddings_dir, threads=1)
 
         assert isinstance(days, pd.DatetimeIndex)
         assert list(days.date) == [date(2000, 1, 1), date(2000, 1, 2)]
@@ -113,12 +101,12 @@ class TestComputeDailySums:
         results = {
             "2000-01.parquet": pl.DataFrame({
                 "day": [date(2000, 1, 15)],
-                "day_sum": [[1.0] * EMBEDDING_DIM],
+                "day_stat": [[1.0] * EMBEDDING_DIM],
                 "n": [4],
             }),
             "2000-02.parquet": pl.DataFrame({
                 "day": [date(2000, 2, 15)],
-                "day_sum": [[2.0] * EMBEDDING_DIM],
+                "day_stat": [[2.0] * EMBEDDING_DIM],
                 "n": [6],
             }),
         }
@@ -126,212 +114,54 @@ class TestComputeDailySums:
         # duckdb.connect() carries no info about which month is being
         # queried, so route by inspecting which files currently exist to
         # read -- simplest correct stand-in is a counter over the sorted
-        # (deterministic) glob order compute_daily_sums iterates in.
+        # (deterministic) glob order compute_daily_stats iterates in.
         call_order = iter(sorted(results))
         monkeypatch.setattr(
             "ravenpack.headlines.mu_asof.duckdb.connect",
             lambda: _FakeDuckDBConn(results[next(call_order)]),
         )
 
-        days, sums, counts = compute_daily_sums(headlines_dir, embeddings_dir, threads=1)
+        days, sums, counts = compute_daily_stats(headlines_dir, embeddings_dir, threads=1)
 
         assert list(days.date) == [date(2000, 1, 15), date(2000, 2, 15)]
         assert counts.tolist() == [4, 6]
 
 
-# ---------------------------------------------------------------------------
-# build_cumulative
-# ---------------------------------------------------------------------------
+    @pytest.mark.parametrize("pooling,op", [("mean", np.sum), ("min", np.min), ("max", np.max)])
+    def test_real_duckdb_per_day_aggregates(self, tmp_path: Path, pooling, op):
+        """The SQL aggregate matches numpy per day, for every pooling."""
+        headlines_dir, embeddings_dir = tmp_path / "h", tmp_path / "e"
+        headlines_dir.mkdir()
+        embeddings_dir.mkdir()
+        rng = np.random.default_rng(0)
+        ids = [f"s{i}" for i in range(6)]
+        stamps = [pd.Timestamp("2000-01-03 09:00") + pd.Timedelta(hours=10 * i) for i in range(6)]
+        emb = rng.normal(size=(6, EMBEDDING_DIM)).astype(np.float16)
+        pl.DataFrame({"RP_STORY_ID": ids, "TIMESTAMP_UTC": stamps}).write_parquet(
+            headlines_dir / "2000-01.parquet")
+        pl.DataFrame({"RP_STORY_ID": ids, "EMBEDDING": list(emb)},
+                     schema={"RP_STORY_ID": pl.String,
+                             "EMBEDDING": pl.Array(pl.Float16, EMBEDDING_DIM)}).write_parquet(
+            embeddings_dir / "2000-01.parquet")
+
+        days, stats, counts = compute_daily_stats(headlines_dir, embeddings_dir,
+                                                  pooling=pooling, threads=1)
+
+        day_of = np.array([s.date() for s in stamps])
+        assert list(days.date) == sorted(set(day_of))
+        for i, d in enumerate(days.date):
+            rows = emb[day_of == d].astype(np.float64)
+            assert counts[i] == len(rows)
+            np.testing.assert_allclose(stats[i], op(rows, axis=0), rtol=1e-6, atol=1e-6)
+
+    def test_rejects_unknown_pooling(self, tmp_path: Path):
+        with pytest.raises(ValueError, match="pooling"):
+            compute_daily_stats(tmp_path, tmp_path, pooling="median")
 
 
-class TestBuildCumulative:
-    def test_no_gaps_shape_and_prefix_row(self):
-        days = pd.DatetimeIndex(["2000-01-01", "2000-01-02", "2000-01-03"])
-        sums = np.stack([np.full(EMBEDDING_DIM, float(i + 1)) for i in range(3)])
-        counts = np.array([2, 3, 5])
-
-        grid, cumsum_ext, cumcount_ext = build_cumulative(days, sums, counts)
-
-        assert len(grid) == 3
-        assert cumsum_ext.shape == (4, EMBEDDING_DIM)
-        assert cumcount_ext.shape == (4,)
-        # Prefix row/entry is always zero -- "no history yet".
-        np.testing.assert_array_equal(cumsum_ext[0], np.zeros(EMBEDDING_DIM))
-        assert cumcount_ext[0] == 0
-        # Cumulative sum/count at the end covers everything.
-        np.testing.assert_allclose(cumsum_ext[-1], sums.sum(axis=0))
-        assert cumcount_ext[-1] == counts.sum()
-
-    def test_zero_fills_missing_calendar_days(self):
-        # Day 2 is missing (a Sunday with no headlines) -- the grid must still
-        # include it, zero-filled, so week/month offsets land on exact dates.
-        days = pd.DatetimeIndex(["2000-01-01", "2000-01-03"])
-        sums = np.stack([np.ones(EMBEDDING_DIM), np.full(EMBEDDING_DIM, 3.0)])
-        counts = np.array([1, 1])
-
-        grid, cumsum_ext, cumcount_ext = build_cumulative(days, sums, counts)
-
-        assert len(grid) == 3
-        assert grid[1] == pd.Timestamp("2000-01-02")
-        # cumcount after day 2 (index 2, zero-filled) equals cumcount after day 1.
-        assert cumcount_ext[2] == cumcount_ext[1]
-        np.testing.assert_array_equal(cumsum_ext[2], cumsum_ext[1])
-        # cumcount after day 3 picks up both observed days.
-        assert cumcount_ext[3] == 2
-
-
-# ---------------------------------------------------------------------------
-# compute_mu_asof
-# ---------------------------------------------------------------------------
-
-
-def _synthetic_grid(n_days: int, seed: int = 0):
-    """A grid of n_days consecutive days, each with a distinct random daily
-    sum vector and a fixed count of 2 headlines/day, plus its cumulative
-    extension -- shared setup for compute_mu_asof tests."""
-    rng = np.random.default_rng(seed)
-    days = pd.date_range("2000-01-01", periods=n_days, freq="D")
-    sums = rng.standard_normal((n_days, EMBEDDING_DIM))
-    counts = np.full(n_days, 2, dtype=np.int64)
-    grid, cumsum_ext, cumcount_ext = build_cumulative(days, sums, counts)
-    return days, grid, cumsum_ext, cumcount_ext
-
-
-class TestComputeMuAsof:
-    def test_output_schema(self):
-        days, grid, cumsum_ext, cumcount_ext = _synthetic_grid(10)
-        result = compute_mu_asof(
-            days, grid[0], cumsum_ext, cumcount_ext,
-            delay=pd.DateOffset(days=1), mode="expanding",
-        )
-        assert result.schema == MU_ASOF_SCHEMA
-
-    def test_expanding_mode_accumulates_all_prior_history(self):
-        days, grid, cumsum_ext, cumcount_ext = _synthetic_grid(10)
-        delay = pd.DateOffset(days=1)
-        result = compute_mu_asof(
-            days, grid[0], cumsum_ext, cumcount_ext, delay=delay, mode="expanding",
-        )
-
-        # asof(day i) should pool every day strictly before day i (delay=1d
-        # excludes day i itself): N grows as 2, 4, 6, ... starting at day 1.
-        n_values = result["N"].to_list()
-        assert n_values == [2 * i for i in range(1, len(n_values) + 1)]
-        # day 0 has no prior history (delay excludes it) -> skipped entirely.
-        assert result["DATE"].to_list()[0] == days[1].date()
-
-    def test_rolling_mode_uses_fixed_window(self):
-        days, grid, cumsum_ext, cumcount_ext = _synthetic_grid(20)
-        delay = pd.DateOffset(days=1)
-        window = pd.DateOffset(weeks=1)  # 7 days
-        result = compute_mu_asof(
-            days, grid[0], cumsum_ext, cumcount_ext, delay=delay, mode=window,
-        )
-
-        # Once the window is fully "inside" the history (far enough from day
-        # 0), N should plateau at 2/day * 7 days = 14, not keep growing.
-        n_values = result["N"].to_list()
-        assert n_values[-1] == 14
-        assert max(n_values) == 14
-
-    def test_delay_skips_dates_with_no_prior_data(self):
-        days, grid, cumsum_ext, cumcount_ext = _synthetic_grid(5)
-        # A delay longer than the whole observed history: every asof date's
-        # cutoff falls before grid_start, so every window is empty.
-        delay = pd.DateOffset(days=30)
-        result = compute_mu_asof(
-            days, grid[0], cumsum_ext, cumcount_ext, delay=delay, mode="expanding",
-        )
-        assert result.is_empty()
-
-    def test_mu_hat_is_unit_norm(self):
-        days, grid, cumsum_ext, cumcount_ext = _synthetic_grid(15)
-        result = compute_mu_asof(
-            days, grid[0], cumsum_ext, cumcount_ext,
-            delay=pd.DateOffset(days=1), mode=pd.DateOffset(weeks=1),
-        )
-        mu_hat = np.asarray(result["MU_HAT"].to_list(), dtype=np.float64)
-        norms = np.linalg.norm(mu_hat, axis=1)
-        np.testing.assert_allclose(norms, 1.0, atol=1e-5)
-
-    def test_mu_and_mu_hat_same_direction(self):
-        days, grid, cumsum_ext, cumcount_ext = _synthetic_grid(15)
-        result = compute_mu_asof(
-            days, grid[0], cumsum_ext, cumcount_ext,
-            delay=pd.DateOffset(days=1), mode="expanding",
-        )
-        mu = np.asarray(result["MU"].to_list(), dtype=np.float64)
-        mu_hat = np.asarray(result["MU_HAT"].to_list(), dtype=np.float64)
-        expected = mu / np.linalg.norm(mu, axis=1, keepdims=True)
-        np.testing.assert_allclose(mu_hat, expected, atol=1e-6)
-
-    def test_n_matches_expected_counts(self):
-        days, grid, cumsum_ext, cumcount_ext = _synthetic_grid(10)
-        result = compute_mu_asof(
-            days, grid[0], cumsum_ext, cumcount_ext,
-            delay=pd.DateOffset(days=1), mode="expanding",
-        )
-        assert all(n > 0 for n in result["N"].to_list())
-        assert result["N"].to_list() == [2 * i for i in range(1, len(result) + 1)]
-
-
-# ---------------------------------------------------------------------------
-# Period parsing
-# ---------------------------------------------------------------------------
-
-
-class TestPeriodParsing:
-    @pytest.mark.parametrize("spec,unit,n", [("5d", "d", 5), ("2W", "W", 2), ("3M", "M", 3)])
-    def test_parse_period_valid(self, spec, unit, n):
-        assert parse_period(spec, allowed_units="dWM") == (n, unit)
-
-    @pytest.mark.parametrize("spec", ["0d", "-1W", "5x", "abc", ""])
-    def test_parse_period_invalid(self, spec):
-        import argparse
-        with pytest.raises(argparse.ArgumentTypeError):
-            parse_period(spec, allowed_units="dWM")
-
-    def test_parse_period_rejects_disallowed_unit(self):
-        import argparse
-        with pytest.raises(argparse.ArgumentTypeError):
-            parse_period("3d", allowed_units="WM")
-
-    def test_offset_of(self):
-        assert offset_of(5, "d") == pd.DateOffset(days=5)
-        assert offset_of(2, "W") == pd.DateOffset(weeks=2)
-        assert offset_of(3, "M") == pd.DateOffset(months=3)
-
-    def test_parse_delay_allows_all_units(self):
-        assert parse_delay("1d") == pd.DateOffset(days=1)
-        assert parse_delay("2W") == pd.DateOffset(weeks=2)
-        assert parse_delay("3M") == pd.DateOffset(months=3)
-
-    def test_parse_mode_expanding(self):
-        assert parse_mode("expanding") == "expanding"
-
-    def test_parse_mode_rolling(self):
-        assert parse_mode("6M") == pd.DateOffset(months=6)
-        assert parse_mode("4W") == pd.DateOffset(weeks=4)
-
-    def test_parse_mode_rejects_day_granularity(self):
-        import argparse
-        with pytest.raises(argparse.ArgumentTypeError):
-            parse_mode("5d")
-
-    def test_validate_window_after_delay_ok(self):
-        # window (6M) is longer than delay (1M) -- no error.
-        validate_window_after_delay(parse_delay("1M"), parse_mode("6M"))
-
-    def test_validate_window_after_delay_noop_for_expanding(self):
-        validate_window_after_delay(parse_delay("6M"), parse_mode("expanding"))
-
-    def test_validate_window_shorter_than_delay_raises(self):
-        with pytest.raises(ValueError, match="must be longer than the delay"):
-            validate_window_after_delay(parse_delay("2M"), parse_mode("1M"))
-
-    def test_validate_window_equal_to_delay_raises(self):
-        with pytest.raises(ValueError):
-            validate_window_after_delay(parse_delay("4W"), parse_mode("4W"))
+def test_output_name_keeps_historical_mean_name():
+    assert output_name("1d", "expanding") == "mu_asof_delay-1d_mode-expanding.parquet"
+    assert output_name("1d", "8W", "max") == "mu_asof_delay-1d_mode-8W_pooling-max.parquet"
 
 
 # ---------------------------------------------------------------------------
@@ -440,3 +270,56 @@ class TestVerifyArtifact:
         )
         findings = verify_artifact(_fake_artifact(tmp_path))
         assert any(f.severity.value == "error" and "empty" in f.message for f in findings)
+
+
+def test_killed_job_resumes_from_checkpoints(tmp_path, monkeypatch):
+    """A job killed in its 2nd month resumes: month 1 comes from its checkpoint (not
+    re-queried), the series equals an uninterrupted run, checkpoints are removed."""
+    import ravenpack.headlines.mu_asof as mod
+    from datalake import DatalakeIndex
+
+    def lake(root):
+        index = DatalakeIndex(root)
+        rng = np.random.default_rng(0)
+        with index.run(kind="ravenpack_headlines", pipeline="t", pipeline_version="v0") as h, \
+             index.run(kind="headline_embeddings", pipeline="t", pipeline_version="v0") as e:
+            for m in (1, 2, 3):
+                ids = [f"{m}-{i}" for i in range(20)]
+                stamps = [pd.Timestamp(f"2000-0{m}-01") + pd.Timedelta(hours=37 * i)
+                          for i in range(20)]
+                pl.DataFrame({"RP_STORY_ID": ids, "TIMESTAMP_UTC": stamps}).write_parquet(
+                    h.out_dir / f"2000-0{m}.parquet")
+                emb = rng.normal(size=(20, EMBEDDING_DIM)).astype(np.float16)
+                pl.DataFrame({"RP_STORY_ID": ids, "EMBEDDING": list(emb)},
+                             schema={"RP_STORY_ID": pl.String,
+                                     "EMBEDDING": pl.Array(pl.Float16, EMBEDDING_DIM)}
+                             ).write_parquet(e.out_dir / f"2000-0{m}.parquet")
+        return index
+
+    ref_index = lake(tmp_path / "ref")
+    ref = mod.mu_asof_to_datalake(ref_index, "1d", "expanding", "v0", threads=1)
+    want = pl.read_parquet(next(ref.path.glob("*.parquet")))
+
+    index = lake(tmp_path / "lake")
+    real, queried = mod._month_stats, []
+
+    def killed_in_february(hl_file, emb_file, pooling, threads):
+        queried.append(emb_file.name)
+        if emb_file.name == "2000-02.parquet" and len(queried) == 2:
+            raise RuntimeError("killed")
+        return real(hl_file, emb_file, pooling, threads)
+
+    monkeypatch.setattr(mod, "_month_stats", killed_in_february)
+    with pytest.raises(RuntimeError, match="killed"):
+        mod.mu_asof_to_datalake(index, "1d", "expanding", "v0", threads=1)
+    part = index.list("mu_asof", include_partial=True)[0]
+    assert part.partial
+    assert [p.name for p in (part.path / mod.CHECKPOINT_DIR).glob("*.npz")] == ["2000-01.npz"]
+
+    queried.clear()
+    done = mod.resume_mu_asof(index, part.artifact_id, threads=1)
+    assert queried == ["2000-02.parquet", "2000-03.parquet"]          # January not re-queried
+    assert not done.partial and not (done.path / mod.CHECKPOINT_DIR).exists()
+    got = pl.read_parquet(next(done.path.glob("*.parquet")))
+    assert got["DATE"].to_list() == want["DATE"].to_list() and got["N"].equals(want["N"])
+    np.testing.assert_array_equal(np.stack(got["MU"].to_list()), np.stack(want["MU"].to_list()))

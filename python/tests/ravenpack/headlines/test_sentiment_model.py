@@ -1,5 +1,10 @@
-"""Model sentiment: the probability -> SENT_* mappings (hand-checked), the classifier on
-tiny random-weight BERTs built here (no real weights), local vs Ray, end to end."""
+"""The model-sentiment job: Sentimeter -> headline_sentiment artifact, end to end.
+
+Score maps, confidence and compatibility checks are tested in tests/nlp; here
+the RavenPack side: the month table obeys the headline_sentiment contract,
+canonical columns are optional, the card and hyperparams record the engine,
+and a resume refuses a sentimeter that scores differently.
+"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -8,111 +13,19 @@ import numpy as np
 import polars as pl
 import pytest
 
+from nlp.backends.local import LocalBackend
+from nlp.sentiment import FinbertSentimeter, RavenbertSentimeter
 from ravenpack.headlines.sentiment import validate_sentiment_frame, verify_artifact
 from ravenpack.headlines.sentiment_model import (
-    MODELS,
-    RAVENBERT_CLASSES,
-    THIRD,
-    Classifier,
-    LocalBackend,
-    RayBackend,
-    finbert_band,
-    finbert_columns,
+    check_resume_compatible,
     ingest_to_datalake,
     producer,
-    ravenbert_columns,
-    weights_sha256,
+    run_hyperparams,
 )
 
-# ---------------------------------------------------------------------------
-# FinBERT band mapping
-# ---------------------------------------------------------------------------
-
-
-def _band(neg, neu, pos) -> tuple[float, float]:
-    s, lab = finbert_band(np.array([neg]), np.array([neu]), np.array([pos]))
-    return float(s[0]), float(lab[0])
-
-
-class TestFinbertBand:
-    def test_hand_checked_values(self):
-        s, lab = _band(0.05, 0.50, 0.45)          # argmax neutral: (0.40 / 0.45) / 3
-        assert s == pytest.approx(0.4 / 0.45 / 3) and s == pytest.approx(0.2963, abs=1e-4)
-        assert lab == 0.0
-        s, lab = _band(0.10, 0.20, 0.70)          # positive: 1/3 + (2/3)(0.70 - 0.20)
-        assert s == pytest.approx(2 / 3) and lab == 1.0
-        s, lab = _band(0.70, 0.20, 0.10)
-        assert s == pytest.approx(-2 / 3) and lab == -1.0
-        assert _band(0.0, 0.0, 1.0) == (pytest.approx(1.0), 1.0)
-        assert _band(1.0, 0.0, 0.0) == (pytest.approx(-1.0), -1.0)
-        assert _band(0.0, 1.0, 0.0) == (0.0, 0.0)
-        s, _ = _band(0.30, 0.40, 0.30)             # symmetric neutral
-        assert s == 0.0
-
-    def test_ties(self):
-        assert _band(0.2, 0.4, 0.4) == (pytest.approx(THIRD), 1.0)     # neu/pos tie -> +1/3
-        assert _band(0.4, 0.4, 0.2) == (pytest.approx(-THIRD), -1.0)
-        assert _band(0.45, 0.10, 0.45) == (0.0, 0.0)                   # pos/neg tie
-        assert _band(1 / 3, 1 / 3, 1 / 3) == (0.0, 0.0)                # triple point
-
-    @pytest.mark.parametrize("p_neg", [0.0, 0.1, 0.25])
-    def test_continuous_across_neutral_polar_boundaries(self, p_neg):
-        rest = 1.0 - p_neg
-        for sign, flip in ((1, False), (-1, True)):
-            # approach the neu == pole tie from both sides
-            for e in (1e-7, 1e-9):
-                a, b = (rest / 2 + e, rest / 2 - e), (rest / 2 - e, rest / 2 + e)
-                for pole, neu in (a, b):
-                    probs = (p_neg, neu, pole) if not flip else (pole, neu, p_neg)
-                    s, _ = _band(*probs)
-                    assert s == pytest.approx(sign * THIRD, abs=1e-6)
-
-    def test_band_matches_argmax_on_random_simplex(self):
-        rng = np.random.default_rng(0)
-        p = rng.dirichlet([0.7, 0.7, 0.7], size=200_000)
-        s, lab = finbert_band(p[:, 0], p[:, 1], p[:, 2])
-        arg = np.array([-1.0, 0.0, 1.0])[np.argmax(p, axis=1)]
-        np.testing.assert_array_equal(lab, arg)
-        assert (s[lab == 1] >= THIRD).all() and (s[lab == -1] <= -THIRD).all()
-        assert (np.abs(s[lab == 0]) < THIRD).all()
-        assert (np.abs(s) <= 1.0).all()
-
-    def test_columns_and_dtypes(self):
-        cols = finbert_columns(np.array([[0.1, 0.2, 0.7], [0.3, 0.4, 0.3]]))
-        assert list(cols) == ["SENT_BAND", "SENT_EV", "SENT_ARGMAX", "P_NEG", "P_NEU", "P_POS"]
-        assert cols["SENT_EV"].tolist() == pytest.approx([0.6, 0.0])
-        assert cols["SENT_ARGMAX"].tolist() == [1.0, 0.0]
-        assert cols["P_POS"].dtype == np.float16 and cols["SENT_BAND"].dtype == np.float32
-        with pytest.raises(ValueError, match=r"\(n, 3\)"):
-            finbert_columns(np.ones((2, 4)) / 4)
-        with pytest.raises(ValueError, match="finite"):
-            finbert_columns(np.array([[np.nan, 0.5, 0.5]]))
-
-
-class TestRavenbertColumns:
-    def test_hand_checked(self):
-        p = np.zeros((2, 41))
-        p[0, [40, 39, 20, 0]] = [0.5, 0.2, 0.2, 0.1]      # s = 1, 0.95, 0, -1
-        p[1, 20] = 1.0
-        cols = ravenbert_columns(p)
-        assert cols["SENT_EV"][0] == pytest.approx(0.5 + 0.2 * 0.95 - 0.1)
-        assert cols["SENT_ARGMAX"].tolist() == [1.0, 0.0]
-        # top 3 = {1.0: .5, 0.95: .2, 0.0: .2} (stable: class 20 before class 0 at equal p? no,
-        # p=.2 ties between classes 39 and 20; both are in the top 3) -> renormalised by .9
-        assert cols["SENT_TOP3"][0] == pytest.approx((0.5 + 0.2 * 0.95) / 0.9, rel=1e-6)
-        assert cols["SENT_EV"][1] == 0.0 and cols["SENT_TOP3"][1] == 0.0
-        rng = np.random.default_rng(1)
-        q = rng.dirichlet(np.ones(41), size=1000)
-        c = ravenbert_columns(q)
-        np.testing.assert_allclose(c["SENT_EV"], q @ RAVENBERT_CLASSES, rtol=1e-6, atol=1e-7)
-        assert all((np.abs(v) <= 1).all() and v.dtype == np.float32 for v in c.values())
-
-
-# ---------------------------------------------------------------------------
-# Tiny random-weight classifiers
-# ---------------------------------------------------------------------------
-
 WORDS = ["stocks", "rally", "plunge", "bank", "profit", "loss", "fed", "rates", "up", "down"]
+TEXTS = ["stocks rally", "bank loss plunge down", "fed rates up", "profit profit", None,
+         "loss >AAPL -- Reuters"]
 
 
 def _tiny_model(root: Path, id2label: dict[int, str]) -> Path:
@@ -129,9 +42,13 @@ def _tiny_model(root: Path, id2label: dict[int, str]) -> Path:
                      num_labels=len(id2label), id2label=id2label,
                      label2id={v: k for k, v in id2label.items()})
     BertForSequenceClassification(cfg).save_pretrained(str(root))
-    (root / ".cache").mkdir()                                  # like a HF --local-dir download
-    (root / ".cache" / "meta").write_text("machine-specific")
     return root
+
+
+@pytest.fixture(scope="module")
+def finbert_dir(tmp_path_factory) -> Path:
+    return _tiny_model(tmp_path_factory.mktemp("fb") / "m",
+                       {0: "positive", 1: "negative", 2: "neutral"})
 
 
 @pytest.fixture(scope="module")
@@ -140,108 +57,118 @@ def ravenbert_dir(tmp_path_factory) -> Path:
                        {i: f"LABEL_{i}" for i in range(41)})
 
 
-@pytest.fixture(scope="module")
-def finbert_dir(tmp_path_factory) -> Path:
-    # deliberately not in [neg, neu, pos] order
-    return _tiny_model(tmp_path_factory.mktemp("fb") / "m",
-                       {0: "positive", 1: "negative", 2: "neutral"})
+def _local(model_dir: Path) -> LocalBackend:
+    return LocalBackend(model_dir, task="classification", dtype="float32", device="cpu",
+                        batch_size=4)
 
 
-TEXTS = ["stocks rally", "bank loss down >AAPL", "", "fed rates up up up rally profit",
-         "plunge", "profit\nloss -- Reuters"]
-
-
-def test_ravenbert_ev_equals_sentiment_model_predict(ravenbert_dir):
-    from ravenbert.sentiment.model import SentimentModel, clean_text
-
-    ref = SentimentModel.from_path(ravenbert_dir, device="cpu", precision="fp32")
-    want = ref.predict(TEXTS, batch_size=64, optimized_inference=False)
-    clf = Classifier(MODELS["ravenbert"], ravenbert_dir, device="cpu", batch_size=2)
-    got = ravenbert_columns(clf.probs([clean_text(t) for t in TEXTS]))["SENT_EV"]
-    np.testing.assert_allclose(got, want, atol=1e-6)
-
-
-def test_finbert_class_order_read_from_id2label(finbert_dir):
-    import torch
-    from transformers import AutoModelForSequenceClassification, AutoTokenizer
-
-    clf = Classifier(MODELS["finbert"], finbert_dir, device="cpu")
-    got = clf.probs(TEXTS)
-    tok = AutoTokenizer.from_pretrained(str(finbert_dir))
-    model = AutoModelForSequenceClassification.from_pretrained(str(finbert_dir)).eval()
-    with torch.inference_mode():
-        raw = torch.softmax(model(**tok(TEXTS, padding=True, return_tensors="pt")).logits,
-                            -1).numpy()
-    np.testing.assert_allclose(got, raw[:, [1, 2, 0]], atol=1e-6)     # neg, neu, pos
-    np.testing.assert_allclose(got.sum(axis=1), 1.0, atol=1e-6)
-
-
-def test_bad_label_sets_are_refused(tmp_path):
-    bad = _tiny_model(tmp_path / "bad", {0: "bullish", 1: "bearish", 2: "neutral"})
-    with pytest.raises(ValueError, match="negative/neutral/positive"):
-        Classifier(MODELS["finbert"], bad, device="cpu")
-    three = _tiny_model(tmp_path / "three", {0: "negative", 1: "neutral", 2: "positive"})
-    with pytest.raises(ValueError, match="41"):
-        Classifier(MODELS["ravenbert"], three, device="cpu")
-
-
-def test_weights_hash_ignores_hidden_cache(ravenbert_dir, tmp_path):
-    import shutil
-
-    copy = tmp_path / "copy"
-    shutil.copytree(ravenbert_dir, copy)
-    (copy / ".cache" / "meta").write_text("other machine")
-    assert weights_sha256(copy) == weights_sha256(ravenbert_dir)
-    (copy / "vocab.txt").write_text("changed")
-    assert weights_sha256(copy) != weights_sha256(ravenbert_dir)
-
-
-@pytest.fixture(scope="module")
-def local_ray():
-    ray = pytest.importorskip("ray")
-    from ray._private import ray_constants
-
-    # Under `uv run`, Ray packages the whole project as the workers' working_dir; a local
-    # test cluster shares this venv and needs none of it.
-    saved = ray_constants.RAY_ENABLE_UV_RUN_RUNTIME_ENV
-    ray_constants.RAY_ENABLE_UV_RUN_RUNTIME_ENV = False
-    ray.init(num_cpus=2, include_dashboard=False, log_to_driver=False)
-    yield ray
-    ray.shutdown()
-    ray_constants.RAY_ENABLE_UV_RUN_RUNTIME_ENV = saved
-
-
-def test_ray_backend_matches_local_and_checks_weights(finbert_dir, local_ray):
-    spec = MODELS["finbert"]
-    local = LocalBackend(spec, finbert_dir, device="cpu", batch_size=4)
-    texts = TEXTS * 7
-    remote = RayBackend(spec, local.weights_sha256, address=None, n_actors=2,
-                        gpus_per_actor=0, model_path=str(finbert_dir), batch_size=4,
-                        slice_rows=5)
-    np.testing.assert_allclose(remote.probs(texts), local.probs(texts), atol=1e-6)
-    assert remote.describe().startswith("ray:2x")
-    with pytest.raises(RuntimeError, match="different finbert weights"):
-        RayBackend(spec, "0" * 64, address=None, n_actors=1, gpus_per_actor=0,
-                   model_path=str(finbert_dir))
-
-
-def test_end_to_end_finbert_artifact(finbert_dir, tmp_path):
+def _lake_with_headlines(tmp_path: Path):
     from datalake import DatalakeIndex
 
     dl = DatalakeIndex(tmp_path / "lake")
     with dl.run(kind="ravenpack_headlines", pipeline="t", pipeline_version="v0") as r:
         pl.DataFrame({"RP_STORY_ID": [f"s{i}" for i in range(len(TEXTS))],
-                      "HEADLINE": [t or None for t in TEXTS]}) \
-            .write_parquet(r.out_dir / "2008-01.parquet")
-    spec = MODELS["finbert"]
-    backend = LocalBackend(spec, finbert_dir, device="cpu", batch_size=4)
-    art = ingest_to_datalake(dl, source=spec.name, columns=list(spec.columns),
-                             produce=producer(spec, backend, read_rows=4),
+                      "HEADLINE": TEXTS}).write_parquet(r.out_dir / "2008-01.parquet")
+    return dl
+
+
+@pytest.mark.parametrize("cls,fixture", [(FinbertSentimeter, "finbert_dir"),
+                                         (RavenbertSentimeter, "ravenbert_dir")])
+def test_end_to_end_artifact(cls, fixture, request, tmp_path):
+    sentimeter = cls(_local(request.getfixturevalue(fixture)))
+    dl = _lake_with_headlines(tmp_path)
+    art = ingest_to_datalake(dl, source=sentimeter.name, columns=sentimeter.columns(),
+                             produce=producer(sentimeter, read_rows=4),
                              headlines=dl.latest("ravenpack_headlines"), start_year=2008,
-                             end_year=2008, extra_hyperparams={"weights_sha": "x"}, temp=True)
+                             end_year=2008, extra_hyperparams=run_hyperparams(sentimeter),
+                             model_card=sentimeter.model_card(), temp=True)
     out = pl.read_parquet(art.path / "2008-01.parquet")
-    assert validate_sentiment_frame(out) == list(spec.columns)
-    assert out.schema["P_NEU"] == pl.Float16 and out.height == len(TEXTS)
-    assert not out["SENT_BAND"].is_nan().any()                  # a null headline still scores
+    assert validate_sentiment_frame(out) == ["SENT_SCORE", "SENT_CONF"]
+    assert out.height == len(TEXTS) and not out["SENT_SCORE"].is_nan().any()
+    conf = out["SENT_CONF"].to_numpy()
+    assert ((conf >= 0) & (conf <= 1)).all()
+    card = art.meta.model_card
+    assert card.backend == "local" and card.model_id == f"{sentimeter.name}-sentiment"
+    assert card.weights_sha256 and card.serving["sentimeter"]["score_rule"]
+    hp = art.meta.hyperparams
+    assert hp["backend"] == "local" and hp["dtype"] == "float32" and hp["model_version"] == "2.0"
     assert verify_artifact(art) == []
+    dl.close()
+
+
+def test_canonical_columns_are_optional_float16(finbert_dir, tmp_path):
+    sentimeter = FinbertSentimeter(_local(finbert_dir))
+    month = tmp_path / "2008-01.parquet"
+    pl.DataFrame({"RP_STORY_ID": ["a", "b"], "HEADLINE": ["stocks rally", "loss"]}) \
+        .write_parquet(month)
+    plain = producer(sentimeter)(month, "t")
+    full = producer(sentimeter, canonical_columns=True)(month, "t")
+    assert plain.columns == ["RP_STORY_ID", "SENT_SCORE", "SENT_CONF"]
+    assert full.columns[-3:] == ["P_NEG", "P_NEU", "P_POS"]
+    assert full.schema["P_NEU"] == pl.Float16
+    np.testing.assert_allclose(full.select(["P_NEG", "P_NEU", "P_POS"]).to_numpy().sum(1),
+                               1.0, atol=2e-3)
+    validate_sentiment_frame(full)
+
+
+def test_min_confidence_nan_passes_the_contract(ravenbert_dir, tmp_path):
+    sentimeter = RavenbertSentimeter(_local(ravenbert_dir), min_confidence=1.0)
+    month = tmp_path / "2008-01.parquet"
+    pl.DataFrame({"RP_STORY_ID": ["a", "b"], "HEADLINE": ["stocks", "loss"]}) \
+        .write_parquet(month)
+    frame = producer(sentimeter)(month, "t")
+    assert frame["SENT_SCORE"].is_nan().all()           # nothing is fully certain
+    validate_sentiment_frame(frame)
+    assert run_hyperparams(sentimeter)["min_confidence"] == 1.0
+
+
+def test_resume_refuses_a_different_sentimeter(finbert_dir):
+    a = FinbertSentimeter(_local(finbert_dir))
+    hp = {"source": "finbert", **run_hyperparams(a)}
+    check_resume_compatible(a.model_card(), hp, a)
+    b = FinbertSentimeter(_local(finbert_dir), min_confidence=0.2)
+    with pytest.raises(ValueError, match="refusing to mix"):
+        check_resume_compatible(a.model_card(), hp, b)
+    with pytest.raises(ValueError, match="no model card"):
+        check_resume_compatible(None, hp, a)
+
+
+def test_killed_run_resumes_from_its_card_alone(finbert_dir, tmp_path):
+    """Everything comes back from the artifact: Sentimeter family, settings, backend
+    (same weights), canonical-column choice; only the missing month is scored."""
+    from datalake import DatalakeIndex
+    from nlp.sentiment import sentimeter_from_card
+    from ravenpack.headlines.sentiment import resume_partial
+
+    dl = DatalakeIndex(tmp_path / "lake")
+    with dl.run(kind="ravenpack_headlines", pipeline="t", pipeline_version="v0") as r:
+        for month, ids in (("2008-01", ["a", "b"]), ("2008-02", ["x1", "x2"])):
+            pl.DataFrame({"RP_STORY_ID": ids, "HEADLINE": ["stocks up", "loss"]}) \
+                .write_parquet(r.out_dir / f"{month}.parquet")
+    hl = dl.latest("ravenpack_headlines")
+    sentimeter = FinbertSentimeter(_local(finbert_dir), min_confidence=0.05)
+    good = producer(sentimeter, canonical_columns=True)
+
+    def dies_on_february(month, tag):
+        if month.name == "2008-02.parquet":
+            raise RuntimeError("killed")
+        return good(month, tag)
+
+    with pytest.raises(RuntimeError, match="killed"):
+        ingest_to_datalake(dl, source=sentimeter.name, columns=sentimeter.columns(),
+                           produce=dies_on_february, headlines=hl, start_year=2008,
+                           end_year=2008, extra_hyperparams=run_hyperparams(sentimeter, True),
+                           model_card=sentimeter.model_card(), temp=True)
+    part = dl.list("headline_sentiment", include_partial=True)[0]
+    assert part.partial and [p.name for p in part.path.glob("*.parquet")] == ["2008-01.parquet"]
+
+    again = sentimeter_from_card(part.meta.model_card, model_path=str(finbert_dir), device="cpu")
+    assert again.min_confidence == 0.05
+    check_resume_compatible(part.meta.model_card, part.meta.hyperparams, again)
+    done = resume_partial(dl, part.artifact_id,
+                          producer(again, canonical_columns=part.meta.hyperparams[
+                              "canonical_columns"]))
+    assert not done.partial and sorted(done.file_hashes) == ["2008-01.parquet", "2008-02.parquet"]
+    assert pl.read_parquet(done.path / "2008-02.parquet").columns[-3:] == ["P_NEG", "P_NEU",
+                                                                          "P_POS"]
     dl.close()

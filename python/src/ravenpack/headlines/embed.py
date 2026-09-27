@@ -1,4 +1,4 @@
-"""RavenBERT headline embedding pipeline.
+"""RavenBERT headline embedding pipeline (RavenPack I/O around ``nlp.Embedder``).
 
 Reads the ``ravenpack_headlines`` datalake artifact (one structured parquet per
 month, with a ``HEADLINE`` column) and writes one embedding parquet per month
@@ -19,22 +19,26 @@ on ``RP_STORY_ID``; the two are never merged into one file.
 Processing per month:
     1. Stream the source parquet in row batches (``write_chunk_rows`` at a time)
        to bound memory on high-volume months.
-    2. Encode ``HEADLINE`` with RavenBERT (passages, no query prefix).  The model
-       returns L2-normalized float32; we cast to float16 before writing.
+    2. Encode ``HEADLINE`` with an ``nlp.embedding.Embedder`` (any backend:
+       TEI by default, local or embedx; passages, no query prefix). The
+       embedder returns L2-normalized float32; we cast to float16 before writing.
     3. Write with zstd compression, atomically (``.parquet.tmp`` + rename), one
        row group per chunk.
 
-Resumable: a month whose output parquet already exists is skipped.
+Resumable: a month whose output parquet already exists is skipped. Before each
+month the backend re-checks that the served model has not changed (a model
+switched on a remote server mid-run would otherwise mix two models).
 
-Model provenance is recorded in the run's ``ModelCard``: ``model_id="ravenbert"``,
-``version="1.0"``, ``weights_public=False``, ``weights_sha256`` = a sha256 over
-the RavenBERT weights directory (sorted relative paths + file bytes).
+Provenance: the run's ``ModelCard`` is ``Embedder.model_card()`` --
+``model_id="ravenbert"``, ``version="1.0"``, the backend, its full serving
+metadata (TEI ``/info``, embedx model entry, or local device/dtype), the
+compatibility-check results, and the weights sha256 when the backend can know
+it (local). The backend and dtype are also hyperparams, so they are part of
+the artifact id.
 """
 from __future__ import annotations
 
-import hashlib
 import logging
-import os
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -46,9 +50,10 @@ import pyarrow.parquet as pq
 
 from ravenpack.headlines.schema import EMBEDDING_DIM, EMBEDDING_SCHEMA
 
-if TYPE_CHECKING:  # avoids importing torch/ravenbert just to import this module
-    from datalake import Artifact, DatalakeIndex, ModelCard
+if TYPE_CHECKING:
+    from datalake import Artifact, DatalakeIndex
     from datalake.verify import Finding
+    from nlp.embedding import Embedder
 
 log = logging.getLogger(__name__)
 
@@ -66,7 +71,6 @@ RAVENBERT_REPO = "https://github.com/GabinTB/RavenBERT"
 PIPELINE = "PhD-Narrative-Finance"
 PIPELINE_REPO = "https://github.com/GabinTB/PhD-Narrative-Finance"
 
-_HASH_CHUNK_BYTES = 8 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -84,100 +88,27 @@ def _arrow_schema() -> pa.Schema:
     return _ARROW_SCHEMA
 
 
-# ---------------------------------------------------------------------------
-# Model weights hashing
-# ---------------------------------------------------------------------------
+def build_embedder(backend: str = "tei", dtype: str = "float16", *,
+                   model_path: Path | str | None = None, batch_size: int | None = None,
+                   device: str | None = None) -> Embedder:
+    """RavenBERT ``Embedder`` on a named backend, named ``ravenbert`` / ``1.0`` so
+    ``dl.latest("headline_embeddings", model="ravenbert", version="1.0")`` keeps
+    resolving artifacts from every backend."""
+    import os
 
-def model_dir_sha256(model_path: Path, *, log_every: int = 20) -> str:
-    """Deterministic sha256 over every file in a model directory.
+    from nlp.backends import make_backend
+    from nlp.embedding import ENV_EMBEDDING_MODEL_PATH, Embedder
 
-    The digest folds in each file's path relative to ``model_path`` (POSIX form,
-    NUL-terminated) followed by its bytes, iterating files in sorted order.  Two
-    directories with identical contents and layout produce the same digest;
-    changing any file's bytes or renaming any file changes it.
-
-    Args:
-        model_path: Directory holding the model weights / tokenizer / config.
-        log_every:  Emit a progress line every N files (the RavenBERT weights
-                    live on a GDrive FUSE mount and hashing is slow).
-
-    Returns:
-        Hex sha256 digest.
-    """
-    model_path = Path(model_path)
-    files = sorted(p for p in model_path.rglob("*") if p.is_file())
-    if not files:
-        raise FileNotFoundError(f"no files under model directory {model_path}")
-
-    h = hashlib.sha256()
-    for i, path in enumerate(files, 1):
-        rel = path.relative_to(model_path).as_posix()
-        h.update(rel.encode("utf-8"))
-        h.update(b"\0")
-        with open(path, "rb") as fh:
-            for chunk in iter(lambda: fh.read(_HASH_CHUNK_BYTES), b""):
-                h.update(chunk)
-        if i % log_every == 0 or i == len(files):
-            log.info("  hashed %d/%d model files", i, len(files))
-    return h.hexdigest()
-
-
-def build_model_card(
-    model_path: Path, weights_sha256: str, *, backend_note: str | None = None
-) -> "ModelCard":
-    """RavenBERT embedding model card, shared by the pipeline and the migration.
-
-    backend_note is appended to notes when the run used a non-local backend
-    (e.g. "embedded via embedx at http://10.10.10.2:8477/v1") -- the weights
-    hash always describes the LOCAL model_path mirror regardless of backend
-    (see embedx_client.py's docstring on this assumption).
-    """
-    from datalake import ModelCard
-
-    notes = (
-        f"Local weights dir: {Path(model_path).name}. Output vectors are "
-        "L2-normalized float32 from RavenBERT, stored as float16."
-    )
-    if backend_note:
-        notes = f"{notes} {backend_note}"
-
-    return ModelCard(
-        model_id=MODEL_ID,
-        version=MODEL_VERSION,
-        repo=RAVENBERT_REPO,
-        weights_public=False,
-        weights_sha256=weights_sha256,
-        architecture="BERT-small (12L, hidden 384), sentence-transformers, CLS pooling",
-        dim=EMBEDDING_DIM,
-        pooling="cls",
-        trained_on="RavenPack headlines",
-        notes=notes,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Model loading
-# ---------------------------------------------------------------------------
-
-def load_embedding_model(model_path: Path, device: str | None = None) -> Any:
-    """Load the RavenBERT embedding model, locally or via a remote embedx server.
-
-    device="embedx" dispatches to RemoteEmbeddingModel.from_env() (see
-    embedx_client.py) instead of loading torch/ravenbert locally at all --
-    any other value (None, "cuda", "mps", "cpu") loads RavenBERT in-process
-    as before. The ravenbert import stays lazy and conditional on this
-    branch so --device embedx needs no GPU stack installed locally.
-    """
-    if device == "embedx":
-        from ravenpack.headlines.embedx_client import RemoteEmbeddingModel
-
-        log.info("using remote embedx backend (device=embedx)")
-        return RemoteEmbeddingModel.from_env()
-
-    from ravenbert.embedding.model import EmbeddingModel
-
-    log.info("loading RavenBERT embedding model from %s (device=%s)", model_path, device)
-    return EmbeddingModel.from_path(str(model_path), device=device)
+    kwargs: dict[str, Any] = {}
+    if batch_size:
+        kwargs["batch_size"] = batch_size
+    if backend == "local":
+        model_path = model_path or os.environ.get(ENV_EMBEDDING_MODEL_PATH)
+        if device:
+            kwargs["device"] = device
+    backend_obj = make_backend(backend, task="embedding", dtype=dtype,
+                               model_path=str(model_path) if model_path else None, **kwargs)
+    return Embedder(backend_obj, model_id=MODEL_ID, version=MODEL_VERSION, repo=RAVENBERT_REPO)
 
 
 # ---------------------------------------------------------------------------
@@ -203,11 +134,10 @@ def _prepare_headlines(values: list[Any]) -> tuple[list[str], int]:
 
 
 def embed_month(
-    model: Any,
+    embedder: Any,
     in_path: Path,
     out_path: Path,
     *,
-    batch_size: int = 128,
     write_chunk_rows: int = 200_000,
     tag: str = "",
     log_every: int = 100_000,
@@ -215,11 +145,11 @@ def embed_month(
     """Embed one month's headlines and write the two-column parquet atomically.
 
     Args:
-        model:           Object exposing ``encode(list[str]) -> np.ndarray`` of
-                         shape ``(n, EMBEDDING_DIM)`` (RavenBERT ``EmbeddingModel``).
+        embedder:        Object exposing ``encode(list[str]) -> np.ndarray`` of
+                         shape ``(n, EMBEDDING_DIM)`` (``nlp.embedding.Embedder``;
+                         batching is the backend's business).
         in_path:         Source structured parquet (needs ``RP_STORY_ID``, ``HEADLINE``).
         out_path:        Destination ``YYYY-MM.parquet``.
-        batch_size:      Passed through to ``model.encode``.
         write_chunk_rows: Source rows read (and encoded) per row group.
         tag:             Log prefix.
         log_every:       Progress line roughly every N rows embedded.
@@ -247,10 +177,7 @@ def embed_month(
             headlines, n_null = _prepare_headlines(batch.column("HEADLINE").to_pylist())
             n_null_total += n_null
 
-            emb = np.asarray(
-                model.encode(headlines, batch_size=batch_size, show_progress_bar=False),
-                dtype=np.float32,
-            )
+            emb = np.asarray(embedder.encode(headlines), dtype=np.float32)
             if emb.shape != (len(headlines), EMBEDDING_DIM):
                 raise ValueError(
                     f"{tag}: encode returned {emb.shape}, "
@@ -291,13 +218,12 @@ def embed_month(
 # ---------------------------------------------------------------------------
 
 def embed_range(
-    model: Any,
+    embedder: Any,
     source_dir: Path,
     out_dir: Path,
     start_year: int,
     end_year: int,               # inclusive
     *,
-    batch_size: int = 128,
     write_chunk_rows: int = 200_000,
     log_every: int = 100_000,
     overwrite: bool = False,
@@ -307,7 +233,8 @@ def embed_range(
     Mirrors ``ingest.ingest_range``: existing output months are skipped unless
     ``overwrite`` is set, so an interrupted run resumes by re-entering the same
     output directory.  Source months absent from ``source_dir`` are warned and
-    skipped (some months genuinely have no data).
+    skipped (some months genuinely have no data). Before each month the
+    embedder's backend re-checks that the served model is unchanged.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -332,10 +259,12 @@ def embed_range(
     total = len(todo)
     for i, (name, src) in enumerate(todo, 1):
         tag = f"[{i}/{total}] {name[:7]}"
+        backend = getattr(embedder, "backend", None)
+        if backend is not None:
+            backend.check_unchanged()
         t_month = time.monotonic()
         n = embed_month(
-            model, src, out_dir / name,
-            batch_size=batch_size,
+            embedder, src, out_dir / name,
             write_chunk_rows=write_chunk_rows,
             tag=tag,
             log_every=log_every,
@@ -356,44 +285,51 @@ def embed_range(
 
 def embed_to_datalake(
     index: "DatalakeIndex",
-    model_path: Path | str,
     pipeline_version: str,
     *,
+    embedder: Embedder | None = None,
+    backend: str = "tei",
+    dtype: str = "float16",
+    model_path: Path | str | None = None,
+    device: str | None = None,
     source_artifact_id: str | None = None,
     start_year: int | None = None,
     end_year: int | None = None,
-    device: str | None = None,
     pipeline: str = PIPELINE,
     pipeline_repo: str | None = PIPELINE_REPO,
     repo_dir: Path | None = None,
-    batch_size: int = 128,
+    batch_size: int | None = None,
     write_chunk_rows: int = 200_000,
     log_every: int = 100_000,
 ) -> "Artifact":
     """Embed a ``ravenpack_headlines`` artifact into a new ``headline_embeddings`` one.
 
     Wraps ``embed_range`` in a datalake run: the output directory is allocated by
-    the index, the source artifact is recorded as lineage, the RavenBERT model
-    card (with a weights sha256) is attached, sidecars and hashes are written on
-    completion, and a crash leaves the artifact registered as partial.
+    the index, the source artifact is recorded as lineage, the embedder's full
+    model card (backend, serving metadata, checks) is attached, sidecars and
+    hashes are written on completion, and a crash leaves the artifact
+    registered as partial.
 
     Args:
         index:              Datalake index to register the artifact in.
-        model_path:         RavenBERT embedding weights directory.
         pipeline_version:   Semantic version of this pipeline.
+        embedder:           A ready ``Embedder``; built from ``backend`` /
+                            ``dtype`` / ``model_path`` / ``device`` /
+                            ``batch_size`` when None.
+        backend, dtype:     Inference engine ("tei" | "local" | "embedx") and
+                            compute dtype; both enter the artifact id.
+        model_path:         Local backend only; default
+                            ``$RAVENBERT_EMBEDDING_MODEL_PATH``.
         source_artifact_id: Explicit source artifact; defaults to
                             ``index.latest("ravenpack_headlines")``.
         start_year/end_year: Restrict the months embedded; default to the source
                             artifact's declared range.
-        device:             Force a torch device ('cuda'|'mps'|'cpu'); None = auto.
         pipeline, pipeline_repo, repo_dir: Provenance passthrough.
-        batch_size, write_chunk_rows, log_every: Throughput / logging knobs.
+        write_chunk_rows, log_every: Throughput / logging knobs.
 
     Returns:
         The completed Artifact.
     """
-    model_path = Path(model_path)
-
     src = index.get(source_artifact_id) if source_artifact_id else index.latest(SOURCE_KIND)
     hp = src.meta.hyperparams
     resolved_start = start_year if start_year is not None else hp.get("start_year")
@@ -404,22 +340,20 @@ def embed_to_datalake(
             f"artifact hyperparams ({src.artifact_id})"
         )
 
-    log.info("hashing RavenBERT model directory %s ...", model_path)
-    weights_sha256 = model_dir_sha256(model_path)
-    backend_note = (
-        f"embedded via embedx at {os.environ.get('EMBEDX_BASE_URL', '?')}"
-        if device == "embedx" else None
-    )
-    card = build_model_card(model_path, weights_sha256, backend_note=backend_note)
+    if embedder is None:
+        embedder = build_embedder(backend, dtype, model_path=model_path,
+                                  batch_size=batch_size, device=device)
+    card = embedder.model_card()
 
-    # Keep hyperparams minimal -- they feed the artifact_id slug.  batch_size and
-    # the source artifact id go into the run notes instead (mirrors
-    # ingest_to_datalake, which keeps raw_dir/columns out of the slug).
+    # Hyperparams feed the artifact_id slug: the year range plus what changes
+    # the numbers (engine and dtype). The source artifact is lineage (sources).
     hyperparams: dict[str, Any] = {
         "start_year": resolved_start,
         "end_year": resolved_end,
+        "backend": embedder.backend.name,
+        "dtype": embedder.backend.dtype,
     }
-    notes = f"source_artifact={src.artifact_id} batch_size={batch_size}"
+    notes = f"source_artifact={src.artifact_id}"
 
     with index.run(
         kind=KIND,
@@ -434,14 +368,12 @@ def embed_to_datalake(
         verifier=KIND,
         hash_pattern="*.parquet",
     ) as run:
-        model = load_embedding_model(model_path, device=device)
         embed_range(
-            model,
+            embedder,
             source_dir=src.path,
             out_dir=run.out_dir,
             start_year=resolved_start,
             end_year=resolved_end,
-            batch_size=batch_size,
             write_chunk_rows=write_chunk_rows,
             log_every=log_every,
             overwrite=False,
@@ -455,6 +387,59 @@ def embed_to_datalake(
         run.note(f"{n_months} monthly embedding files from {src.artifact_id}")
 
     return index.get(run.artifact_id)
+
+
+def resume_embedding(
+    index: "DatalakeIndex",
+    artifact_id: str,
+    *,
+    embedder: Embedder | None = None,
+    model_path: Path | str | None = None,
+    write_chunk_rows: int = 200_000,
+    log_every: int = 100_000,
+    **backend_kwargs: Any,
+) -> "Artifact":
+    """Finish a partial ``headline_embeddings`` artifact from its own metadata.
+
+    Nothing is taken from the caller but throughput knobs: the embedder is rebuilt
+    from the artifact's model card (backend, dtype, naming) and must serve the
+    SAME model -- a remote server's metadata is read first and compared with the
+    recorded identity; local weights must hash to the recorded sha256. The source
+    is the recorded lineage, the year range the recorded hyperparams. Months
+    already written are skipped; the artifact is completed in place. A ready
+    ``embedder`` may be passed instead of rebuilding one; it must pass the same
+    identity check.
+    """
+    from nlp.backends import assert_same_model
+    from nlp.embedding import embedder_from_card
+
+    art = index.get(artifact_id)
+    if art.kind != KIND:
+        raise ValueError(f"{artifact_id} is a {art.kind}, not a {KIND}")
+    if not art.partial:
+        raise ValueError(f"{artifact_id} is complete; nothing to resume")
+    card = art.meta.model_card
+    if card is None:
+        raise ValueError(f"{artifact_id} has no model card; cannot identify its embedder")
+    if embedder is None:
+        embedder = embedder_from_card(card, model_path=str(model_path) if model_path else None,
+                                      **backend_kwargs)
+    else:
+        assert_same_model((card.serving or {}).get("identity") or {}, embedder.backend)
+    hp = art.meta.hyperparams
+    source_id = next((s for s in art.meta.sources if s.startswith(SOURCE_KIND)), None)
+    if source_id is None:
+        raise ValueError(f"{artifact_id} records no {SOURCE_KIND} source")
+    src = index.get(source_id)
+    with index.run(kind=KIND, pipeline=art.meta.pipeline,
+                   pipeline_version=art.meta.pipeline_version,
+                   pipeline_repo=art.meta.pipeline_repo, hyperparams=hp,
+                   verifier=KIND, hash_pattern="*.parquet", resume=artifact_id) as run:
+        embed_range(embedder, source_dir=src.path, out_dir=run.out_dir,
+                    start_year=hp["start_year"], end_year=hp["end_year"],
+                    write_chunk_rows=write_chunk_rows, log_every=log_every, overwrite=False)
+        run.note(f"{len(list(run.out_dir.glob('*.parquet')))} monthly embedding files")
+    return index.get(artifact_id)
 
 
 # ---------------------------------------------------------------------------
