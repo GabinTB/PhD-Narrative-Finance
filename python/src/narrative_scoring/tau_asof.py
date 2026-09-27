@@ -1,15 +1,19 @@
-"""tau_asof: the production F0 floor as a point-in-time monthly series.
+"""tau_asof: the production F0 floor as a point-in-time series, one row per period.
 
-Conventions mirror mu_asof: a 1-month delay and, by default, a ROLLING
-5-year window (``expanding`` is the alternative over the same partitions).
+The calibration calendar is a parameter of this job: ``calibration_freq`` (the
+period of the null partitions, default M) and ``calibration_delay`` (default
+1M), with, by default, a ROLLING 5-year window (``expanding`` is the
+alternative over the same partitions). Column names keep their historical
+monthly wording: MONTH_END is the last day of a calibration period and
+WINDOW_MONTHS_USED counts calibration periods.
 
-For each cutoff (a partition MONTH_END at or before today - 1M), the job is
+For each cutoff (a partition MONTH_END at or before today - delay), the job is
 self-contained::
 
     mu            = latest mu_asof row with DATE <= cutoff           (as-of)
     N_eff, ...    = warmup.compute_warmup(table, P, config, mu)       (recomputed here)
-    window        = partitions with month_end(cutoff - 5Y) < MONTH_END <= cutoff
-                    (60 partitions; or every partition <= cutoff when expanding)
+    window        = partitions with period_end(cutoff - 5Y) < MONTH_END <= cutoff
+                    (60 monthly partitions; or every partition <= cutoff when expanding)
     while pool(window) < min_month_draws and older partitions exist:
         window   += one earlier partition                          (recorded)
     D             = TDigest.merge(window partitions, chronological order)
@@ -45,18 +49,18 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from typing import Sequence
 
 import numpy as np
 import pandas as pd
 import polars as pl
 
-from datalake.periods import parse_span
+from datalake.periods import parse_span, period_of, periods
 from narrative_scoring.calibration import LookaheadError, TauRecord
 from narrative_scoring.config import ScoringConfig
 from narrative_scoring.f0 import TDigest, Welford, gaussian_tau, tail_probability
-from narrative_scoring.partitions import month_end, partition_digest, partition_welford
+from narrative_scoring.partitions import partition_digest, partition_welford
 from narrative_scoring.primitives import PrimitiveTable
 from narrative_scoring.schema import TAU_ASOF_SCHEMA
 from narrative_scoring.warmup import compute_warmup
@@ -67,8 +71,71 @@ log = logging.getLogger(__name__)
 
 WINDOW_DEFAULT = "5Y"
 WINDOW_EXPANDING = "expanding"
-DELAY = pd.DateOffset(months=1)
+CALIBRATION_FREQ_DEFAULT = "M"
+CALIBRATION_DELAY_DEFAULT = "1M"
+DELAY = pd.DateOffset(months=1)          # the default delay as an offset
+
+
+def delay_offset(delay: str) -> pd.DateOffset:
+    """The calibration delay ('1M', '1Q', '7d', ...) as an offset."""
+    return parse_span(delay, units="dWMQY").offset()
 POOL_QUANTILES = (0.99, 0.999, 0.9993, 0.9999)
+
+
+@dataclass(frozen=True)
+class CalibrationCalendar:
+    """The tau job's calibration calendar: partition period ``freq`` and publication
+    ``delay``. The default (M, 1M) is the historical monthly calendar; its
+    hyperparams are empty, so every existing tau / partitions id is unchanged."""
+
+    freq: str = CALIBRATION_FREQ_DEFAULT
+    delay: str = CALIBRATION_DELAY_DEFAULT
+
+    def __post_init__(self) -> None:
+        period_of(date(2000, 1, 1), self.freq)             # validates freq
+        delay_offset(self.delay)                            # validates delay
+
+    @property
+    def is_default(self) -> bool:
+        return (self.freq, self.delay) == (CALIBRATION_FREQ_DEFAULT, CALIBRATION_DELAY_DEFAULT)
+
+    @property
+    def delay_offset(self) -> pd.DateOffset:
+        return delay_offset(self.delay)
+
+    def period_of(self, day: date):
+        return period_of(day, self.freq)
+
+    def periods(self, start: date, end: date):
+        return periods(start, end, self.freq)
+
+    def hyperparams(self) -> dict[str, str]:
+        return {} if self.is_default else {"calibration_freq": self.freq,
+                                           "calibration_delay": self.delay}
+
+    def first_scorable(self, earliest: date) -> date:
+        """earliest + delay + one period: the first day a tau row can exist for.
+
+        Summed in one unit when delay and period share it (the default gives the
+        historical earliest + 2 months exactly), else applied in sequence.
+        """
+        span = parse_span(self.delay, units="dWMQY")
+        months = {"M": 1, "Q": 3, "Y": 12}
+        days = {"d": 1, "W": 7}
+        period_unit = {"D": "d", "W": "W"}.get(self.freq, self.freq)
+        t = pd.Timestamp(earliest)
+        if span.unit in months and period_unit in months:
+            return (t + pd.DateOffset(months=span.n * months[span.unit]
+                                      + months[period_unit])).date()
+        if span.unit in days and period_unit in days:
+            return (t + pd.DateOffset(days=span.n * days[span.unit] + days[period_unit])).date()
+        one_period = parse_span(f"1{period_unit}").offset()
+        return (t + self.delay_offset + one_period).date()
+
+    @classmethod
+    def from_hyperparams(cls, hp: dict) -> CalibrationCalendar:
+        return cls(hp.get("calibration_freq", CALIBRATION_FREQ_DEFAULT),
+                   hp.get("calibration_delay", CALIBRATION_DELAY_DEFAULT))
 
 
 def window_offset(window: str) -> pd.DateOffset | None:
@@ -76,27 +143,30 @@ def window_offset(window: str) -> pd.DateOffset | None:
     return parse_span(window, units="WMQY", allow_expanding=True).offset()
 
 
-def window_start(cutoff: date, offset: pd.DateOffset) -> date:
-    """Exclusive lower bound of a rolling window: the month-end ``offset`` before ``cutoff``.
+def window_start(cutoff: date, offset: pd.DateOffset, freq: str = "M") -> date:
+    """Exclusive lower bound of a rolling window: the period end ``offset`` before ``cutoff``.
 
-    Month arithmetic is done on the first of the month so that a 5Y window
-    ending 2013-04-30 starts after 2008-04-30 (60 partitions), whatever the
-    day counts of the months involved.
+    Arithmetic is done on the first day of the cutoff's period so that a 5Y
+    window ending 2013-04-30 starts after 2008-04-30 (60 monthly partitions),
+    whatever the day counts of the periods involved.
     """
-    first = (pd.Timestamp(cutoff.replace(day=1)) - offset).date()
-    return month_end(first.year, first.month)
+    first = (pd.Timestamp(period_of(cutoff, freq).first) - offset).date()
+    return period_of(first, freq).last
 
 
-def latest_cutoff(partitions: pl.DataFrame, today: date) -> date | None:
-    """Latest partition MONTH_END at or before today - 1 month."""
-    limit = (pd.Timestamp(today) - DELAY).date()
+def latest_cutoff(partitions: pl.DataFrame, today: date,
+                  delay: pd.DateOffset = DELAY) -> date | None:
+    """Latest partition MONTH_END at or before today - delay."""
+    limit = (pd.Timestamp(today) - delay).date()
     ok = partitions.filter(pl.col("MONTH_END") <= limit)
     return None if ok.is_empty() else ok["MONTH_END"].max()
 
 
-def _months_span(start_exclusive: date, cutoff: date) -> int:
-    a, b = start_exclusive, cutoff
-    return (b.year - a.year) * 12 + (b.month - a.month)
+def _periods_span(start_exclusive: date, cutoff: date, freq: str = "M") -> int:
+    """Number of calibration periods in (start_exclusive, cutoff] (period ends)."""
+    if cutoff <= start_exclusive:
+        return 0
+    return len(periods(start_exclusive + timedelta(days=1), cutoff, freq))
 
 
 def build_tau_rows(
@@ -113,8 +183,14 @@ def build_tau_rows(
     partitions_id: str = "",
     code_version: str | None = None,
     today: date | None = None,
+    freq: str = CALIBRATION_FREQ_DEFAULT,
+    delay: str = CALIBRATION_DELAY_DEFAULT,
 ) -> pl.DataFrame:
-    """One TAU_ASOF row per cutoff. Default cutoffs: every MONTH_END <= today - 1M."""
+    """One TAU_ASOF row per cutoff. Default cutoffs: every MONTH_END <= today - delay.
+
+    ``freq`` / ``delay`` are the calibration calendar (the partitions' period and
+    the publication delay), parameters of the tau job.
+    """
     parts = partitions.sort("MONTH_END")
     if parts.is_empty():
         raise ValueError("no partitions")
@@ -127,7 +203,7 @@ def build_tau_rows(
         raise ValueError(f"mode {config.mode.value} needs mu_asof to compute N_eff")
 
     if cutoffs is None:
-        limit = (pd.Timestamp(today or date.today()) - DELAY).date()
+        limit = (pd.Timestamp(today or date.today()) - delay_offset(delay)).date()
         cutoffs = parts.filter(pl.col("MONTH_END") <= limit)["MONTH_END"].to_list()
     offset = window_offset(window)
     all_rows = parts.to_dicts()
@@ -147,7 +223,7 @@ def build_tau_rows(
         if offset is None:
             lo = 0
         else:
-            start = window_start(cutoff, offset)
+            start = window_start(cutoff, offset, freq)
             lo = min((i for i, e in enumerate(ends) if e > start), default=hi)
         nominal_lo = lo
         pool = sum(int(r["WELFORD_COUNT"]) for r in all_rows[lo:hi + 1])
@@ -158,7 +234,7 @@ def build_tau_rows(
         sel_rows = all_rows[lo:hi + 1]
         if extended_by:
             log.warning("tau_asof %s: pool below min_month_draws=%d; window extended by %d "
-                        "month(s) back to %s (pool now %d)", cutoff, config.min_month_draws,
+                        "period(s) back to %s (pool now %d)", cutoff, config.min_month_draws,
                         extended_by, sel_rows[0]["MONTH_END"], pool)
         elif pool < config.min_month_draws:
             log.warning("tau_asof %s: pool %d below min_month_draws=%d and history exhausted",
@@ -179,7 +255,7 @@ def build_tau_rows(
                         cutoff, gap, config.gap_alert_threshold, tau_emp, tau_g)
         qs = digest.quantiles(np.asarray(POOL_QUANTILES))
         # the window actually used: from just before the first partition merged to the cutoff
-        w_start = month_end(*_prev_month(sel_rows[0]["MONTH_END"]))
+        w_start = period_of(sel_rows[0]["MONTH_END"], freq).previous().last
         rows.append({
             "MONTH_END": cutoff, "TAU_EMPIRICAL": float(tau_emp), "TAU_GAUSS": float(tau_g),
             "ABS_GAP": float(gap),
@@ -188,7 +264,7 @@ def build_tau_rows(
             "P_TAIL": float(p_tail), "POOL_COUNT": int(digest.count),
             "POOL_MEAN": float(moments.mean), "POOL_STD": float(moments.std),
             "N_PARTITIONS": len(sel_rows), "WINDOW_START": w_start, "WINDOW": window,
-            "WINDOW_MONTHS_USED": _months_span(w_start, cutoff),
+            "WINDOW_MONTHS_USED": _periods_span(w_start, cutoff, freq),
             "WINDOW_EXTENDED_BY": int(extended_by), "MIN_MONTH_DRAWS": config.min_month_draws,
             "N_EFF": float(warm.n_eff), "EFFECTIVE_RANK": float(warm.effective_rank),
             "LAMBDA1_SHARE": float(warm.lambda1_share),
@@ -200,10 +276,6 @@ def build_tau_rows(
             "PARTITIONS_ID": partitions_id, "CODE_VERSION": code_version or "",
         })
     return pl.DataFrame(rows, schema=TAU_ASOF_SCHEMA)
-
-
-def _prev_month(d: date) -> tuple[int, int]:
-    return (d.year - 1, 12) if d.month == 1 else (d.year, d.month - 1)
 
 
 @dataclass

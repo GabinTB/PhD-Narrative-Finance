@@ -124,6 +124,12 @@ def _indexes(args: argparse.Namespace):
     return dl, upstream
 
 
+def _calendar(args: argparse.Namespace):
+    from narrative_scoring.tau_asof import CalibrationCalendar
+
+    return CalibrationCalendar(args.calibration_freq, args.calibration_delay)
+
+
 def _table_and_embeddings(args: argparse.Namespace, dl, upstream):
     """The chosen registered taxonomy, its primitive table, primitive-text embeddings
     and their provenance (backend, serving metadata, checks)."""
@@ -167,7 +173,7 @@ def cmd_score(args: argparse.Namespace) -> int:
         table=table, P=P, upstream=upstream, source=source, window=args.window,
         seed=args.seed, threads=args.threads, rss_budget_gb=args.rss_budget_gb,
         temp=args.temp, label=args.label, taxonomy_id=tax_art.artifact_id,
-        sentiment=sentiment, primitive_meta=p_meta)
+        sentiment=sentiment, primitive_meta=p_meta, calendar=_calendar(args))
     for k in ("start", "end", "n_days_scored", "n_days_null_only", "peak_rss_gb",
               "months_finalised", "narrative_daily_id", "day_diagnostics_id",
               "partitions_id", "tau_asof_id"):
@@ -184,6 +190,7 @@ def cmd_tau_asof(args: argparse.Namespace) -> int:
     art = build_tau_asof(dl, config, table, P, upstream=upstream, window=args.window,
                          seed=args.seed, rebuild=args.rebuild, temp=args.temp,
                          taxonomy_id=tax_art.artifact_id, primitive_meta=p_meta,
+                         calendar=_calendar(args),
                          today=date.fromisoformat(args.today) if args.today else None)
     print(art.artifact_id if art else "no partition old enough yet")
     return 0
@@ -248,6 +255,10 @@ def main(argv: list[str] | None = None) -> int:
     common.add_argument("--min-month-draws", type=int, default=20_000_000)
     common.add_argument("--gap-alert-threshold", type=float, default=0.05)
     common.add_argument("--label", default="")
+    common.add_argument("--calibration-freq", default="M", choices=["D", "W", "M", "Q", "Y"],
+                        help="tau job: null-partition period (default M)")
+    common.add_argument("--calibration-delay", default="1M",
+                        help="tau job: publication delay, e.g. 1M, 1Q, 7d (default 1M)")
     common.add_argument("--embedding-backend", default="tei",
                         choices=["tei", "local", "embedx"],
                         help="engine for the primitive-text embeddings (default: tei)")

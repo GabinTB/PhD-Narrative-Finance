@@ -214,7 +214,7 @@ class TestTauAsof:
         assert jun["WINDOW_EXTENDED_BY"] == 2 and jun["N_PARTITIONS"] == 4
         assert jun["WINDOW_MONTHS_USED"] == 4 and jun["WINDOW_START"] == date(2008, 2, 29)
         assert jun["POOL_COUNT"] >= 150_000 and jun["MIN_MONTH_DRAWS"] == 150_000
-        assert any("window extended by 2 month(s)" in r.message for r in caplog.records)
+        assert any("window extended by 2 period(s)" in r.message for r in caplog.records)
         # Jan alone: 93k < 150k and no history -> logged, row still produced
         assert by[date(2008, 1, 31)]["WINDOW_EXTENDED_BY"] == 0
         assert any("history exhausted" in r.message for r in caplog.records)

@@ -50,6 +50,7 @@ from typing import Any, Iterable, Iterator, Literal, Protocol
 import numpy as np
 import polars as pl
 
+from datalake.periods import partition_file, period_key
 from narrative_scoring._kernels import HAVE_SELECT, select_aggregate_rowwise
 from narrative_scoring.aggregation import DayAccumulator, headline_narrative_scores
 from narrative_scoring.calibration import CalibrationProvider, LookaheadError, TauRecord
@@ -128,27 +129,29 @@ class ScoringResult:
 
 
 class ParquetMonthWriter:
-    """``YYYY-MM.parquet`` per month under ``out_dir`` (narrative_daily) and under
-    ``diagnostics_dir`` (day_diagnostics), plus ``run_metadata.json`` in both.
+    """``{period key}.parquet`` per period of ``freq`` (default M: ``YYYY-MM.parquet``)
+    under ``out_dir`` (narrative_daily) and under ``diagnostics_dir``
+    (day_diagnostics), plus ``run_metadata.json`` in both.
 
     Days are written in the order received (``score_dates`` sorts them); a
-    month is flushed when the first day of a later month arrives or on close.
+    period is flushed when the first day of a later period arrives or on close.
     Primitive-grain diagnostics, when produced, go to ``out_dir/primitive_daily/``.
     """
 
-    def __init__(self, out_dir: Path, diagnostics_dir: Path | None = None):
+    def __init__(self, out_dir: Path, diagnostics_dir: Path | None = None, freq: str = "M"):
+        self.freq = freq
         self.out_dir = Path(out_dir)
         self.diag_dir = (Path(diagnostics_dir) if diagnostics_dir
                          else self.out_dir / "day_diagnostics")
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.diag_dir.mkdir(parents=True, exist_ok=True)
-        self._month: tuple[int, int] | None = None
+        self._month: str | None = None           # the open period's key
         self._narr: list[pl.DataFrame] = []
         self._prim: list[pl.DataFrame] = []
         self._diag: list[dict[str, Any]] = []
 
     def write_day(self, r: DayResult) -> None:
-        ym = (r.day.year, r.day.month)
+        ym = period_key(r.day, self.freq)
         if self._month is not None and ym != self._month:
             self._flush()
         self._month = ym
@@ -160,7 +163,7 @@ class ParquetMonthWriter:
     def _flush(self) -> None:
         if self._month is None or not self._narr:
             return
-        name = f"{self._month[0]}-{self._month[1]:02d}.parquet"
+        name = partition_file(self._month)
         _atomic_parquet(pl.concat(self._narr), self.out_dir / name)
         _atomic_parquet(pl.DataFrame(self._diag, schema=DAY_DIAGNOSTICS_SCHEMA),
                         self.diag_dir / name)

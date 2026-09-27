@@ -520,3 +520,62 @@ def test_day_diagnostics_verifier_accepts_the_previous_schema(tmp_path):
                                 accepted=(DAY_DIAGNOSTICS_SCHEMA_V1,))) == []
     assert list(A._schema_check([f], DAY_DIAGNOSTICS_SCHEMA, "dg")) == [
         "2008-01.parquet: schema mismatch"]
+
+
+def test_default_calendar_adds_no_hyperparams(lake, toy_table, toy_embeddings, cfg):
+    s = A.score_range_to_datalake(lake, date(2008, 1, 1), date(2008, 4, 30), cfg,
+                                  table=toy_table, P=toy_embeddings,
+                                  source=_source(toy_table, toy_embeddings,
+                                                 [(2008, m) for m in range(1, 5)]),
+                                  use_kernel=False, temp=True)
+    for key in ("narrative_daily_id", "partitions_id", "tau_asof_id"):
+        hp = lake.get(s[key]).meta.hyperparams
+        assert "calibration_freq" not in hp and "calibration_delay" not in hp
+
+
+def test_weekly_calibration_calendar_end_to_end_and_resume(tmp_path, toy_table, toy_embeddings,
+                                                          cfg):
+    """A W / 1W calendar: weekly partitions, weekly narrative_daily files, lookups kept
+    apart from the monthly calendar, and kill-at-mid-run + resume == uninterrupted."""
+    from narrative_scoring.tau_asof import CalibrationCalendar
+
+    weekly = CalibrationCalendar("W", "1W")
+    months = [(2008, m) for m in range(1, 5)]
+    kw = dict(table=toy_table, P=toy_embeddings, window="5Y", use_kernel=False, temp=True,
+              calendar=weekly)
+
+    ref_lake = _make_lake(tmp_path / "ref")
+    ref = A.score_range_to_datalake(ref_lake, date(2008, 1, 1), date(2008, 4, 30), cfg,
+                                    source=_source(toy_table, toy_embeddings, months), **kw)
+    pt = ref_lake.get(ref["partitions_id"])
+    assert pt.meta.hyperparams["calibration_freq"] == "W"
+    assert all("-W" in p.stem for p in pt.path.glob("*.parquet"))
+    nd = ref_lake.get(ref["narrative_daily_id"])
+    assert sorted(_frames(nd)) and all("-W" in n for n in _frames(nd))
+    assert A.find_partitions(ref_lake, cfg, toy_table, A.embedding_key(toy_embeddings, None),
+                             temp=True) is None                     # monthly lookup: no match
+    assert A.find_partitions(ref_lake, cfg, toy_table, A.embedding_key(toy_embeddings, None),
+                             temp=True, calendar=weekly) is not None
+
+    lake = _make_lake(tmp_path / "lake")
+    dying = _DiesOn(_source(toy_table, toy_embeddings, months).days, chunk_size=5)
+    dying.kill_day = date(2008, 3, 19)
+    with pytest.raises(_Killed):
+        A.score_range_to_datalake(lake, date(2008, 1, 1), date(2008, 4, 30), cfg,
+                                  source=dying, **kw)
+    nd_part = lake.list(A.KIND_NARRATIVE_DAILY, include_partial=True)[0]
+    rc = json.loads((nd_part.path / A.RUN_CONFIG_FILE).read_text())
+    assert rc["calibration"] == {"freq": "W", "delay": "1W"}
+    s = A.score_range_to_datalake(
+        lake, date.fromisoformat(rc["start"]), date.fromisoformat(rc["end"]), cfg,
+        source=_source(toy_table, toy_embeddings, months), inputs=rc["inputs"],
+        resume=rc["artifacts"], **kw)
+    drop = ("RSS_GB_BEFORE", "RSS_GB_AFTER", "SECONDS", "RSS_PEAK_GB", "CODE_VERSION")
+    for got_id, want_id in ((s["narrative_daily_id"], ref["narrative_daily_id"]),
+                            (s["partitions_id"], ref["partitions_id"]),
+                            (s["tau_asof_id"], ref["tau_asof_id"])):
+        got, want = _frames(lake.get(got_id)), _frames(ref_lake.get(want_id))
+        assert sorted(got) == sorted(want)
+        for name in want:
+            cols = [c for c in drop if c in want[name].columns]
+            assert got[name].drop(cols).equals(want[name].drop(cols)), (got_id, name)

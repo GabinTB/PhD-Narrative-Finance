@@ -50,11 +50,9 @@ from datalake.layout import Layout, layout_of
 from datalake.meta import git_commit
 from narrative_scoring.config import ScoringConfig, SentimentSplit
 from narrative_scoring.partitions import (
-    MonthlyNullPartitionWriter,
+    NullPartitionWriter,
     SkipClosedDays,
     load_partitions,
-    month_range_days,
-    months_between,
 )
 from narrative_scoring.pipeline import ParquetMonthWriter, score_dates
 from narrative_scoring.primitives import (
@@ -78,8 +76,10 @@ from narrative_scoring.streaming import (
     ParquetSentimentSource,
 )
 from narrative_scoring.tau_asof import (
-    DELAY,
+    CALIBRATION_DELAY_DEFAULT,
+    CALIBRATION_FREQ_DEFAULT,
     WINDOW_DEFAULT,
+    CalibrationCalendar,
     TauSeriesProvider,
     build_tau_rows,
     latest_cutoff,
@@ -106,11 +106,10 @@ KIND_SENTIMENT = "headline_sentiment"
 AGENT_KINDS = (KIND_PARTITIONS, KIND_TAU_ASOF, KIND_NARRATIVE_DAILY, KIND_DAY_DIAGNOSTICS)
 
 TAU_ASOF_FILE = "tau_asof.parquet"
+DEFAULT_CALENDAR = CalibrationCalendar()
 RUN_CONFIG_FILE = "run_config.json"      # everything a resume needs, written at run start
 PROVENANCE_FILE = "embeddings_provenance.json"
 PARAPHRASE_STYLES = ("headline", "semantic")
-X_MIN_MONTHS = 2          # earliest scorable start = earliest data + X_MIN_MONTHS (spec)
-X_FULL_MONTHS = 61        # 60-partition rolling window + the 1M delay
 
 
 def _repo_dir() -> Path:
@@ -137,7 +136,8 @@ def latest_matching(dl: DatalakeIndex, kind: str, *, partial: bool = False,
     pool = ([a for a in dl.list(kind, include_partial=True) if a.partial] if partial
             else dl.list(kind))
     matches = [art for art in pool
-               if all(art.meta.hyperparams.get(k) == v for k, v in hyperparams.items())]
+               if all(art.meta.hyperparams.get(k, HP_DEFAULTS.get(k)) == v
+                      for k, v in hyperparams.items())]
     if not matches:
         state = "partial" if partial else "complete"
         raise DatalakeError(f"no {state} {kind} artifact matching {hyperparams}")
@@ -145,6 +145,11 @@ def latest_matching(dl: DatalakeIndex, kind: str, *, partial: bool = False,
 
 
 TEMP_NOTE = "TEMP: agent_created=true, safe to delete"
+
+# Hyperparams that are recorded only when non-default: an artifact without the key
+# was built with the default (keeps every pre-existing id and lookup valid).
+HP_DEFAULTS: dict[str, Any] = {"calibration_freq": CALIBRATION_FREQ_DEFAULT,
+                               "calibration_delay": CALIBRATION_DELAY_DEFAULT}
 
 
 def mark_temp_deprecated(dl: DatalakeIndex, artifact_id: str,
@@ -264,43 +269,54 @@ def embedding_key(P: np.ndarray, primitive_meta: dict[str, Any] | None) -> str:
 
 
 def partitions_params(config: ScoringConfig, table: PrimitiveTable, emb_key: str, seed: int,
-                      temp: bool) -> dict[str, Any]:
+                      temp: bool,
+                      calendar: CalibrationCalendar = DEFAULT_CALENDAR) -> dict[str, Any]:
     return {**_taxonomy_params(table), "embeddings_id": emb_key,
             "f0_config_id": config.f0_digest(),
             "mode": config.mode.value, "pooling": config.paraphrase_pooling.value,
             "trim_frac": config.trim_frac, "draws_per_headline": config.null_draws_per_headline,
-            "seed": seed, "agent_created": temp}
+            "seed": seed, "agent_created": temp, **calendar.hyperparams()}
 
 
 def find_partitions(dl: DatalakeIndex, config: ScoringConfig, table: PrimitiveTable,
-                    emb_key: str, seed: int = 0, temp: bool = False) -> Artifact | None:
-    """The partitions artifact for this config, taxonomy AND embedding recipe
-    (``embedding_key``): null draws are scores against P."""
+                    emb_key: str, seed: int = 0, temp: bool = False,
+                    calendar: CalibrationCalendar = DEFAULT_CALENDAR) -> Artifact | None:
+    """The partitions artifact for this config, taxonomy, embedding recipe
+    (``embedding_key``: null draws are scores against P) and calibration calendar."""
     try:
         return latest_matching(dl, KIND_PARTITIONS, f0_config_id=config.f0_digest(),
                                embeddings_id=emb_key,
                                taxonomy_sha1=table.taxonomy_sha1[:12],
                                paraphrase_sha1=table.paraphrase_sha1[:12], seed=seed,
-                               agent_created=temp)
+                               agent_created=temp, calibration_freq=calendar.freq,
+                               calibration_delay=calendar.delay)
     except DatalakeError:
         return None
 
 
 def tau_params(config: ScoringConfig, table: PrimitiveTable, emb_key: str, window: str,
-               seed: int, temp: bool) -> dict[str, Any]:
+               seed: int, temp: bool,
+               calendar: CalibrationCalendar = DEFAULT_CALENDAR) -> dict[str, Any]:
     return {**_taxonomy_params(table), "embeddings_id": emb_key,
             "f0_config_id": config.f0_digest(), "window": window,
             "alpha": config.alpha, "mode": config.mode.value,
             "pooling": config.paraphrase_pooling.value, "seed": seed,
-            "min_month_draws": config.min_month_draws, "agent_created": temp}
+            "min_month_draws": config.min_month_draws, "agent_created": temp,
+            **calendar.hyperparams()}
+
+
+def _lookup(hp: dict[str, Any], calendar: CalibrationCalendar) -> dict[str, Any]:
+    """Lookup keys: the calendar is always compared (missing on an artifact = default)."""
+    return {**hp, "calibration_freq": calendar.freq, "calibration_delay": calendar.delay}
 
 
 def find_tau_asof(dl: DatalakeIndex, config: ScoringConfig, table: PrimitiveTable,
                   emb_key: str, window: str = WINDOW_DEFAULT, seed: int = 0,
-                  temp: bool = False) -> Artifact | None:
+                  temp: bool = False,
+                  calendar: CalibrationCalendar = DEFAULT_CALENDAR) -> Artifact | None:
     try:
-        return latest_matching(dl, KIND_TAU_ASOF,
-                               **tau_params(config, table, emb_key, window, seed, temp))
+        return latest_matching(dl, KIND_TAU_ASOF, **_lookup(
+            tau_params(config, table, emb_key, window, seed, temp, calendar), calendar))
     except DatalakeError:
         return None
 
@@ -477,6 +493,7 @@ def build_tau_asof(
     today: date | None = None, rebuild: bool = False, temp: bool = False,
     partitions_art: Artifact | None = None, taxonomy_id: str | None = None,
     primitive_meta: dict[str, Any] | None = None, mu_id: str | None = None,
+    calendar: CalibrationCalendar = DEFAULT_CALENDAR,
 ) -> Artifact | None:
     """Append every cutoff <= today - 1M not yet in the series (or rebuild it all).
 
@@ -488,7 +505,8 @@ def build_tau_asof(
     """
     upstream = upstream or dl
     emb_key = embedding_key(P, primitive_meta)
-    parts_art = partitions_art or find_partitions(dl, config, table, emb_key, seed, temp)
+    parts_art = partitions_art or find_partitions(dl, config, table, emb_key, seed, temp,
+                                                  calendar)
     if parts_art is None:
         log.info("tau_asof: no %s artifact yet for this config", KIND_PARTITIONS)
         return None
@@ -496,25 +514,27 @@ def build_tau_asof(
     if parts.is_empty():
         return None
     today = today or date.today()
-    cutoff = latest_cutoff(parts, today)
+    cutoff = latest_cutoff(parts, today, calendar.delay_offset)
     if cutoff is None:
-        log.info("tau_asof: no partition old enough as of %s (needs month_end <= today - 1M)",
+        log.info("tau_asof: no partition old enough as of %s (needs period end <= today - "
+                 + calendar.delay + ")",
                  today)
         return None
     mu_art, mu_df = _mu_inputs(upstream, config, mu_id)
 
-    hp = tau_params(config, table, emb_key, window, seed, temp)
+    hp = tau_params(config, table, emb_key, window, seed, temp, calendar)
     existing: Artifact | None = None
     prior = pl.DataFrame(schema=TAU_ASOF_SCHEMA)
     if rebuild:
         from datalake.artifact import utc_now_iso
         hp = {**hp, "rebuilt_at": utc_now_iso()}
     else:
-        existing = find_tau_asof(dl, config, table, emb_key, window, seed, temp)
+        existing = find_tau_asof(dl, config, table, emb_key, window, seed, temp, calendar)
         interrupted = None
         if existing is None:                       # a tau job killed mid-run: continue it
             try:
-                interrupted = latest_matching(dl, KIND_TAU_ASOF, partial=True, **hp)
+                interrupted = latest_matching(dl, KIND_TAU_ASOF, partial=True,
+                                              **_lookup(hp, calendar))
             except DatalakeError:
                 interrupted = None
         prior = load_tau_series(existing or interrupted)
@@ -535,7 +555,7 @@ def build_tau_asof(
         new_rows = build_tau_rows(
             parts, config, table, P, mu_df, mu_asof_id=mu_art.artifact_id if mu_art else None,
             cutoffs=todo, window=window, seed=seed, partitions_id=parts_art.artifact_id,
-            code_version=run.record.pipeline_commit)
+            code_version=run.record.pipeline_commit, freq=calendar.freq, delay=calendar.delay)
         out = pl.concat([prior, new_rows]).sort("MONTH_END") if prior.height else new_rows
         tmp = run.out_dir / (TAU_ASOF_FILE + ".tmp")
         out.write_parquet(tmp, compression="zstd")
@@ -553,7 +573,8 @@ def calibration_as_of(dl: DatalakeIndex, config: ScoringConfig, table: Primitive
                       emb_key: str, *, upstream: DatalakeIndex | None = None,
                       window: str = WINDOW_DEFAULT, seed: int = 0,
                       temp: bool = False, mu_id: str | None = None,
-                      as_of: date | None = None) -> TauSeriesProvider:
+                      as_of: date | None = None,
+                      calendar: CalibrationCalendar = DEFAULT_CALENDAR) -> TauSeriesProvider:
     """The CalibrationProvider over the tau_asof rows that exist right now (possibly none).
 
     ``as_of`` restricts them to the rows the monthly job had built by that day
@@ -563,10 +584,10 @@ def calibration_as_of(dl: DatalakeIndex, config: ScoringConfig, table: Primitive
     """
     upstream = upstream or dl
     mu_art, mu_df = _mu_inputs(upstream, config, mu_id)
-    tau_art = find_tau_asof(dl, config, table, emb_key, window, seed, temp)
+    tau_art = find_tau_asof(dl, config, table, emb_key, window, seed, temp, calendar)
     tau_df = load_tau_series(tau_art)
     if as_of is not None:
-        limit = (pd.Timestamp(as_of) - DELAY).date()
+        limit = (pd.Timestamp(as_of) - calendar.delay_offset).date()
         tau_df = tau_df.filter(pl.col("MONTH_END") <= limit)
     return TauSeriesProvider(tau_df, mu_df,
                              tau_source_id=tau_art.artifact_id if tau_art else "",
@@ -577,10 +598,6 @@ def calibration_as_of(dl: DatalakeIndex, config: ScoringConfig, table: Primitive
 # THE scoring path: chronological replay of the live loop
 # ---------------------------------------------------------------------------
 
-def _next_month_first(y: int, m: int) -> date:
-    return date(y + (m == 12), 1 if m == 12 else m + 1, 1)
-
-
 def score_range_to_datalake(
     dl: DatalakeIndex, start: date, end: date, config: ScoringConfig, *,
     table: PrimitiveTable, P: np.ndarray, upstream: DatalakeIndex | None = None,
@@ -590,16 +607,20 @@ def score_range_to_datalake(
     temp: bool = False, label: str = "", taxonomy_id: str | None = None,
     sentiment: Artifact | None = None, primitive_meta: dict[str, Any] | None = None,
     inputs: dict[str, str | None] | None = None, resume: dict[str, str] | None = None,
+    calendar: CalibrationCalendar = DEFAULT_CALENDAR,
 ) -> dict[str, Any]:
     """Score [start, end] chronologically through the live machinery.
 
-    Per month M in order: (1) the monthly tau_asof job as of the first day of
-    M (cutoffs <= that day - 1M); (2) ``score_dates`` over M's requested days
-    with providers resolving as of each day; days with no tau row old enough
-    feed the partitions only. Months before ``start`` that have no partition
-    yet are walked the same way (null-only), because the first tau row needs
-    them. ``start`` is shifted to earliest_data + X_MIN_MONTHS when earlier,
-    with a loud warning, never an error.
+    The walk follows the tau job's calibration ``calendar`` (default monthly,
+    1M delay). Per calibration period P in order: (1) the tau_asof job as of
+    the first day of P (cutoffs <= that day - delay); (2) ``score_dates`` over
+    P's requested days with providers resolving as of each day; days with no
+    tau row old enough feed the partitions only. Periods before ``start`` that
+    have no partition yet are walked the same way (null-only), because the
+    first tau row needs them. ``start`` is shifted to earliest_data + delay +
+    one period (``CalibrationCalendar.first_scorable``) when earlier, with a
+    loud warning, never an error. narrative_daily / day_diagnostics are
+    partitioned by the same period.
 
     A split run (``config.sentiment_split = sign``) needs ``sentiment``, the
     ``headline_sentiment`` artifact whose ``config.sentiment_column`` is joined in; it
@@ -644,26 +665,25 @@ def score_range_to_datalake(
     mu_art, _ = _mu_inputs(upstream, config, mu_id)
 
     earliest = earliest_headline_day(hl)
-    x_min = (pd.Timestamp(earliest) + pd.DateOffset(months=X_MIN_MONTHS)).date()
+    x_min = calendar.first_scorable(earliest)
     if start < x_min:
-        log.warning("requested start %s precedes earliest data %s + %d months; start shifted "
-                    "to %s (cold start: earlier months feed the null partitions only)",
-                    start, earliest, X_MIN_MONTHS, x_min)
+        log.warning("requested start %s precedes earliest data %s + delay %s + one %s period; "
+                    "start shifted to %s (cold start: earlier periods feed the null "
+                    "partitions only)", start, earliest, calendar.delay, calendar.freq, x_min)
         start = x_min
     if end < start:
         log.warning("nothing to score: end %s precedes the shifted start %s", end, start)
 
     emb_key = embedding_key(P, primitive_meta)
     parts_art = (dl.get(resume["partitions"]) if resume
-                 else find_partitions(dl, config, table, emb_key, seed, temp))
+                 else find_partitions(dl, config, table, emb_key, seed, temp, calendar))
     have = (set(load_partitions(parts_art.path)["MONTH_END"].to_list())
             if parts_art else set())
     # months that end before the first mu_asof row can never be corrected, hence never
     # yield a partition: not walked at all
     first_mu = _mu_inputs(upstream, config, mu_id)[1]
     first_correctable = first_mu["DATE"].min() if first_mu is not None else earliest
-    months = [(y, m) for (y, m) in months_between(earliest, end)
-              if month_range_days(y, m)[-1] >= first_correctable]
+    walk = [p for p in calendar.periods(earliest, end) if p.last >= first_correctable]
     provenance = embeddings_provenance(P, primitive_meta, em)
     hp = {**_taxonomy_params(table), "embeddings_id": emb_key,
           "config_id": config.digest(),
@@ -671,7 +691,8 @@ def score_range_to_datalake(
           "pooling": config.paraphrase_pooling.value, "q": config.q,
           "split": config.sentiment_split.value, "window": window, "seed": seed,
           "start": start.isoformat(), "end": end.isoformat(), "label": label,
-          "taxonomy_artifact_id": taxonomy_id, "agent_created": temp}
+          "taxonomy_artifact_id": taxonomy_id, "agent_created": temp,
+          **calendar.hyperparams()}
     if sentiment is not None:
         hp.update(sentiment_source=config.sentiment_source,
                   sentiment_column=config.sentiment_column,
@@ -694,7 +715,7 @@ def score_range_to_datalake(
                 verifier=KIND_DAY_DIAGNOSTICS, hash_pattern="*",
                 resume=resume.get("day_diagnostics"), **run_kw) as dg_run, \
          dl.run(kind=KIND_PARTITIONS, hyperparams=partitions_params(config, table, emb_key, seed,
-                                                                temp),
+                                                                temp, calendar),
                 sources=sources, verifier=KIND_PARTITIONS, hash_pattern="*.parquet",
                 extend=parts_art.artifact_id if parts_art and not pt_partial else None,
                 resume=parts_art.artifact_id if pt_partial else None, **run_kw) as pt_run:
@@ -706,6 +727,7 @@ def score_range_to_datalake(
                 "end": end.isoformat(), "window": window, "seed": seed, "label": label,
                 "temp": temp, "keep_primitive_daily": keep_primitive_daily,
                 "taxonomy_artifact_id": taxonomy_id,
+                "calibration": {"freq": calendar.freq, "delay": calendar.delay},
                 "sentiment_artifact_id": sentiment.artifact_id if sentiment else None,
                 "inputs": {"headlines": hl.artifact_id, "embeddings": em.artifact_id,
                            "mu_asof": mu_art.artifact_id if mu_art else None},
@@ -717,18 +739,20 @@ def score_range_to_datalake(
                               "day_diagnostics": dg_run.artifact_id,
                               "partitions": pt_run.artifact_id},
             })
-        writer = ParquetMonthWriter(nd_run.out_dir, dg_run.out_dir)
-        partition_writer = MonthlyNullPartitionWriter(
+        writer = ParquetMonthWriter(nd_run.out_dir, dg_run.out_dir, freq=calendar.freq)
+        out_layout = Layout(calendar.freq)
+        partition_writer = NullPartitionWriter(
             pt_run.out_dir, config=config, table=table, seed=seed,
             input_ids={"headlines": hl.artifact_id, "embeddings": em.artifact_id,
                        "mu_asof": mu_art.artifact_id if mu_art else None},
-            code_version=pt_run.record.pipeline_commit)
+            code_version=pt_run.record.pipeline_commit, freq=calendar.freq)
         sink = SkipClosedDays(partition_writer) if resume else partition_writer
         last_metadata = None
-        for (y, m) in months:
-            all_days = month_range_days(y, m)
+        start_period = calendar.period_of(start).first
+        for period in walk:
+            all_days = period.days()
             days = [d for d in all_days if d <= end]
-            if date(y, m, 1) < start.replace(day=1):
+            if period.first < start_period:
                 if all_days[-1] in have:
                     continue                      # partition already there
                 mode = "null-only (pre-start)"
@@ -738,20 +762,22 @@ def score_range_to_datalake(
             if not days:
                 continue
             if resume and mode == "score" and \
-                    (nd_run.out_dir / f"{y}-{m:02d}.parquet").exists():
+                    out_layout.path_of(nd_run.out_dir, period).exists():
                 continue                          # finished before the interruption
-            # (1) the monthly tau job, as of the first day of this month
+            # (1) the tau job, as of the first day of this calibration period
             tau_art = build_tau_asof(dl, config, table, P, upstream=upstream, window=window,
-                                     seed=seed, today=date(y, m, 1), temp=temp,
+                                     seed=seed, today=period.first, temp=temp,
                                      partitions_art=dl.get(pt_run.artifact_id),
                                      taxonomy_id=taxonomy_id, primitive_meta=primitive_meta,
-                                     mu_id=mu_id)
+                                     mu_id=mu_id, calendar=calendar)
             cal = calibration_as_of(dl, config, table, emb_key, upstream=upstream, window=window,
-                                    seed=seed, temp=temp, mu_id=mu_id, as_of=date(y, m, 1))
+                                    seed=seed, temp=temp, mu_id=mu_id, as_of=period.first,
+                                    calendar=calendar)
             if tau_art is not None:
                 summary["tau_rows"] = load_tau_series(tau_art)
-            log.info("month %d-%02d: %s, %d day(s), tau rows available: %d",
-                     y, m, mode, len(days), cal.tau_df.height)
+            log.info("%s %s: %s, %d day(s), tau rows available: %d",
+                     "month" if calendar.freq == "M" else "period", period.key, mode, len(days),
+                     cal.tau_df.height)
             # (2) the days, through the one pipeline
             res = score_dates(
                 days, config, table=table, primitive_embeddings=P, source=source,
@@ -769,19 +795,20 @@ def score_range_to_datalake(
             summary["peak_rss_gb"] = max(summary["peak_rss_gb"], res.peak_rss_gb)
             if res.metadata is not None:
                 last_metadata = res.metadata
-            if days[-1] == all_days[-1]:          # the month closed on schedule
-                sink.finalise_before(_next_month_first(y, m))
+            if days[-1] == all_days[-1]:          # the period closed on schedule
+                sink.finalise_before(period.next().first)
         summary["months_finalised"] = [p.name for p in sink.finalised]
         if last_metadata is not None:
             writer.close(last_metadata)
-        pt_run.note(f"{len(sink.finalised)} month(s) finalised in [{earliest}, {end}]")
+        pt_run.note(f"{len(sink.finalised)} {calendar.freq} partition(s) finalised in "
+                    f"[{earliest}, {end}]")
         nd_run.note(f"{summary['n_days_scored']} day(s) scored, "
                     f"{summary['n_days_null_only']} null-only, peak RSS "
                     f"{summary['peak_rss_gb']:.2f} GB")
         dg_run.note(f"{summary['n_days_scored']} day(s)")
     summary.update(narrative_daily_id=nd_run.artifact_id, day_diagnostics_id=dg_run.artifact_id,
                    partitions_id=pt_run.artifact_id)
-    tau_art = find_tau_asof(dl, config, table, emb_key, window, seed, temp)
+    tau_art = find_tau_asof(dl, config, table, emb_key, window, seed, temp, calendar)
     summary["tau_asof_id"] = tau_art.artifact_id if tau_art else None
     return summary
 
@@ -837,6 +864,7 @@ def resume_scoring(
                              sentiment=sentiment, sentiment_column=config.sentiment_column,
                              headlines=upstream.get(inputs["headlines"]),
                              embeddings=upstream.get(inputs["embeddings"]))
+    calendar = CalibrationCalendar(**rc.get("calibration", {}))   # absent: the default
     log.info("resuming %s (%s -> %s)", narrative_daily_id, rc["start"], rc["end"])
     return score_range_to_datalake(
         dl, date.fromisoformat(rc["start"]), date.fromisoformat(rc["end"]), config,
@@ -844,7 +872,7 @@ def resume_scoring(
         seed=rc["seed"], keep_primitive_daily=rc["keep_primitive_daily"], threads=threads,
         rss_budget_gb=rss_budget_gb, use_kernel=use_kernel, temp=rc["temp"],
         label=rc["label"], taxonomy_id=rc["taxonomy_artifact_id"], sentiment=sentiment,
-        primitive_meta=meta, inputs=inputs, resume=rc["artifacts"])
+        primitive_meta=meta, inputs=inputs, resume=rc["artifacts"], calendar=calendar)
 
 
 # ---------------------------------------------------------------------------
