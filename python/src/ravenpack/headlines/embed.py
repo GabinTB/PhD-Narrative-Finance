@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -48,6 +49,8 @@ import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from datalake.layout import Layout, layout_from_hyperparams
+from datalake.periods import period_of
 from ravenpack.headlines.schema import EMBEDDING_DIM, EMBEDDING_SCHEMA
 
 if TYPE_CHECKING:
@@ -221,44 +224,49 @@ def embed_range(
     embedder: Any,
     source_dir: Path,
     out_dir: Path,
-    start_year: int,
-    end_year: int,               # inclusive
+    start_year: int | None = None,
+    end_year: int | None = None,               # inclusive
     *,
+    layout: Layout | None = None,
     write_chunk_rows: int = 200_000,
     log_every: int = 100_000,
     overwrite: bool = False,
 ) -> None:
-    """Embed every month in ``[start_year, end_year]`` present in ``source_dir``.
+    """Embed every partition of ``layout`` present in ``source_dir``.
 
-    Mirrors ``ingest.ingest_range``: existing output months are skipped unless
-    ``overwrite`` is set, so an interrupted run resumes by re-entering the same
-    output directory.  Source months absent from ``source_dir`` are warned and
-    skipped (some months genuinely have no data). Before each month the
-    embedder's backend re-checks that the served model is unchanged.
+    The output has the source's layout (one embedding file per headlines
+    partition, same key). ``start_year`` / ``end_year`` are the legacy monthly
+    call. Existing output partitions are skipped unless ``overwrite`` is set, so
+    an interrupted run resumes by re-entering the same output directory. Source
+    partitions absent from ``source_dir`` are warned and skipped (some periods
+    genuinely have no data). Before each partition the embedder's backend
+    re-checks that the served model is unchanged.
     """
+    if layout is None:
+        if start_year is None or end_year is None:
+            raise ValueError("give a layout or start_year/end_year")
+        layout = Layout("M", date(start_year, 1, 1), date(end_year, 12, 31))
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    all_months = [
-        (y, m) for y in range(start_year, end_year + 1) for m in range(1, 13)
-    ]
+    parts = layout.expected()
     todo: list[tuple[str, Path]] = []
-    for y, m in all_months:
-        name = f"{y}-{m:02d}.parquet"
-        src = source_dir / name
+    for period in parts:
+        src = layout.path_of(source_dir, period)
+        name = src.name
         if not src.exists():
-            log.warning("source month missing, skipping: %s", name)
+            log.warning("source partition missing, skipping: %s", name)
             continue
         if not overwrite and (out_dir / name).exists():
             continue
         todo.append((name, src))
 
     log.info(
-        "embed: %d month(s) to process (of %d in range), overwrite=%s",
-        len(todo), len(all_months), overwrite,
+        "embed: %d %s partition(s) to process (of %d in range), overwrite=%s",
+        len(todo), layout.freq, len(parts), overwrite,
     )
     total = len(todo)
     for i, (name, src) in enumerate(todo, 1):
-        tag = f"[{i}/{total}] {name[:7]}"
+        tag = f"[{i}/{total}] {Path(name).stem}"
         backend = getattr(embedder, "backend", None)
         if backend is not None:
             backend.check_unchanged()
@@ -295,6 +303,8 @@ def embed_to_datalake(
     source_artifact_id: str | None = None,
     start_year: int | None = None,
     end_year: int | None = None,
+    start: date | None = None,
+    end: date | None = None,
     pipeline: str = PIPELINE,
     pipeline_repo: str | None = PIPELINE_REPO,
     repo_dir: Path | None = None,
@@ -322,7 +332,9 @@ def embed_to_datalake(
                             ``$RAVENBERT_EMBEDDING_MODEL_PATH``.
         source_artifact_id: Explicit source artifact; defaults to
                             ``index.latest("ravenpack_headlines")``.
-        start_year/end_year: Restrict the months embedded; default to the source
+        start/end (or legacy start_year/end_year): restrict the partitions
+                            embedded (rounded out to whole periods of the
+                            source's frequency); default to the source
                             artifact's declared range.
         pipeline, pipeline_repo, repo_dir: Provenance passthrough.
         write_chunk_rows, log_every: Throughput / logging knobs.
@@ -332,13 +344,19 @@ def embed_to_datalake(
     """
     src = index.get(source_artifact_id) if source_artifact_id else index.latest(SOURCE_KIND)
     hp = src.meta.hyperparams
-    resolved_start = start_year if start_year is not None else hp.get("start_year")
-    resolved_end = end_year if end_year is not None else hp.get("end_year")
-    if resolved_start is None or resolved_end is None:
+    src_layout = layout_from_hyperparams(hp)
+    if start is None and start_year is not None:
+        start = date(start_year, 1, 1)
+    if end is None and end_year is not None:
+        end = date(end_year, 12, 31)
+    start, end = start or src_layout.start, end or src_layout.end
+    if start is None or end is None:
         raise ValueError(
-            "start_year/end_year not provided and not present in source "
-            f"artifact hyperparams ({src.artifact_id})"
+            "no start/end given and none declared by the source "
+            f"artifact ({src.artifact_id})"
         )
+    layout = Layout(src_layout.freq, period_of(start, src_layout.freq).first,
+                    period_of(end, src_layout.freq).last)
 
     if embedder is None:
         embedder = build_embedder(backend, dtype, model_path=model_path,
@@ -348,8 +366,7 @@ def embed_to_datalake(
     # Hyperparams feed the artifact_id slug: the year range plus what changes
     # the numbers (engine and dtype). The source artifact is lineage (sources).
     hyperparams: dict[str, Any] = {
-        "start_year": resolved_start,
-        "end_year": resolved_end,
+        **layout.hyperparams(),
         "backend": embedder.backend.name,
         "dtype": embedder.backend.dtype,
     }
@@ -372,8 +389,7 @@ def embed_to_datalake(
             embedder,
             source_dir=src.path,
             out_dir=run.out_dir,
-            start_year=resolved_start,
-            end_year=resolved_end,
+            layout=layout,
             write_chunk_rows=write_chunk_rows,
             log_every=log_every,
             overwrite=False,
@@ -381,7 +397,7 @@ def embed_to_datalake(
         n_months = len(list(run.out_dir.glob("*.parquet")))
         if n_months == 0:
             raise RuntimeError(
-                f"embed produced no output for {resolved_start}-{resolved_end}; "
+                f"embed produced no output for {layout.start}..{layout.end}; "
                 f"check source artifact {src.artifact_id} at {src.path}"
             )
         run.note(f"{n_months} monthly embedding files from {src.artifact_id}")
@@ -436,7 +452,7 @@ def resume_embedding(
                    pipeline_repo=art.meta.pipeline_repo, hyperparams=hp,
                    verifier=KIND, hash_pattern="*.parquet", resume=artifact_id) as run:
         embed_range(embedder, source_dir=src.path, out_dir=run.out_dir,
-                    start_year=hp["start_year"], end_year=hp["end_year"],
+                    layout=layout_from_hyperparams(hp),
                     write_chunk_rows=write_chunk_rows, log_every=log_every, overwrite=False)
         run.note(f"{len(list(run.out_dir.glob('*.parquet')))} monthly embedding files")
     return index.get(artifact_id)
@@ -450,7 +466,7 @@ def verify_artifact(artifact: "Artifact") -> "list[Finding]":
     """Verify a headline_embeddings artifact matches its declared scope.
 
     Registered as the ``headline_embeddings`` entry point.  Checks:
-      - one parquet per month in [start_year, end_year] (missing -> WARNING)
+      - one parquet per partition of the declared layout (missing -> WARNING)
       - no parquet outside the declared range (-> ERROR)
       - a first/middle/last sample are non-empty and match EMBEDDING_SCHEMA
         (RP_STORY_ID + EMBEDDING Array(Float16, 384), nothing else)
@@ -460,28 +476,22 @@ def verify_artifact(artifact: "Artifact") -> "list[Finding]":
     findings: list[Finding] = []
     aid = artifact.artifact_id
     hp = artifact.meta.hyperparams
-    start_year = hp.get("start_year")
-    end_year = hp.get("end_year")
-
-    if start_year is None or end_year is None:
+    layout = layout_from_hyperparams(hp)
+    if layout.start is None or layout.end is None:
         findings.append(Finding(
             Severity.WARNING, aid,
-            "no start_year/end_year in hyperparams; cannot verify date coverage",
+            "no declared range in hyperparams; cannot verify coverage",
         ))
         return findings
 
     present = {p.name for p in artifact.path.glob("*.parquet")}
-    expected = {
-        f"{y}-{m:02d}.parquet"
-        for y in range(start_year, end_year + 1)
-        for m in range(1, 13)
-    }
+    expected = {f"{p.key}.parquet" for p in layout.expected()}
 
     missing = expected - present
     if missing:
         findings.append(Finding(
             Severity.WARNING, aid,
-            f"{len(missing)} of {len(expected)} declared months missing: "
+            f"{len(missing)} of {len(expected)} declared {layout.freq} partitions missing: "
             f"{', '.join(sorted(missing)[:6])}"
             + (" ..." if len(missing) > 6 else ""),
         ))
@@ -491,7 +501,7 @@ def verify_artifact(artifact: "Artifact") -> "list[Finding]":
         findings.append(Finding(
             Severity.ERROR, aid,
             f"{len(unexpected)} parquet(s) outside declared range "
-            f"[{start_year}, {end_year}]: {', '.join(sorted(unexpected)[:6])}",
+            f"[{layout.start}, {layout.end}]: {', '.join(sorted(unexpected)[:6])}",
         ))
 
     sample_names = sorted(present)

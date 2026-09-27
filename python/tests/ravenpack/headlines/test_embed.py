@@ -338,6 +338,26 @@ class CrashingBackend(FakeBackend):
         return super().embed(texts)
 
 
+class TestLayouts:
+    def test_quarterly_source_gives_quarterly_embeddings(self, tmp_path: Path):
+        from datalake import DatalakeIndex
+        from datalake.layout import layout_of
+
+        index = DatalakeIndex(tmp_path / "lake")
+        with index.run(kind="ravenpack_headlines", pipeline="test", pipeline_version="v0",
+                       hyperparams={"partition_freq": "Q", "start": "2000-01-01",
+                                    "end": "2000-06-30"}) as run:
+            for key in ("2000Q1", "2000Q2"):
+                _write_source_month(run.out_dir / f"{key}.parquet",
+                                    [f"{key}-S{i}" for i in range(3)],
+                                    [f"{key} headline {i}" for i in range(3)])
+        art = embed_to_datalake(index, "v0.3.0", embedder=Embedder(FakeBackend()))
+        lay = layout_of(art)
+        assert (lay.freq, str(lay.start), str(lay.end)) == ("Q", "2000-01-01", "2000-06-30")
+        assert list(lay.existing(art.path)) == ["2000Q1", "2000Q2"]
+        assert verify_artifact(art) == []
+
+
 class TestResume:
     def _crashed(self, tmp_path):
         from datalake import DatalakeIndex

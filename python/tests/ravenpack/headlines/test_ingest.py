@@ -598,3 +598,19 @@ def test_datalake_records_the_layout(tmp_path):
         from ravenpack.headlines.ingest import verify_artifact
 
         assert verify_artifact(art) == []
+
+
+def test_story_repeated_across_raw_months_is_refused_for_quarterly(tmp_path):
+    from datetime import date
+
+    from datalake.layout import Layout
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    jan, feb = _month_df(2010, 1), _month_df(2010, 2)
+    feb.loc[0:1, "RP_STORY_ID"] = jan.loc[0, "RP_STORY_ID"]           # same story id, 2 months
+    _make_zip(raw, 2010, 1, jan)
+    _make_zip(raw, 2010, 2, feb)
+    with pytest.raises(ValueError, match="more than one raw month"):
+        ingest_range(raw, tmp_path / "Q", layout=Layout("Q", date(2010, 1, 1), date(2010, 3, 31)))
+    ingest_range(raw, tmp_path / "M", layout=Layout("M", date(2010, 1, 1), date(2010, 2, 28)))

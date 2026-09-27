@@ -29,12 +29,16 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable, Sequence
+from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import polars as pl
 import pyarrow.parquet as pq
+
+from datalake.layout import Layout, layout_from_hyperparams
+from datalake.periods import period_of
 
 if TYPE_CHECKING:
     from datalake import Artifact, DatalakeIndex, ModelCard
@@ -49,7 +53,7 @@ SCORE_PREFIX = "SENT_"
 
 PIPELINE = "PhD-Narrative-Finance"
 PIPELINE_REPO = "https://github.com/GabinTB/PhD-Narrative-Finance"
-PIPELINE_VERSION = "v0.1.0"
+PIPELINE_VERSION = "v0.2.0"   # v0.2.0: partition layout (partition_freq/start/end) in the id
 TEMP_SUFFIX = "__TEMP"
 
 MonthProducer = Callable[[Path, str], pl.DataFrame]
@@ -144,8 +148,14 @@ def write_month(df: pl.DataFrame, out_path: Path) -> None:
     tmp.replace(out_path)
 
 
+def partition_names(layout: Layout) -> list[str]:
+    """The partition file names a layout declares (``2008-01.parquet``, ``2008Q1.parquet``...)."""
+    return [f"{p.key}.parquet" for p in layout.expected()]
+
+
 def month_names(start_year: int, end_year: int) -> list[str]:
-    return [f"{y}-{m:02d}.parquet" for y in range(start_year, end_year + 1) for m in range(1, 13)]
+    """Legacy monthly names of [start_year, end_year] (the M layout of those years)."""
+    return partition_names(Layout("M", date(start_year, 1, 1), date(end_year, 12, 31)))
 
 
 # ---------------------------------------------------------------------------
@@ -186,29 +196,41 @@ def fill_months(
 
 def ingest_to_datalake(
     index: DatalakeIndex, *, source: str, columns: Sequence[str], produce: MonthProducer,
-    headlines: Artifact, start_year: int, end_year: int, extra_hyperparams: dict[str, Any],
-    model_card: ModelCard | None = None, notes: str = "", temp: bool = False,
-    repo_dir: Path | None = None,
+    headlines: Artifact, start_year: int | None = None, end_year: int | None = None,
+    extra_hyperparams: dict[str, Any], model_card: ModelCard | None = None, notes: str = "",
+    temp: bool = False, repo_dir: Path | None = None, start: date | None = None,
+    end: date | None = None,
 ) -> Artifact:
-    """Fresh ``headline_sentiment`` run over [start_year, end_year] of ``headlines``.
+    """Fresh ``headline_sentiment`` run over the partitions of ``headlines``.
 
     ``source`` names the producer (``ravenpack``, ``ravenbert``, ``finbert``);
-    ``temp`` marks the artifact agent-created (``__TEMP`` in its id).
+    ``temp`` marks the artifact agent-created (``__TEMP`` in its id). The output
+    has the headlines' layout (same partition keys), restricted to [start, end]
+    (or legacy [start_year, end_year]) rounded out to whole periods, default the
+    headlines' declared range.
     """
+    src = layout_from_hyperparams(headlines.meta.hyperparams)
+    if start is None and start_year is not None:
+        start = date(start_year, 1, 1)
+    if end is None and end_year is not None:
+        end = date(end_year, 12, 31)
+    start, end = start or src.start, end or src.end
+    if start is None or end is None:
+        raise ValueError(f"no range given and none declared by {headlines.artifact_id}")
+    layout = Layout(src.freq, period_of(start, src.freq).first, period_of(end, src.freq).last)
     hp: dict[str, Any] = {"source": source, "columns": ",".join(columns),
-                          "headlines_id": headlines.artifact_id, "start_year": start_year,
-                          "end_year": end_year, **extra_hyperparams, "agent_created": temp}
+                          "headlines_id": headlines.artifact_id, **layout.hyperparams(),
+                          **extra_hyperparams, "agent_created": temp}
     version = PIPELINE_VERSION + (TEMP_SUFFIX if temp else "")
     with index.run(kind=KIND, pipeline=PIPELINE, pipeline_version=version,
                    pipeline_repo=PIPELINE_REPO, hyperparams=hp, sources=[headlines],
                    model_card=model_card, verifier=KIND, hash_pattern="*.parquet",
                    repo_dir=repo_dir, notes=notes) as run:
-        n = fill_months(produce, headlines.path, run.out_dir,
-                        month_names(start_year, end_year), columns)
+        n = fill_months(produce, headlines.path, run.out_dir, partition_names(layout), columns)
         if not any(run.out_dir.glob("*.parquet")):
-            raise RuntimeError(f"no sentiment month written for {start_year}-{end_year} "
-                               f"from {headlines.artifact_id}")
-        run.note(f"{n} month(s) written")
+            raise RuntimeError(f"no sentiment partition written for {layout.start}..{layout.end}"
+                               f" from {headlines.artifact_id}")
+        run.note(f"{n} {layout.freq} partition(s) written")
     return index.get(run.artifact_id)
 
 
@@ -234,7 +256,7 @@ def resume_partial(index: DatalakeIndex, artifact_id: str, produce: MonthProduce
                    pipeline_repo=art.meta.pipeline_repo, hyperparams=hp, repo_dir=repo_dir,
                    verifier=KIND, hash_pattern="*.parquet", resume=artifact_id) as run:
         n = fill_months(produce, headlines.path, run.out_dir,
-                        month_names(hp["start_year"], hp["end_year"]), columns)
+                        partition_names(layout_from_hyperparams(hp)), columns)
         if not any(run.out_dir.glob("*.parquet")):
             raise RuntimeError(f"still no output in {run.out_dir} after resume")
         run.note(f"{n} month(s) written")
@@ -263,19 +285,22 @@ def verify_artifact(artifact: Artifact) -> list[Finding]:
         findings.append(Finding(Severity.ERROR, aid, msg))
 
     hp = artifact.meta.hyperparams
-    for key in ("source", "columns", "headlines_id", "start_year", "end_year"):
+    for key in ("source", "columns", "headlines_id"):
         if key not in hp:
             err(f"hyperparams missing {key}")
+    layout = layout_from_hyperparams(hp)
+    if layout.start is None or layout.end is None:
+        err("hyperparams declare no range (start/end or start_year/end_year)")
     if findings:
         return findings
     columns = hp["columns"].split(",")
     present = sorted(p.name for p in artifact.path.glob("*.parquet"))
     if not present:
-        err("no month files")
+        err("no partition files")
         return findings
-    outside = set(present) - set(month_names(hp["start_year"], hp["end_year"]))
+    outside = set(present) - set(partition_names(layout))
     if outside:
-        err(f"{len(outside)} file(s) outside the declared years: {sorted(outside)[:3]}")
+        err(f"{len(outside)} file(s) outside the declared range: {sorted(outside)[:3]}")
     for name in present:
         names = pq.read_schema(artifact.path / name).names
         if ID_COL not in names or score_columns(names) != columns:
@@ -310,5 +335,6 @@ def verify_artifact(artifact: Artifact) -> list[Finding]:
 __all__ = [
     "KIND", "SCORE_PREFIX", "ID_COL", "SentimentContractError", "score_columns",
     "validate_sentiment_frame", "align_to_stories", "headline_story_ids", "write_month",
-    "month_names", "fill_months", "ingest_to_datalake", "resume_partial", "verify_artifact",
+    "month_names", "partition_names", "fill_months", "ingest_to_datalake", "resume_partial",
+    "verify_artifact",
 ]

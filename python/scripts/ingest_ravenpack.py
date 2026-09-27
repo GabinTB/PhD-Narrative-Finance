@@ -30,7 +30,7 @@ from datalake import DatalakeError, DatalakeIndex
 
 PIPELINE = "PhD-Narrative-Finance"
 PIPELINE_REPO = "https://github.com/GabinTB/PhD-Narrative-Finance"
-PIPELINE_VERSION = "v0.1.0"
+PIPELINE_VERSION = "v0.2.0"   # v0.2.0: partition layout (partition_freq/start/end) in the id
 
 log = logging.getLogger(__name__)
 

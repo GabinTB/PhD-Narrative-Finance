@@ -40,6 +40,7 @@ import polars as pl
 import pyarrow as pa
 import pyarrow.csv as pacsv
 
+from datalake.periods import parse_key, periods
 from ravenpack.headlines.sentiment import (
     ID_COL,
     SOURCE_KIND,
@@ -123,10 +124,30 @@ def story_scores(batches: Iterator[pa.RecordBatch | pl.DataFrame], *,
 
 
 def producer(raw_dir: Path, block_bytes: int = BLOCK_BYTES) -> MonthProducer:
-    """The month producer for sentiment.fill_months: headlines ``YYYY-MM.parquet`` -> scores."""
-    def produce(headlines_month: Path, tag: str) -> pl.DataFrame:
-        year, month = (int(x) for x in headlines_month.stem.split("-"))
-        return story_scores(raw_month_batches(raw_dir, year, month, block_bytes), where=tag)
+    """The partition producer for sentiment.fill_months: headlines partition -> scores.
+
+    The partition key (``2008-01``, ``2008-01-15``, ``2008-W03``, ``2008Q1``...)
+    gives the period; the scores come from every raw month CSV it spans (the
+    caller aligns them to the partition's own stories). The last two raw
+    months' scores are cached, so daily or weekly partitions read each raw
+    month once.
+    """
+    cache: dict[tuple[int, int], pl.DataFrame] = {}
+
+    def month_scores(year: int, month: int, tag: str) -> pl.DataFrame:
+        key = (year, month)
+        if key not in cache:
+            if len(cache) >= 2:
+                cache.pop(next(iter(cache)))
+            cache[key] = story_scores(raw_month_batches(raw_dir, year, month, block_bytes),
+                                      where=f"{tag} {year}-{month:02d}")
+        return cache[key]
+
+    def produce(headlines_partition: Path, tag: str) -> pl.DataFrame:
+        period = parse_key(headlines_partition.stem)
+        months = [(m.first.year, m.first.month) for m in periods(period.first, period.last, "M")]
+        frames = [month_scores(y, m, tag) for y, m in months]
+        return frames[0] if len(frames) == 1 else pl.concat(frames)
     return produce
 
 

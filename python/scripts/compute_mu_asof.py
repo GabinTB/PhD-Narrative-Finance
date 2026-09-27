@@ -27,7 +27,7 @@ from dotenv import find_dotenv, load_dotenv
 
 from datalake import DatalakeIndex
 
-PIPELINE_VERSION = "v0.1.0"
+PIPELINE_VERSION = "v0.2.0"   # v0.2.0: pooling in the hyperparams (mean/min/max)
 
 log = logging.getLogger(__name__)
 

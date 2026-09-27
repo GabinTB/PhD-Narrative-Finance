@@ -26,7 +26,7 @@ code picks what it needs without recomputing.
 
 Two-pass design, adapted from the lab repo's ``mu_asof.py``:
 
-  1. One DuckDB join+aggregate PER MONTH, accumulated in Python: the
+  1. One DuckDB join+aggregate PER PARTITION (e.g. month), accumulated in Python: the
      embedding parquet has only RP_STORY_ID and EMBEDDING (no timestamp), so
      each month's embeddings file is joined to that SAME month's headlines
      file (identically named ``YYYY-MM.parquet`` in both artifacts) to get
@@ -379,10 +379,21 @@ def mu_asof_to_datalake(
 CHECKPOINT_DIR = "_daily"
 
 
+def _check_same_layout(headlines_artifact: Artifact, embeddings_artifact: Artifact) -> None:
+    """Pass 1 pairs the two artifacts' partitions file by file (same key)."""
+    from datalake.layout import layout_of
+
+    a, b = layout_of(headlines_artifact).freq, layout_of(embeddings_artifact).freq
+    if a != b:
+        raise ValueError(f"headlines ({a}) and embeddings ({b}) must share a partition "
+                         "frequency to be joined partition by partition")
+
+
 def _build_series(run: Any, headlines_artifact: Artifact, embeddings_artifact: Artifact,
                   delay: str, mode: str, pooling: str, threads: int) -> None:
-    """Both passes into ``run.out_dir``; pass 1 is checkpointed per month so an
-    interrupted run resumes without re-querying finished months."""
+    """Both passes into ``run.out_dir``; pass 1 is checkpointed per partition so an
+    interrupted run resumes without re-querying finished partitions."""
+    _check_same_layout(headlines_artifact, embeddings_artifact)
     ckpt_dir = run.out_dir / CHECKPOINT_DIR
     log.info("pass 1/2: daily embedding %s aggregates (SQL join, per month)", pooling)
     days, stats, counts = compute_daily_stats(

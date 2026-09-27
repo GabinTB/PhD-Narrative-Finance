@@ -46,6 +46,7 @@ import pandas as pd
 import polars as pl
 
 from datalake import Artifact, DatalakeError, DatalakeIndex
+from datalake.layout import Layout, layout_of
 from datalake.meta import git_commit
 from narrative_scoring.config import ScoringConfig, SentimentSplit
 from narrative_scoring.partitions import (
@@ -377,13 +378,27 @@ def headline_source(upstream: DatalakeIndex, chunk_size: int = 8_192, threads: i
     ``sentiment`` joined in."""
     hl = headlines or upstream.latest(KIND_HEADLINES)
     em = embeddings or upstream.latest(KIND_EMBEDDINGS)
+    layout = shared_layout(hl, em, *([sentiment] if sentiment is not None else []))
     sent = None
     if sentiment is not None:
         check_sentiment(sentiment, headlines_id=hl.artifact_id, column=sentiment_column)
-        sent = ParquetSentimentSource(sentiment.path, sentiment_column, sentiment.artifact_id)
+        sent = ParquetSentimentSource(sentiment.path, sentiment_column, sentiment.artifact_id,
+                                      layout=layout)
     return ParquetHeadlineSource(hl.path, em.path, chunk_size=chunk_size, threads=threads,
                                  source_id=f"{hl.artifact_id}+{em.artifact_id}",
-                                 sentiment=sent)
+                                 sentiment=sent, layout=layout)
+
+
+def shared_layout(*artifacts: Artifact) -> Layout:
+    """The one partition layout of artifacts read together file by file (headlines,
+    embeddings, sentiment); refuses artifacts partitioned differently."""
+    layouts = [layout_of(a) for a in artifacts]
+    freqs = {lay.freq for lay in layouts}
+    if len(freqs) != 1:
+        raise DatalakeError("artifacts read together must share a partition frequency: "
+                            + ", ".join(f"{a.artifact_id}={lay.freq}"
+                                        for a, lay in zip(artifacts, layouts)))
+    return Layout(freqs.pop())
 
 
 def sentiment_columns(art: Artifact) -> list[str]:
@@ -429,10 +444,10 @@ def resolve_sentiment(indexes: list[DatalakeIndex], *, headlines_id: str, column
 
 
 def earliest_headline_day(headlines: Artifact) -> date:
-    """First calendar day with a headline: min TIMESTAMP_UTC of the first monthly file."""
-    files = headlines.files()
+    """First calendar day with a headline: min TIMESTAMP_UTC of the first partition."""
+    files = list(layout_of(headlines).existing(headlines.path).values())
     if not files:
-        raise DatalakeError(f"{headlines.artifact_id} has no monthly files")
+        raise DatalakeError(f"{headlines.artifact_id} has no partition files")
     conn = duckdb.connect()
     try:
         row = conn.sql(

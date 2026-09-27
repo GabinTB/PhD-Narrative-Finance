@@ -107,3 +107,19 @@ def test_end_to_end_story_set_from_headlines(tmp_path: Path):
     assert np.isnan(out.row(5)[1:]).all()
     assert verify_artifact(art) == []
     dl.close()
+
+
+def test_quarterly_partition_reads_every_raw_month_it_spans(tmp_path: Path):
+    """A 2008Q1 headlines partition gets the scores of the Jan, Feb and Mar raw CSVs;
+    each raw month is read once (cached) when monthly/daily partitions reuse it."""
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    stem = "RavenPackAnalytics_AllEntities_1.0_2008"
+    with zipfile.ZipFile(raw / f"{stem}.zip", "w") as zf:
+        for month, sid in ((1, "J"), (2, "F"), (3, "M")):
+            zf.writestr(f"{stem}/2008-{month:02d}.csv", _csv([(sid, "0.10", "0.50", "100")]))
+    hl = tmp_path / "2008Q1.parquet"
+    pl.DataFrame({"RP_STORY_ID": ["J"]}).write_parquet(hl)
+    got = producer(raw)(hl, "t").sort("RP_STORY_ID")
+    assert got["RP_STORY_ID"].to_list() == ["F", "J", "M"]
+    assert got["SENT_CSS"].to_list() == pytest.approx([0.1, 0.1, 0.1])

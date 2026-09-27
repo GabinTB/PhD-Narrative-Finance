@@ -292,6 +292,12 @@ class _PartitionWriters:
             if count[0] == 0:
                 tmp.unlink(missing_ok=True)
                 continue
+            if self.layout.freq in ("W", "Q", "Y"):      # spans several raw months
+                ids = pq.read_table(tmp, columns=["RP_STORY_ID"]).column(0)
+                if len(ids) != len(ids.unique()):
+                    tmp.unlink(missing_ok=True)
+                    raise ValueError(f"partition {key}: a story id appears in more than one "
+                                     "raw month; refusing to write duplicate stories")
             tmp.replace(self.out_dir / f"{key}.parquet")
             self.written.append(key)
             log.info("wrote %s.parquet (%d stories) | RSS=%.1fGB", key, count[0], _rss_gb())

@@ -21,7 +21,7 @@ Sentiment is an optional side channel (``SentimentSource``): one SENT_* column
 of a ``headline_sentiment`` artifact (ravenpack/headlines/sentiment.py, the
 score database contract), LEFT JOINed on RP_STORY_ID in the same day query,
 so the score arrives in the same Arrow batch as the embedding, already
-aligned, with no per-row Python lookup. Strict: a missing month file or
+aligned, with no per-row Python lookup. Strict: a missing partition file or
 column, a scored headline without a sentiment row, or a value outside
 [-1, 1] raises; a NaN value is a legitimate "no score" and passes through.
 The score is a function of the story as published, hence available at the
@@ -43,6 +43,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from datalake.layout import Layout
 from narrative_scoring.schema import EMBEDDING_DIM
 
 log = logging.getLogger(__name__)
@@ -77,13 +78,13 @@ class Chunk:
 
 
 class SentimentSource(Protocol):
-    """Where a day's sentiment scores live: one column of monthly parquet files keyed by
-    RP_STORY_ID (the headline_sentiment contract)."""
+    """Where a day's sentiment scores live: one column of partitioned parquet files keyed
+    by RP_STORY_ID (the headline_sentiment contract)."""
 
     column: str
     artifact_id: str
 
-    def month_path(self, day: date) -> Path: ...
+    def partition_path(self, day: date) -> Path: ...
 
     def describe(self) -> str: ...
 
@@ -98,6 +99,7 @@ class ParquetSentimentSource:
     sentiment_dir: Path
     column: str
     artifact_id: str = ""
+    layout: Layout = field(default_factory=Layout)
 
     def __post_init__(self) -> None:
         self.sentiment_dir = Path(self.sentiment_dir)
@@ -105,8 +107,8 @@ class ParquetSentimentSource:
             raise ValueError(f"sentiment column must match {SCORE_COLUMN_RE.pattern}, "
                              f"got {self.column!r}")
 
-    def month_path(self, day: date) -> Path:
-        return self.sentiment_dir / month_file(day)
+    def partition_path(self, day: date) -> Path:
+        return self.layout.file_for(self.sentiment_dir, day)
 
     def describe(self) -> str:
         return f"{self.artifact_id or self.sentiment_dir.name}:{self.column}"
@@ -120,13 +122,14 @@ class HeadlineSource(Protocol):
     def describe(self) -> str: ...
 
 
-def month_file(day: date) -> str:
-    return f"{day.year}-{day.month:02d}.parquet"
-
-
 @dataclass
 class ParquetHeadlineSource:
-    """Monthly ``YYYY-MM.parquet`` headline + embedding artifacts, joined on RP_STORY_ID."""
+    """Partitioned headline + embedding artifacts, joined on RP_STORY_ID.
+
+    Both artifacts share one ``layout`` (an embedding partition has the key of the
+    headlines partition it was computed from), so a day is read from the one pair
+    of files that holds it, whatever the partition frequency.
+    """
 
     headlines_dir: Path
     embeddings_dir: Path
@@ -136,6 +139,7 @@ class ParquetHeadlineSource:
     temp_directory: str | None = "/tmp/duckdb_spill"
     source_id: str = ""
     sentiment: SentimentSource | None = None
+    layout: Layout = field(default_factory=Layout)
 
     def __post_init__(self) -> None:
         self.headlines_dir = Path(self.headlines_dir)
@@ -148,14 +152,14 @@ class ParquetHeadlineSource:
         return base if self.sentiment is None else f"{base}+sentiment:{self.sentiment.describe()}"
 
     def has_day(self, day: date) -> bool:
-        name = month_file(day)
-        return (self.headlines_dir / name).exists() and (self.embeddings_dir / name).exists()
+        return (self.layout.file_for(self.headlines_dir, day).exists()
+                and self.layout.file_for(self.embeddings_dir, day).exists())
 
     def iter_day(self, day: date) -> Iterator[Chunk]:
         if not self.has_day(day):
             return
-        name = month_file(day)
-        hl, emb = self.headlines_dir / name, self.embeddings_dir / name
+        hl = self.layout.file_for(self.headlines_dir, day)
+        emb = self.layout.file_for(self.embeddings_dir, day)
         day_after = (day + timedelta(days=1)).isoformat()
         sent_cols, sent_join = "", ""
         if self.sentiment is not None:
@@ -191,11 +195,11 @@ class ParquetHeadlineSource:
             conn.close()
 
     def _sentiment_file(self, day: date) -> Path:
-        """The day's sentiment month file, after the file and column checks."""
+        """The day's sentiment partition file, after the file and column checks."""
         assert self.sentiment is not None
-        path = self.sentiment.month_path(day)
+        path = self.sentiment.partition_path(day)
         if not path.exists():
-            raise FileNotFoundError(f"{day}: sentiment month file missing: {path} "
+            raise FileNotFoundError(f"{day}: sentiment partition file missing: {path} "
                                     f"({self.sentiment.describe()})")
         schema = pq.read_schema(path)
         col = self.sentiment.column

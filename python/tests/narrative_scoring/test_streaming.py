@@ -9,16 +9,20 @@ import polars as pl
 import pyarrow as pa
 import pytest
 
+from datalake.layout import Layout
 from narrative_scoring.schema import EMBEDDING_DIM
 from narrative_scoring.streaming import (
     InMemoryHeadlineSource,
     ParquetHeadlineSource,
     ParquetSentimentSource,
     arrow_embeddings_to_numpy,
-    month_file,
     prefetch,
     rss_gb,
 )
+
+
+def _file(day):
+    return Layout().file_for(Path('.'), day).name
 
 
 def _write_month(root: Path, per_day: dict[date, np.ndarray]) -> tuple[Path, Path]:
@@ -34,7 +38,7 @@ def _write_month(root: Path, per_day: dict[date, np.ndarray]) -> tuple[Path, Pat
     em = pl.DataFrame({"RP_STORY_ID": ids[::-1], "EMBEDDING": embs[::-1]},
                       schema={"RP_STORY_ID": pl.String,
                               "EMBEDDING": pl.Array(pl.Float16, EMBEDDING_DIM)})
-    name = month_file(next(iter(per_day)))
+    name = _file(next(iter(per_day)))
     hl.write_parquet(hl_dir / name)
     em.write_parquet(em_dir / name)
     return hl_dir, em_dir
@@ -86,7 +90,7 @@ def _write_sentiment(root: Path, day: date, n: int, *, drop: int | None = None,
         vals[1] = value
     pl.DataFrame({"RP_STORY_ID": ids, column: pl.Series(vals, dtype=dtype),
                   "P_POS": pl.Series([0.5] * len(ids), dtype=pl.Float32)}) \
-        .write_parquet(d / month_file(day))
+        .write_parquet(d / _file(day))
     return d
 
 
@@ -126,7 +130,7 @@ def test_sentiment_missing_month_file_and_bad_column_name(month, tmp_path):
     _, src = month
     (tmp_path / "empty").mkdir()
     src.sentiment = ParquetSentimentSource(tmp_path / "empty", "SENT_X")
-    with pytest.raises(FileNotFoundError, match="sentiment month file missing"):
+    with pytest.raises(FileNotFoundError, match="sentiment partition file missing"):
         list(src.iter_day(D))
     with pytest.raises(ValueError, match="SENT_"):
         ParquetSentimentSource(tmp_path, "P_POS")
