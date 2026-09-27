@@ -572,6 +572,39 @@ def build_tau_asof(
     return dl.get(run.artifact_id)
 
 
+def check_scoring_lineage(dl: DatalakeIndex, *, hl: Artifact, em: Artifact,
+                          mu_art: Artifact | None, parts_art: Artifact | None,
+                          tau_hp: dict[str, Any],
+                          calendar: CalibrationCalendar = DEFAULT_CALENDAR) -> None:
+    """Refuse a run that would combine artifacts built from different inputs (before
+    any work): the embeddings must come from the scored headlines; mu_asof from those
+    headlines and embeddings; the null partitions and the tau series this run extends
+    from those headlines / embeddings / mu_asof (and tau from those partitions). An
+    artifact that records no source of a kind (legacy, migrated) is only warned about.
+    The partitions / tau caches are keyed by config, taxonomy and primitive recipe, not
+    by these inputs: without this check new embeddings would silently extend a null
+    distribution and tau series built from the old ones."""
+    from datalake.lineage import require_lineage
+
+    mu_id = mu_art.artifact_id if mu_art else None
+    tau_art = None
+    for partial in (False, True):                 # the series build_tau_asof would extend
+        try:
+            tau_art = latest_matching(dl, KIND_TAU_ASOF, partial=partial,
+                                      **_lookup(tau_hp, calendar))
+            break
+        except DatalakeError:
+            continue
+    require_lineage([
+        (em, {KIND_HEADLINES: hl.artifact_id}),
+        (mu_art, {KIND_HEADLINES: hl.artifact_id, KIND_EMBEDDINGS: em.artifact_id}),
+        (parts_art, {KIND_HEADLINES: hl.artifact_id, KIND_EMBEDDINGS: em.artifact_id,
+                     KIND_MU_ASOF: mu_id}),
+        (tau_art, {KIND_PARTITIONS: parts_art.artifact_id if parts_art else None,
+                   KIND_MU_ASOF: mu_id}),
+    ], what="scoring")
+
+
 def calibration_as_of(dl: DatalakeIndex, config: ScoringConfig, table: PrimitiveTable,
                       emb_key: str, *, upstream: DatalakeIndex | None = None,
                       window: str = WINDOW_DEFAULT, seed: int = 0,
@@ -658,6 +691,10 @@ class ScoringJob(Job):
         emb_key = embedding_key(P, primitive_meta)
         parts_art = (dl.get(resume["partitions"]) if resume
                      else find_partitions(dl, config, table, emb_key, seed, temp, calendar))
+        check_scoring_lineage(dl, hl=hl, em=em, mu_art=mu_art, parts_art=parts_art,
+                              tau_hp=tau_params(config, table, emb_key, window, seed, temp,
+                                                calendar),
+                              calendar=calendar)
         have = (set(load_partitions(parts_art.path)["MONTH_END"].to_list())
                 if parts_art else set())
         # periods that end before the first mu_asof row can never be corrected, hence

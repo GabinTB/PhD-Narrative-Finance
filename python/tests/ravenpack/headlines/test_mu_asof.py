@@ -323,3 +323,25 @@ def test_killed_job_resumes_from_checkpoints(tmp_path, monkeypatch):
     got = pl.read_parquet(next(done.path.glob("*.parquet")))
     assert got["DATE"].to_list() == want["DATE"].to_list() and got["N"].equals(want["N"])
     np.testing.assert_array_equal(np.stack(got["MU"].to_list()), np.stack(want["MU"].to_list()))
+
+
+def test_embeddings_of_other_headlines_are_refused(tmp_path):
+    from datalake import DatalakeIndex
+    from datalake.lineage import LineageError
+    from ravenpack.headlines.mu_asof import MuAsofJob
+
+    index = DatalakeIndex(tmp_path / "lake")
+    arts = []
+    for name in ("old", "new"):
+        with index.run(kind="ravenpack_headlines", pipeline="t", pipeline_version="v0",
+                       hyperparams={"name": name}) as r:
+            pass
+        arts.append(index.get(r.artifact_id))
+    with index.run(kind="headline_embeddings", pipeline="t", pipeline_version="v0",
+                   sources=[arts[0]]) as r:
+        pass
+    emb = index.get(r.artifact_id)
+    with pytest.raises(LineageError, match="was built from ravenpack_headlines"):
+        MuAsofJob(arts[1], emb, "1d", "expanding")
+    MuAsofJob(arts[0], emb, "1d", "expanding")            # its own headlines: fine
+    index.close()

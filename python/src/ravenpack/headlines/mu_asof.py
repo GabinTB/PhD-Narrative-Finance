@@ -333,6 +333,10 @@ class MuAsofJob(Job):
         if pooling not in POOLINGS:
             raise ValueError(f"pooling must be one of {POOLINGS}, got {pooling!r}")
         _check_same_layout(headlines, embeddings)
+        from datalake.lineage import require_lineage
+
+        require_lineage([(embeddings, {SOURCE_HEADLINES_KIND: headlines.artifact_id})],
+                        what="mu_asof")
         self.headlines, self.embeddings = headlines, embeddings
         self.delay, self.mode, self.pooling = delay, mode, pooling
         self.threads, self.temp = threads, temp

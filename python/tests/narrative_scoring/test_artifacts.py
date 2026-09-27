@@ -631,3 +631,61 @@ def test_scoring_job_pauses_at_a_period_boundary_and_resumes_identically(
     done = lake.get(s["narrative_daily_id"])
     assert not done.partial and STATE_FILE not in done.file_hashes
     assert JobState.read(done.path).status == "complete"
+
+
+# ---------------------------------------------------------------------------
+# Lineage pre-flight: never combine artifacts built from different inputs
+# ---------------------------------------------------------------------------
+
+def _score(lake, start, end, cfg, table, P):
+    months = [(2008, m) for m in range(1, 7)]
+    return A.score_range_to_datalake(lake, start, end, cfg, table=table, P=P,
+                                     source=_source(table, P, months), window="5Y",
+                                     use_kernel=False, temp=True)
+
+
+def test_new_embeddings_refuse_to_extend_partitions_and_tau_built_from_the_old(
+        tmp_path, toy_table, toy_embeddings, cfg):
+    from datalake.lineage import LineageError
+
+    lake = _make_lake(tmp_path / "lake")
+    _score(lake, date(2008, 1, 1), date(2008, 4, 30), cfg, toy_table, toy_embeddings)
+    hl = lake.latest(A.KIND_HEADLINES)
+    with lake.run(kind=A.KIND_EMBEDDINGS, pipeline="t", pipeline_version="v1",
+                  sources=[hl]) as r:                      # re-embedded corpus
+        (r.out_dir / "2008-01.parquet").write_bytes(b"1")
+    new_em = lake.get(r.artifact_id)
+    with lake.run(kind=A.KIND_MU_ASOF, pipeline="t", pipeline_version="v1",
+                  sources=[hl, new_em]) as r:              # its mu_asof, recomputed
+        _mu_df([date(2008, 2, 1), date(2008, 7, 1)]).write_parquet(r.out_dir / "mu.parquet")
+    n_runs = len(lake.list(A.KIND_NARRATIVE_DAILY, include_partial=True))
+    with pytest.raises(LineageError) as exc:
+        _score(lake, date(2008, 5, 1), date(2008, 6, 30), cfg, toy_table, toy_embeddings)
+    msg = str(exc.value)
+    assert A.KIND_PARTITIONS in msg and new_em.artifact_id in msg    # partitions: old em
+    assert "tau_asof" in msg                                         # tau: old mu_asof
+    assert len(lake.list(A.KIND_NARRATIVE_DAILY, include_partial=True)) == n_runs
+
+
+def test_mu_asof_built_from_other_embeddings_is_refused(tmp_path, toy_table,
+                                                         toy_embeddings, cfg):
+    from datalake.lineage import LineageError
+
+    lake = _make_lake(tmp_path / "lake")
+    hl, old_em = lake.latest(A.KIND_HEADLINES), lake.latest(A.KIND_EMBEDDINGS)
+    with lake.run(kind=A.KIND_EMBEDDINGS, pipeline="t", pipeline_version="v1",
+                  sources=[hl]) as r:
+        (r.out_dir / "2008-01.parquet").write_bytes(b"1")
+    with lake.run(kind=A.KIND_MU_ASOF, pipeline="t", pipeline_version="v1",
+                  sources=[hl, old_em]) as r:              # latest mu_asof, stale source
+        _mu_df([date(2008, 2, 1), date(2008, 7, 1)]).write_parquet(r.out_dir / "mu.parquet")
+    with pytest.raises(LineageError, match=r"mu_asof.*built from headline_embeddings"):
+        _score(lake, date(2008, 3, 1), date(2008, 3, 31), cfg, toy_table, toy_embeddings)
+
+
+def test_unrecorded_lineage_warns_and_runs(tmp_path, toy_table, toy_embeddings, cfg, caplog):
+    lake = _make_lake(tmp_path / "lake")          # upstream registered without sources
+    with caplog.at_level(logging.WARNING, logger="datalake.lineage"):
+        s = _score(lake, date(2008, 3, 1), date(2008, 3, 31), cfg, toy_table, toy_embeddings)
+    assert s["narrative_daily_id"]
+    assert "records no ravenpack_headlines source" in caplog.text
