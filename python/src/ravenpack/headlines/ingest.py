@@ -1,14 +1,23 @@
 """RavenPack Annotations 1.0 ingestion pipeline.
 
-Reads raw per-year zip files (one CSV per month inside each zip) and writes
-one structured parquet per month under the output directory.
+Reads raw per-year zip files (one CSV per month inside each zip, the vendor's
+fixed layout) and writes one structured parquet per PARTITION of the chosen
+``partition_freq`` (``datalake.layout``; default M = today's monthly files).
 
 Raw layout (expected on disk):
     {raw_dir}/RavenPackAnalytics_AllEntities_1.0_{year}.zip
         {stem}/{year}-{month:02d}.csv   <- one CSV per month inside the zip
 
-Output layout:
-    {out_dir}/{year}-{month:02d}.parquet
+Output layout (``datalake.layout.Layout``):
+    {out_dir}/{period key}.parquet     2008-01 (M), 2008-01-15 (D), 2008-W03 (W),
+                                       2008Q1 (Q), 2008 (Y)
+
+Routing raw rows to partitions: for M / Q / Y a raw month belongs to exactly one
+partition and all its rows go there (M reproduces the historical files byte for
+byte); for D / W rows go by their TIMESTAMP_UTC date, and a row dated outside
+its raw month raises instead of being silently misplaced. A partition is
+written (atomically) once every raw month it spans has been read; ranges are
+rounded out to whole periods, so a partition always holds a complete period.
 
 Processing per month:
     1. Stream-read the CSV in chunks (raw_chunk_rows at a time) to bound RAM.
@@ -29,6 +38,7 @@ import os
 import time
 import zipfile
 from collections.abc import Iterator
+from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -36,6 +46,8 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from datalake.layout import Layout, layout_from_hyperparams
+from datalake.periods import period_key, periods
 from ravenpack.headlines.schema import (
     ENTITY_LIST_COLS,
     RAW_COLUMNS,
@@ -244,163 +256,157 @@ def _to_arrow_table(df: pd.DataFrame) -> pa.Table:
 
 
 # ---------------------------------------------------------------------------
-# Month writer
+# Partition writers and the public entry point
 # ---------------------------------------------------------------------------
 
-def _write_month(
-    df_iter: Iterator[pd.DataFrame],
-    out_path: Path,
-    tag: str,
-    log_every: int,
-) -> int:
-    """Write one month's structured parquet from a stream of deduped frames.
+def whole_periods(layout: Layout) -> Layout:
+    """The layout with its range rounded out to whole periods."""
+    first, last = layout.expected()[0], layout.expected()[-1]
+    return Layout(layout.freq, first.first, last.last)
 
-    Atomic: writes to a .tmp file first, renames on success.  A partial run
-    never leaves a file that looks complete.
-    """
-    tmp = out_path.with_suffix(".parquet.tmp")
-    writer = pq.ParquetWriter(tmp, STRUCTURED_SCHEMA, compression="zstd")
-    n_written = 0
-    next_report = log_every
-    t0 = time.monotonic()
 
-    try:
-        for df in df_iter:
-            if df.empty:
+class _PartitionWriters:
+    """Lazily opened atomic writers, one per partition key, closed when complete."""
+
+    def __init__(self, out_dir: Path, layout: Layout, log_every: int) -> None:
+        self.out_dir, self.layout, self.log_every = out_dir, layout, log_every
+        self.open: dict[str, tuple[pq.ParquetWriter, Path, list[int]]] = {}
+        self.written: list[str] = []
+
+    def append(self, key: str, df: pd.DataFrame) -> None:
+        if df.empty:
+            return
+        if key not in self.open:
+            tmp = self.out_dir / f"{key}.parquet.tmp"
+            self.open[key] = (pq.ParquetWriter(tmp, STRUCTURED_SCHEMA, compression="zstd"),
+                              tmp, [0])
+        writer, _, count = self.open[key]
+        writer.write_table(_to_arrow_table(df))
+        count[0] += len(df)
+
+    def close_through(self, day: date) -> None:
+        """Finalise every open partition whose last day is <= ``day``."""
+        for key in [k for k in self.open if _last_day(k) <= day]:
+            writer, tmp, count = self.open.pop(key)
+            writer.close()
+            if count[0] == 0:
+                tmp.unlink(missing_ok=True)
                 continue
-            writer.write_table(_to_arrow_table(df))
-            n_written += len(df)
-            if n_written >= next_report:
-                rate = n_written / max(time.monotonic() - t0, 1e-9)
-                log.info(
-                    "%s  %d stories | %.0f/s | RSS=%.1fGB",
-                    tag, n_written, rate, _rss_gb(),
-                )
-                next_report = n_written + log_every
-            del df
-    except BaseException:
-        writer.close()
-        tmp.unlink(missing_ok=True)
-        raise
+            tmp.replace(self.out_dir / f"{key}.parquet")
+            self.written.append(key)
+            log.info("wrote %s.parquet (%d stories) | RSS=%.1fGB", key, count[0], _rss_gb())
 
-    writer.close()
-
-    if n_written == 0:
-        tmp.unlink(missing_ok=True)
-        return 0
-
-    tmp.replace(out_path)
-    return n_written
+    def abort(self) -> None:
+        for writer, tmp, _ in self.open.values():
+            writer.close()
+            tmp.unlink(missing_ok=True)
+        self.open.clear()
 
 
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
+def _last_day(key: str) -> date:
+    from datalake.periods import parse_key
+
+    return parse_key(key).last
+
 
 def ingest_range(
     raw_dir: Path,
     out_dir: Path,
-    start_year: int,
-    end_year: int,                    # inclusive
+    start_year: int | None = None,
+    end_year: int | None = None,                    # inclusive
     raw_chunk_rows: int = 2_000_000,
     log_every: int = 100_000,
     overwrite: bool = False,
+    *,
+    layout: Layout | None = None,
 ) -> None:
-    """Ingest all months in [start_year, end_year] from raw zip files.
+    """Ingest every partition of ``layout`` (or the monthly layout of [start_year,
+    end_year], the historical call) from the raw zip files.
 
     Args:
         raw_dir:        Directory containing the per-year zip files.
         out_dir:        Destination for structured parquets (created if absent).
-        start_year:     First year to process (inclusive).
-        end_year:       Last year to process (inclusive).
+        start_year / end_year: legacy monthly range (inclusive years).
         raw_chunk_rows: Raw CSV rows read per chunk.  Lower this if RSS
                         climbs during the read phase on high-volume months.
         log_every:      Emit a progress line roughly every N stories written.
-        overwrite:      Re-process months whose output file already exists.
+        overwrite:      Re-process partitions whose output file already exists.
+        layout:         Partition frequency and range (rounded out to whole periods).
     """
+    if layout is None:
+        if start_year is None or end_year is None:
+            raise ValueError("give a layout or start_year/end_year")
+        layout = Layout("M", date(start_year, 1, 1), date(end_year, 12, 31))
+    layout = whole_periods(layout)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    all_months = [
-        (y, m)
-        for y in range(start_year, end_year + 1)
-        for m in range(1, 13)
-    ]
-    if overwrite:
-        todo = all_months
-    else:
-        todo = [
-            (y, m)
-            for y, m in all_months
-            if not (out_dir / f"{y}-{m:02d}.parquet").exists()
-        ]
-
-    n_all = len(all_months)
-    n_done = n_all - len(todo)
-    log.info(
-        "ingest: %d/%d months already done, %d to process (overwrite=%s)",
-        n_done, n_all, len(todo), overwrite,
-    )
+    parts = layout.expected()
+    todo = {p.key for p in parts
+            if overwrite or not layout.path_of(out_dir, p).exists()}
+    log.info("ingest: %d/%d %s partitions already done, %d to process (overwrite=%s)",
+             len(parts) - len(todo), len(parts), layout.freq, len(todo), overwrite)
     if not todo:
         log.info("nothing to do")
         return
+    raw_months = sorted({(m.first.year, m.first.month) for p in parts if p.key in todo
+                         for m in periods(p.first, p.last, "M")})
 
-    total = len(todo)
-    processed = 0
+    writers = _PartitionWriters(out_dir, layout, log_every)
     open_year: int | None = None
     zf: zipfile.ZipFile | None = None
-
+    t0, n_total = time.monotonic(), 0
     try:
-        for i, (year, month) in enumerate(todo, 1):
-            tag = f"[{i}/{total}] {year}-{month:02d}"
-
+        for i, (year, month) in enumerate(raw_months, 1):
+            tag = f"[{i}/{len(raw_months)}] {year}-{month:02d}"
+            month_last = periods(date(year, month, 1), date(year, month, 1), "M")[0].last
             zip_path = raw_dir / _ZIP_NAME.format(year=year)
             if not zip_path.exists():
                 log.warning("%s  skip: zip not found at %s", tag, zip_path)
+                writers.close_through(month_last)
                 continue
-
             if open_year != year:
                 if zf is not None:
                     zf.close()
                 zf = zipfile.ZipFile(zip_path)
                 open_year = year
-
-            stem = zip_path.stem
-            member = _MEMBER_NAME.format(stem=stem, year=year, month=month)
+            member = _MEMBER_NAME.format(stem=zip_path.stem, year=year, month=month)
             if member not in zf.namelist():
                 log.warning("%s  skip: member %s not in zip", tag, member)
+                writers.close_through(month_last)
                 continue
 
-            out_path = out_dir / f"{year}-{month:02d}.parquet"
-            t_month = time.monotonic()
-            log.info(
-                "%s  start (raw_chunk_rows=%d)",
-                tag, raw_chunk_rows,
-            )
-
-            n = _write_month(
-                _iter_month_deduped(zf, member, raw_chunk_rows, tag),
-                out_path,
-                tag,
-                log_every,
-            )
-
-            if n == 0:
-                log.warning("%s  skip: no stories after dedup", tag)
-                continue
-
-            elapsed = time.monotonic() - t_month
-            log.info(
-                "%s  wrote %s (%d stories in %.0fs, %.0f/s) | RSS=%.1fGB",
-                tag, out_path.name, n, elapsed,
-                n / max(elapsed, 1e-9), _rss_gb(),
-            )
-            processed += 1
-
+            log.info("%s  start (raw_chunk_rows=%d)", tag, raw_chunk_rows)
+            month_key = f"{year}-{month:02d}"
+            for df in _iter_month_deduped(zf, member, raw_chunk_rows, tag):
+                if df.empty:
+                    continue
+                if layout.freq in ("M", "Q", "Y"):       # the raw month's own partition
+                    key = period_key(date(year, month, 1), layout.freq)
+                    if key in todo:
+                        writers.append(key, df)
+                else:                                    # D / W: by the row's date
+                    days = df["TIMESTAMP_UTC"].astype(str).str.slice(0, 10)
+                    outside = days.str.slice(0, 7) != month_key
+                    if outside.any():
+                        raise ValueError(f"{tag}: {int(outside.sum())} row(s) dated outside "
+                                         f"{month_key} (e.g. {days[outside].iloc[0]})")
+                    for day_str, part in df.groupby(days, sort=True):
+                        key = period_key(date.fromisoformat(day_str), layout.freq)
+                        if key in todo:
+                            writers.append(key, part)
+                n_total += len(df)
+            writers.close_through(month_last)
+        writers.close_through(layout.end)
+    except BaseException:
+        writers.abort()
+        raise
     finally:
         if zf is not None:
             zf.close()
 
-    log.info("ingest done: %d/%d months written to %s", processed, total, out_dir)
+    elapsed = time.monotonic() - t0
+    log.info("ingest done: %d partition(s) written to %s (%d stories, %.0f/s)",
+             len(writers.written), out_dir, n_total, n_total / max(elapsed, 1e-9))
 
 
 # ---------------------------------------------------------------------------
@@ -410,9 +416,10 @@ def ingest_range(
 def ingest_to_datalake(
     index: DatalakeIndex,
     raw_dir: Path,
-    start_year: int,
-    end_year: int,
+    start_year: int | None = None,
+    end_year: int | None = None,
     *,
+    layout: Layout | None = None,
     pipeline: str = "PhD-Narrative-Finance",
     pipeline_version: str,
     pipeline_repo: str | None = None,
@@ -441,8 +448,9 @@ def ingest_to_datalake(
     Args:
         index:            Datalake index to register the artifact in.
         raw_dir:          Directory containing the per-year zip files.
-        start_year:       First year to ingest (inclusive).
-        end_year:         Last year to ingest (inclusive).
+        start_year / end_year: legacy monthly range (inclusive years).
+        layout:           Partition frequency and range (default: monthly over
+                          [start_year, end_year]); recorded in the hyperparams.
         pipeline:         Producing repo name, recorded in provenance.
         pipeline_version: Semantic version of this pipeline.
         pipeline_repo:    URL of the producing repo.
@@ -453,12 +461,12 @@ def ingest_to_datalake(
     Returns:
         The completed Artifact.
     """
-    hyperparams = {
-        "start_year": start_year,
-        "end_year": end_year,
-        # "raw_dir": str(raw_dir),
-        # "columns": ",".join(RAW_COLUMNS),
-    }
+    if layout is None:
+        if start_year is None or end_year is None:
+            raise ValueError("give a layout or start_year/end_year")
+        layout = Layout("M", date(start_year, 1, 1), date(end_year, 12, 31))
+    layout = whole_periods(layout)
+    hyperparams = layout.hyperparams()
     notes = f"raw_dir={raw_dir} columns={','.join(RAW_COLUMNS)}"
 
     with index.run(
@@ -472,22 +480,15 @@ def ingest_to_datalake(
         verifier=KIND,
         hash_pattern="*.parquet",
     ) as run:
-        ingest_range(
-            raw_dir=raw_dir,
-            out_dir=run.out_dir,
-            start_year=start_year,
-            end_year=end_year,
-            raw_chunk_rows=raw_chunk_rows,
-            log_every=log_every,
-            overwrite=False,
-        )
-        n_months = len(list(run.out_dir.glob("*.parquet")))
-        if n_months == 0:
+        ingest_range(raw_dir=raw_dir, out_dir=run.out_dir, raw_chunk_rows=raw_chunk_rows,
+                     log_every=log_every, overwrite=False, layout=layout)
+        n_parts = len(layout.existing(run.out_dir))
+        if n_parts == 0:
             raise RuntimeError(
-                f"ingest produced no output for {start_year}-{end_year}; "
+                f"ingest produced no output for {layout.start}..{layout.end}; "
                 f"check that {raw_dir} contains the expected zip files"
             )
-        run.note(f"{n_months} monthly files ingested")
+        run.note(f"{n_parts} {layout.freq} partition(s) ingested")
 
     return index.get(run.artifact_id)
 
@@ -499,7 +500,7 @@ def verify_artifact(artifact: "Artifact") -> list:
     """Verify a ravenpack_headlines artifact's content matches its declared scope.
 
     Registered as the `ravenpack_headlines` entry point.  Checks:
-      - one parquet per month in [start_year, end_year], none missing
+      - one parquet per partition of the declared layout, none missing
       - no parquet outside the declared range
       - a sample of files are non-empty and match STRUCTURED_SCHEMA
     """
@@ -509,31 +510,23 @@ def verify_artifact(artifact: "Artifact") -> list:
 
     findings: list = []
     aid = artifact.artifact_id
-    hp = artifact.meta.hyperparams
-    start_year = hp.get("start_year")
-    end_year = hp.get("end_year")
-
-    if start_year is None or end_year is None:
+    layout = layout_from_hyperparams(artifact.meta.hyperparams)
+    if layout.start is None or layout.end is None:
         findings.append(Finding(
-            Severity.WARNING, aid,
-            "no start_year/end_year in hyperparams; cannot verify date coverage",
+            Severity.WARNING, aid, "no declared range in hyperparams; cannot verify coverage",
         ))
         return findings
 
     present = {p.name for p in artifact.path.glob("*.parquet")}
-    expected = {
-        f"{y}-{m:02d}.parquet"
-        for y in range(start_year, end_year + 1)
-        for m in range(1, 13)
-    }
+    expected = {f"{p.key}.parquet" for p in layout.expected()}
 
     missing = expected - present
     if missing:
-        # Missing months are a WARNING not ERROR: raw zips genuinely lack some
+        # Missing partitions are a WARNING not ERROR: raw zips genuinely lack some
         # months, but a complete artifact should surface the gap.
         findings.append(Finding(
             Severity.WARNING, aid,
-            f"{len(missing)} of {len(expected)} declared months missing: "
+            f"{len(missing)} of {len(expected)} declared {layout.freq} partitions missing: "
             f"{', '.join(sorted(missing)[:6])}"
             + (" ..." if len(missing) > 6 else ""),
         ))
@@ -543,7 +536,7 @@ def verify_artifact(artifact: "Artifact") -> list:
         findings.append(Finding(
             Severity.ERROR, aid,
             f"{len(unexpected)} parquet(s) outside declared range "
-            f"[{start_year}, {end_year}]: {', '.join(sorted(unexpected)[:6])}",
+            f"[{layout.start}, {layout.end}]: {', '.join(sorted(unexpected)[:6])}",
         ))
 
     # Deep-check a sample: first, middle, last present file.

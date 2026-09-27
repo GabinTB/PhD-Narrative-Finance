@@ -498,3 +498,103 @@ def test_script_resume_completes_a_killed_ingest(tmp_path, monkeypatch):
         assert not done.partial and done.artifact_id == part.artifact_id
         assert {"2010-01.parquet", "2010-02.parquet"} <= set(done.file_hashes)
         assert len(done.meta.runs) == 2
+
+
+# ---------------------------------------------------------------------------
+# Partition frequencies (datalake.layout): same content, other partitioning
+# ---------------------------------------------------------------------------
+
+def _month_df(year: int, month: int, n: int = 6) -> pd.DataFrame:
+    """n stories spread over the month (two detections each), one per ~5 days."""
+    rows = []
+    for i in range(n):
+        day = min(1 + 5 * i, 28)
+        ts = f"{year}-{month:02d}-{day:02d} 0{i % 9}:00:00"
+        for e in (1, 2):
+            rows.append({"TIMESTAMP_UTC": ts, "RP_STORY_ID": f"S{year}{month:02d}{i}",
+                         "RP_ENTITY_ID": f"E{e}", "ENTITY_TYPE": "COMP",
+                         "ENTITY_NAME": f"N{e}", "COUNTRY_CODE": "US",
+                         "NEWS_TYPE": "FULL-ARTICLE", "SOURCE_NAME": "Reuters",
+                         "HEADLINE": f"H{i}", "EVENT_SENTIMENT_SCORE": 0.1 * e})
+    return pd.DataFrame(rows)
+
+
+def _raw_2010(tmp_path: Path, months=(1, 2, 3, 4)) -> Path:
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    for m in months:
+        _make_zip(raw, 2010, m, _month_df(2010, m))
+    return raw
+
+
+def _all_rows(out: Path) -> pd.DataFrame:
+    import polars as pl
+
+    frames = [pl.read_parquet(p) for p in sorted(out.glob("*.parquet"))]
+    return pl.concat(frames).sort("RP_STORY_ID").to_pandas()
+
+
+@pytest.mark.parametrize("freq", ["D", "W", "Q", "Y"])
+def test_other_partitionings_hold_exactly_the_monthly_content(tmp_path, freq):
+    from datetime import date
+
+    from datalake.layout import Layout
+
+    raw = _raw_2010(tmp_path)
+    monthly, other = tmp_path / "M", tmp_path / freq
+    ingest_range(raw, monthly, layout=Layout("M", date(2010, 1, 1), date(2010, 4, 30)))
+    ingest_range(raw, other, layout=Layout(freq, date(2010, 1, 1), date(2010, 4, 30)))
+    lay = Layout(freq)
+    for key, path in lay.existing(other).items():                 # every row in its period
+        import polars as pl
+
+        days = pl.read_parquet(path)["TIMESTAMP_UTC"].str.slice(0, 10).to_list()
+        from datalake.periods import parse_key
+
+        period = parse_key(key)
+        assert all(period.contains(date.fromisoformat(d)) for d in days)
+    pd.testing.assert_frame_equal(_all_rows(monthly), _all_rows(other))
+
+
+def test_week_straddling_two_months_is_complete(tmp_path):
+    from datetime import date
+
+    from datalake.layout import Layout
+
+    raw = _raw_2010(tmp_path)
+    out = tmp_path / "W"
+    ingest_range(raw, out, layout=Layout("W", date(2010, 1, 25), date(2010, 2, 7)))
+    # ISO week 2010-W04 = Jan 25..31, W05 = Feb 1..7; stories on Jan 26 and Feb 1/6
+    assert set(Layout("W").existing(out)) == {"2010-W04", "2010-W05"}
+
+
+def test_row_dated_outside_its_raw_month_raises_for_daily(tmp_path):
+    from datetime import date
+
+    from datalake.layout import Layout
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    bad = _month_df(2010, 1)
+    bad.loc[0:1, "TIMESTAMP_UTC"] = "2010-02-01 00:00:00"
+    _make_zip(raw, 2010, 1, bad)
+    with pytest.raises(ValueError, match="outside 2010-01"):
+        ingest_range(raw, tmp_path / "D", layout=Layout("D", date(2010, 1, 1), date(2010, 1, 31)))
+    assert not list((tmp_path / "D").glob("*.parquet*"))           # nothing half-written
+
+
+def test_datalake_records_the_layout(tmp_path):
+    from datetime import date
+
+    from datalake.layout import Layout, layout_of
+
+    raw = _raw_2010(tmp_path, months=(1, 2))
+    with DatalakeIndex(tmp_path / "dl") as index:
+        art = ingest_to_datalake(index, raw, layout=Layout("Q", date(2010, 1, 15),
+                                                           date(2010, 2, 20)),
+                                 pipeline_version="v0.2.0")
+        assert layout_of(art) == Layout("Q", date(2010, 1, 1), date(2010, 3, 31))
+        assert list(layout_of(art).existing(art.path)) == ["2010Q1"]
+        from ravenpack.headlines.ingest import verify_artifact
+
+        assert verify_artifact(art) == []

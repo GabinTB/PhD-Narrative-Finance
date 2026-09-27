@@ -153,15 +153,12 @@ def _resume(index, artifact_id, raw_dir_override, raw_chunk_rows, log_every):
         )
         return None
 
-    recorded = artifact.meta.hyperparams
-    start_year = recorded.get("start_year")
-    end_year = recorded.get("end_year")
+    from datalake.layout import layout_from_hyperparams
 
-    if start_year is None or end_year is None:
-        log.error(
-            "artifact %s has no start_year/end_year in hyperparams.",
-            artifact_id,
-        )
+    recorded = artifact.meta.hyperparams
+    layout = layout_from_hyperparams(recorded)          # legacy start_year/end_year -> M
+    if layout.start is None or layout.end is None:
+        log.error("artifact %s declares no range in its hyperparams.", artifact_id)
         return None
 
     if raw_dir_override is not None and raw_dir_override.is_dir():
@@ -181,10 +178,9 @@ def _resume(index, artifact_id, raw_dir_override, raw_chunk_rows, log_every):
 
     from ravenpack.headlines.ingest import KIND
 
-    expected_months = (end_year - start_year + 1) * 12
-    log.info("resuming %s | start_year=%d end_year=%d | %d/%d months done",
-             artifact_id, start_year, end_year,
-             len(list(artifact.path.glob("*.parquet"))), expected_months)
+    expected = len(layout.expected())
+    log.info("resuming %s | %s partitions %s..%s | %d/%d done", artifact_id, layout.freq,
+             layout.start, layout.end, len(layout.existing(artifact.path)), expected)
     # The datalake reopens the partial artifact only with its own hyperparams and
     # completes it in place (a new execution record; the crashed one is kept).
     with index.run(kind=KIND, pipeline=artifact.meta.pipeline,
@@ -192,16 +188,15 @@ def _resume(index, artifact_id, raw_dir_override, raw_chunk_rows, log_every):
                    pipeline_repo=artifact.meta.pipeline_repo, hyperparams=recorded,
                    verifier=artifact.meta.verifier, hash_pattern="*.parquet",
                    resume=artifact_id) as run:
-        ingest_range(raw_dir=raw_dir, out_dir=run.out_dir, start_year=start_year,
-                     end_year=end_year, raw_chunk_rows=raw_chunk_rows, log_every=log_every,
-                     overwrite=False)
-        n_months = len(list(run.out_dir.glob("*.parquet")))
-        if n_months == 0:
-            raise RuntimeError("still no output after resume -- check raw_dir and year range")
-        if n_months < expected_months:
-            log.warning("%d/%d months present -- some months may be missing from raw zips",
-                        n_months, expected_months)
-        run.note(f"Resumed after interruption. {n_months}/{expected_months} monthly files.")
+        ingest_range(raw_dir=raw_dir, out_dir=run.out_dir, raw_chunk_rows=raw_chunk_rows,
+                     log_every=log_every, overwrite=False, layout=layout)
+        n_parts = len(layout.existing(run.out_dir))
+        if n_parts == 0:
+            raise RuntimeError("still no output after resume -- check raw_dir and range")
+        if n_parts < expected:
+            log.warning("%d/%d partitions present -- some months may be missing from raw zips",
+                        n_parts, expected)
+        run.note(f"Resumed after interruption. {n_parts}/{expected} partitions.")
     return index.get(artifact_id)
 
 if __name__ == "__main__":
