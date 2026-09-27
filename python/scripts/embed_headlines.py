@@ -36,7 +36,7 @@ from datalake import DatalakeError, DatalakeIndex
 
 PIPELINE = "PhD-Narrative-Finance"
 PIPELINE_REPO = "https://github.com/GabinTB/PhD-Narrative-Finance"
-PIPELINE_VERSION = "v0.3.0"   # v0.3.0: partition layout in the id; v0.2.0: nlp backends, backend/dtype
+from ravenpack.headlines.embed import PIPELINE_VERSION  # noqa: E402
 
 _BACKEND_HELP = "inference engine: tei (default) | local | embedx"
 _DTYPE_HELP = "compute dtype: float16 (default) | float32"

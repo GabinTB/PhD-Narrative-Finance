@@ -53,6 +53,7 @@ headline_sentiment = "ravenpack.headlines.sentiment:verify_artifact"
 [project.entry-points."narrative_finance.jobs"]
 ravenpack_headlines = "ravenpack.headlines.ingest:IngestJob"
 headline_sentiment = "ravenpack.headlines.sentiment:HeadlineSentimentJob"
+headline_embeddings = "ravenpack.headlines.embed:EmbedJob"
 
 [build-system]
 requires      = ["hatchling"]

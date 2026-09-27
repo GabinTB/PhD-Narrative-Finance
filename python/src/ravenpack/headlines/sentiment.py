@@ -308,6 +308,8 @@ class HeadlineSentimentJob(Job):
         model.add_argument("--backend", default="tei", choices=["tei", "local"])
         model.add_argument("--dtype", default="float16", help="float16 (default) | float32")
         model.add_argument("--device", default=None, help="local backend: cuda|mps|cpu")
+        model.add_argument("--model-path", default=None,
+                           help="local backend: default the family's model path variable")
         model.add_argument("--batch-size", type=int, default=None)
         model.add_argument("--score-rule", default=None,
                            help="ravenbert: mean (default) | median; finbert: band")

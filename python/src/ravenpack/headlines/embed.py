@@ -49,8 +49,9 @@ import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from datalake.jobs import TEMP_SUFFIX, Job, JobContext, Unit, register_job
 from datalake.layout import Layout, layout_from_hyperparams
-from datalake.periods import period_of
+from datalake.periods import partition_file, period_of
 from ravenpack.headlines.schema import EMBEDDING_DIM, EMBEDDING_SCHEMA
 
 if TYPE_CHECKING:
@@ -288,12 +289,159 @@ def embed_range(
 
 
 # ---------------------------------------------------------------------------
-# Datalake-aware entry point
+# The Job (datalake.jobs) and the datalake-aware entry points
 # ---------------------------------------------------------------------------
+
+PIPELINE_VERSION = "v0.3.0"   # v0.3.0: partition layout in the id; v0.2.0: nlp backends
+
+
+def embedding_layout(src: Artifact, start: date | None = None,
+                     end: date | None = None) -> Layout:
+    """The source's partitioning over [start, end] rounded out to whole periods
+    (default: the source's declared range)."""
+    src_layout = layout_from_hyperparams(src.meta.hyperparams)
+    start, end = start or src_layout.start, end or src_layout.end
+    if start is None or end is None:
+        raise ValueError("no start/end given and none declared by the source "
+                         f"artifact ({src.artifact_id})")
+    return Layout(src_layout.freq, period_of(start, src_layout.freq).first,
+                  period_of(end, src_layout.freq).last)
+
+
+@register_job
+class EmbedJob(Job):
+    """RavenBERT embeddings of a ravenpack_headlines artifact, one file per partition."""
+
+    kind = KIND
+    pipeline_version = PIPELINE_VERSION
+
+    def __init__(self, source: Artifact, layout: Layout, embedder: Embedder, *,
+                 temp: bool = False, pipeline_version: str | None = None,
+                 write_chunk_rows: int = 200_000, log_every: int = 100_000) -> None:
+        self.source, self.layout, self.embedder, self.temp = source, layout, embedder, temp
+        if pipeline_version is not None:
+            self.pipeline_version = pipeline_version
+        self.write_chunk_rows, self.log_every = write_chunk_rows, log_every
+
+    def params(self) -> dict[str, Any]:
+        # the range plus what changes the numbers (engine and dtype); the source
+        # artifact is lineage (sources), the model is the card
+        return {**self.layout.hyperparams(), "backend": self.embedder.backend.name,
+                "dtype": self.embedder.backend.dtype}
+
+    def sources(self) -> list[Any]:
+        return [self.source]
+
+    def model_card(self) -> Any:
+        return self.embedder.model_card()
+
+    def backends(self) -> list[Any]:
+        return [self.embedder.backend]
+
+    def notes(self) -> str:
+        return f"source_artifact={self.source.artifact_id}"
+
+    def units(self) -> list[Unit]:
+        keys = [p.key for p in self.layout.expected()]
+        missing = [k for k in keys if not (self.source.path / partition_file(k)).exists()]
+        if missing:
+            log.warning("%d source partition(s) missing, skipped (e.g. %s)", len(missing),
+                        missing[0])
+        return [Unit(k) for k in keys if k not in set(missing)]
+
+    def is_done(self, unit: Unit, out_dir: Path) -> bool:
+        return (out_dir / partition_file(unit.key)).exists()
+
+    def run_unit(self, unit: Unit, ctx: JobContext) -> None:
+        name = partition_file(unit.key)
+        t0 = time.monotonic()
+        n = embed_month(self.embedder, self.source.path / name, ctx.out_dir / name,
+                        write_chunk_rows=self.write_chunk_rows, tag=unit.key,
+                        log_every=self.log_every)
+        if n == 0:
+            ctx.log.warning("%s  no rows in source, nothing written", unit.key)
+            return
+        elapsed = time.monotonic() - t0
+        ctx.log.info("%s  wrote %s (%d stories in %.0fs, %.0f/s)", unit.key, name, n,
+                     elapsed, n / max(elapsed, 1e-9))
+
+    def finalize(self, ctx: JobContext) -> None:
+        n = len(list(ctx.out_dir.glob("*.parquet")))
+        if n == 0:
+            raise RuntimeError(
+                f"embed produced no output for {self.layout.start}..{self.layout.end}; "
+                f"check source artifact {self.source.artifact_id} at {self.source.path}")
+        ctx.note(f"{n} {self.layout.freq} embedding partition(s) from "
+                 f"{self.source.artifact_id}")
+
+    @classmethod
+    def from_artifact(cls, artifact: Artifact, index: DatalakeIndex, *,
+                      embedder: Embedder | None = None, model_path: Path | str | None = None,
+                      write_chunk_rows: int = 200_000, log_every: int = 100_000,
+                      **backend_kwargs: Any) -> EmbedJob:
+        """Everything from the artifact: the embedder is rebuilt from the model card
+        and must serve the SAME model (a server's metadata is read first; local
+        weights must hash to the recorded sha256); source and range are the
+        recorded lineage and hyperparams. A ready ``embedder`` passes the same check."""
+        from nlp.backends import assert_same_model
+        from nlp.embedding import embedder_from_card
+
+        card = artifact.meta.model_card
+        if card is None:
+            raise ValueError(f"{artifact.artifact_id} has no model card; "
+                             "cannot identify its embedder")
+        if embedder is None:
+            embedder = embedder_from_card(card, model_path=str(model_path) if model_path
+                                          else None, **backend_kwargs)
+        else:
+            assert_same_model((card.serving or {}).get("identity") or {}, embedder.backend)
+        source_id = next((s for s in artifact.meta.sources if s.startswith(SOURCE_KIND)), None)
+        if source_id is None:
+            raise ValueError(f"{artifact.artifact_id} records no {SOURCE_KIND} source")
+        return cls(index.get(source_id), layout_from_hyperparams(artifact.meta.hyperparams),
+                   embedder, temp=artifact.meta.pipeline_version.endswith(TEMP_SUFFIX),
+                   write_chunk_rows=write_chunk_rows, log_every=log_every)
+
+    @classmethod
+    def add_cli_args(cls, parser: Any) -> None:
+        from datalake.layout import add_layout_args
+
+        parser.add_argument("--source-artifact", default=None,
+                            help="default: the latest ravenpack_headlines")
+        add_layout_args(parser, default_freq=None, required=False)
+        parser.add_argument("--backend", default="tei", choices=["tei", "local", "embedx"])
+        parser.add_argument("--dtype", default="float16", help="float16 (default) | float32")
+        parser.add_argument("--device", default=None, help="local backend: cuda|mps|cpu")
+        parser.add_argument("--model-path", default=None,
+                            help="local backend: default $RAVENBERT_EMBEDDING_MODEL_PATH")
+        parser.add_argument("--batch-size", type=int, default=None)
+        parser.add_argument("--write-chunk-rows", type=int, default=200_000)
+        parser.add_argument("--log-every", type=int, default=100_000)
+        parser.add_argument("--temp", action="store_true", help="agent-created (__TEMP)")
+
+    @classmethod
+    def from_args(cls, args: Any, index: DatalakeIndex) -> EmbedJob:
+        from datalake.layout import layout_from_args
+
+        if args.device and args.backend != "local":
+            raise ValueError("--device applies to the local backend only")
+        src = index.get(args.source_artifact) if args.source_artifact \
+            else index.latest(SOURCE_KIND)
+        src_layout = layout_from_hyperparams(src.meta.hyperparams)
+        if args.partition_freq and args.partition_freq != src_layout.freq:
+            raise ValueError(f"embeddings follow their source's partitioning "
+                             f"({src_layout.freq}); re-partitioning is its own job")
+        given = layout_from_args(args, default=src_layout)
+        embedder = build_embedder(args.backend, args.dtype, model_path=args.model_path,
+                                  batch_size=args.batch_size, device=args.device)
+        return cls(src, embedding_layout(src, given.start, given.end), embedder,
+                   temp=args.temp, write_chunk_rows=args.write_chunk_rows,
+                   log_every=args.log_every)
+
 
 def embed_to_datalake(
     index: "DatalakeIndex",
-    pipeline_version: str,
+    pipeline_version: str = PIPELINE_VERSION,
     *,
     embedder: Embedder | None = None,
     backend: str = "tei",
@@ -311,14 +459,10 @@ def embed_to_datalake(
     batch_size: int | None = None,
     write_chunk_rows: int = 200_000,
     log_every: int = 100_000,
+    temp: bool = False,
 ) -> "Artifact":
-    """Embed a ``ravenpack_headlines`` artifact into a new ``headline_embeddings`` one.
-
-    Wraps ``embed_range`` in a datalake run: the output directory is allocated by
-    the index, the source artifact is recorded as lineage, the embedder's full
-    model card (backend, serving metadata, checks) is attached, sidecars and
-    hashes are written on completion, and a crash leaves the artifact
-    registered as partial.
+    """Embed a ``ravenpack_headlines`` artifact into a new ``headline_embeddings`` one
+    (library entry point; runs ``EmbedJob``).
 
     Args:
         index:              Datalake index to register the artifact in.
@@ -338,71 +482,24 @@ def embed_to_datalake(
                             artifact's declared range.
         pipeline, pipeline_repo, repo_dir: Provenance passthrough.
         write_chunk_rows, log_every: Throughput / logging knobs.
-
-    Returns:
-        The completed Artifact.
+        temp:               Agent-created (``__TEMP`` in the id).
     """
+    from datalake.jobs import JobRunner
+
     src = index.get(source_artifact_id) if source_artifact_id else index.latest(SOURCE_KIND)
-    hp = src.meta.hyperparams
-    src_layout = layout_from_hyperparams(hp)
     if start is None and start_year is not None:
         start = date(start_year, 1, 1)
     if end is None and end_year is not None:
         end = date(end_year, 12, 31)
-    start, end = start or src_layout.start, end or src_layout.end
-    if start is None or end is None:
-        raise ValueError(
-            "no start/end given and none declared by the source "
-            f"artifact ({src.artifact_id})"
-        )
-    layout = Layout(src_layout.freq, period_of(start, src_layout.freq).first,
-                    period_of(end, src_layout.freq).last)
-
+    layout = embedding_layout(src, start, end)
     if embedder is None:
         embedder = build_embedder(backend, dtype, model_path=model_path,
                                   batch_size=batch_size, device=device)
-    card = embedder.model_card()
-
-    # Hyperparams feed the artifact_id slug: the year range plus what changes
-    # the numbers (engine and dtype). The source artifact is lineage (sources).
-    hyperparams: dict[str, Any] = {
-        **layout.hyperparams(),
-        "backend": embedder.backend.name,
-        "dtype": embedder.backend.dtype,
-    }
-    notes = f"source_artifact={src.artifact_id}"
-
-    with index.run(
-        kind=KIND,
-        pipeline=pipeline,
-        pipeline_version=pipeline_version,
-        pipeline_repo=pipeline_repo,
-        repo_dir=repo_dir,
-        hyperparams=hyperparams,
-        notes=notes,
-        sources=[src],
-        model_card=card,
-        verifier=KIND,
-        hash_pattern="*.parquet",
-    ) as run:
-        embed_range(
-            embedder,
-            source_dir=src.path,
-            out_dir=run.out_dir,
-            layout=layout,
-            write_chunk_rows=write_chunk_rows,
-            log_every=log_every,
-            overwrite=False,
-        )
-        n_months = len(list(run.out_dir.glob("*.parquet")))
-        if n_months == 0:
-            raise RuntimeError(
-                f"embed produced no output for {layout.start}..{layout.end}; "
-                f"check source artifact {src.artifact_id} at {src.path}"
-            )
-        run.note(f"{n_months} monthly embedding files from {src.artifact_id}")
-
-    return index.get(run.artifact_id)
+    job = EmbedJob(src, layout, embedder, temp=temp, pipeline_version=pipeline_version,
+                   write_chunk_rows=write_chunk_rows, log_every=log_every)
+    job.pipeline, job.pipeline_repo = pipeline, pipeline_repo
+    return JobRunner(index, repo_dir=repo_dir, allow_dirty=True,
+                     handle_signals=False).start(job)
 
 
 def resume_embedding(
@@ -413,49 +510,24 @@ def resume_embedding(
     model_path: Path | str | None = None,
     write_chunk_rows: int = 200_000,
     log_every: int = 100_000,
+    repo_dir: Path | None = None,
     **backend_kwargs: Any,
 ) -> "Artifact":
-    """Finish a partial ``headline_embeddings`` artifact from its own metadata.
-
-    Nothing is taken from the caller but throughput knobs: the embedder is rebuilt
-    from the artifact's model card (backend, dtype, naming) and must serve the
-    SAME model -- a remote server's metadata is read first and compared with the
-    recorded identity; local weights must hash to the recorded sha256. The source
-    is the recorded lineage, the year range the recorded hyperparams. Months
-    already written are skipped; the artifact is completed in place. A ready
-    ``embedder`` may be passed instead of rebuilding one; it must pass the same
-    identity check.
-    """
-    from nlp.backends import assert_same_model
-    from nlp.embedding import embedder_from_card
+    """Finish a partial ``headline_embeddings`` artifact from its own metadata
+    (``EmbedJob.from_artifact``; the same as ``jobs resume <id>``). Only throughput
+    knobs, or a ready ``embedder`` that passes the identity check, come from the caller."""
+    from datalake.jobs import JobRunner
 
     art = index.get(artifact_id)
     if art.kind != KIND:
         raise ValueError(f"{artifact_id} is a {art.kind}, not a {KIND}")
     if not art.partial:
         raise ValueError(f"{artifact_id} is complete; nothing to resume")
-    card = art.meta.model_card
-    if card is None:
-        raise ValueError(f"{artifact_id} has no model card; cannot identify its embedder")
-    if embedder is None:
-        embedder = embedder_from_card(card, model_path=str(model_path) if model_path else None,
-                                      **backend_kwargs)
-    else:
-        assert_same_model((card.serving or {}).get("identity") or {}, embedder.backend)
-    hp = art.meta.hyperparams
-    source_id = next((s for s in art.meta.sources if s.startswith(SOURCE_KIND)), None)
-    if source_id is None:
-        raise ValueError(f"{artifact_id} records no {SOURCE_KIND} source")
-    src = index.get(source_id)
-    with index.run(kind=KIND, pipeline=art.meta.pipeline,
-                   pipeline_version=art.meta.pipeline_version,
-                   pipeline_repo=art.meta.pipeline_repo, hyperparams=hp,
-                   verifier=KIND, hash_pattern="*.parquet", resume=artifact_id) as run:
-        embed_range(embedder, source_dir=src.path, out_dir=run.out_dir,
-                    layout=layout_from_hyperparams(hp),
-                    write_chunk_rows=write_chunk_rows, log_every=log_every, overwrite=False)
-        run.note(f"{len(list(run.out_dir.glob('*.parquet')))} monthly embedding files")
-    return index.get(artifact_id)
+    job = EmbedJob.from_artifact(art, index, embedder=embedder, model_path=model_path,
+                                 write_chunk_rows=write_chunk_rows, log_every=log_every,
+                                 **backend_kwargs)
+    return JobRunner(index, repo_dir=repo_dir, allow_dirty=True,
+                     handle_signals=False).resume_job(artifact_id, job)
 
 
 # ---------------------------------------------------------------------------

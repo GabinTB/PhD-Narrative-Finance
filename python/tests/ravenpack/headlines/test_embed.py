@@ -365,7 +365,7 @@ class TestResume:
         index = DatalakeIndex(tmp_path / "lake")
         _register_source(index, tmp_path)
         with pytest.raises(RuntimeError, match="killed"):
-            embed_to_datalake(index, "v0.2.0", embedder=Embedder(CrashingBackend(die_at=3)))
+            embed_to_datalake(index, "v0.3.0", embedder=Embedder(CrashingBackend(die_at=3)))
         return index, index.list("headline_embeddings", include_partial=True)[0]
 
     def test_resume_finishes_in_place(self, tmp_path):
@@ -465,3 +465,36 @@ class TestVerifyArtifact:
         findings = verify_artifact(art)
         assert len(findings) == 1
         assert findings[0].severity.value == "warning"
+
+
+class TestEmbedJob:
+    def test_model_switch_fails_the_job_then_jobs_resume_finishes_it(self, tmp_path):
+        from datalake import DatalakeIndex
+        from datalake.jobs import JobRunner, JobState
+        from ravenpack.headlines.embed import EmbedJob, embedding_layout
+
+        index = DatalakeIndex(tmp_path / "lake")
+        src = _register_source(index, tmp_path)
+        backend = CrashingBackend()
+        real_embed = backend.embed
+
+        def embed_then_switch(texts):
+            out = real_embed(texts)
+            backend.switched = backend.calls >= 2    # after the probe and January
+            return out
+
+        backend.embed = embed_then_switch
+        runner = JobRunner(index, allow_dirty=True, handle_signals=False)
+        with pytest.raises(IncompatibleModelError):
+            runner.start(EmbedJob(src, embedding_layout(src), Embedder(backend), temp=True))
+        part = index.list("headline_embeddings", include_partial=True)[0]
+        state = JobState.read(part.path)
+        assert (state.status, state.units_done, state.units_total) == ("failed", 1, 2)
+        assert "model changed" in state.last_error
+        assert state.backends == [{"backend": "fake", "dtype": "float16"}]
+        assert state.current_unit == "2000-02"
+        done = runner.resume(part.artifact_id, embedder=Embedder(CrashingBackend()))
+        assert not done.partial and sorted(done.file_hashes) == ["2000-01.parquet",
+                                                                 "2000-02.parquet"]
+        assert "__v0.3.0__TEMP__" in done.artifact_id
+        index.close()

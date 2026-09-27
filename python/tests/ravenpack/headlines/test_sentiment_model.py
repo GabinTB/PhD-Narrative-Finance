@@ -175,3 +175,45 @@ def test_killed_run_resumes_from_its_card_alone(finbert_dir, tmp_path):
     assert pl.read_parquet(done.path / "2008-02.parquet").columns[-3:] == ["P_NEG", "P_NEU",
                                                                           "P_POS"]
     dl.close()
+
+
+def test_jobs_resume_rebuilds_the_sentimeter_and_stops_on_a_model_switch(finbert_dir,
+                                                                       tmp_path):
+    """``JobRunner.resume`` alone: the Sentimeter comes from the card; a backend whose
+    served model changes before a partition fails the job with that reason."""
+    from datalake import DatalakeIndex
+    from datalake.jobs import JobRunner, JobState
+    from nlp.backends.base import IncompatibleModelError
+    from ravenpack.headlines import sentiment_model as sm
+    from ravenpack.headlines.sentiment import sentiment_layout
+
+    dl = DatalakeIndex(tmp_path / "lake")
+    with dl.run(kind="ravenpack_headlines", pipeline="t", pipeline_version="v0",
+                hyperparams={"start_year": 2008, "end_year": 2008}) as r:
+        for month, ids in (("2008-01", ["a", "b"]), ("2008-02", ["x1", "x2"])):
+            pl.DataFrame({"RP_STORY_ID": ids, "HEADLINE": ["stocks up", "loss"]}) \
+                .write_parquet(r.out_dir / f"{month}.parquet")
+    hl = dl.latest("ravenpack_headlines")
+    backend = _local(finbert_dir)
+    switched = {"after": "2008-01"}
+    real_check = type(backend).check_unchanged
+
+    def check_unchanged(self):
+        if switched["after"] and (dl.list("headline_sentiment", include_partial=True)[0].path
+                                  / "2008-01.parquet").exists():
+            raise IncompatibleModelError("served model changed: finbert -> other")
+        return real_check(self)
+
+    backend.check_unchanged = check_unchanged.__get__(backend)
+    job = sm.job(hl, sentiment_layout(hl), FinbertSentimeter(backend), temp=True)
+    runner = JobRunner(dl, allow_dirty=True, handle_signals=False)
+    with pytest.raises(IncompatibleModelError, match="served model changed"):
+        runner.start(job)
+    part = dl.list("headline_sentiment", include_partial=True)[0]
+    state = JobState.read(part.path)
+    assert state.status == "failed" and state.units_done == 1
+    assert "served model changed" in state.last_error
+    done = runner.resume(part.artifact_id, model_path=finbert_dir, device="cpu")
+    assert not done.partial and sorted(done.file_hashes) == ["2008-01.parquet",
+                                                             "2008-02.parquet"]
+    dl.close()

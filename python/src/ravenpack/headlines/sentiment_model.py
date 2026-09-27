@@ -150,6 +150,7 @@ def job_from_args(args, index: DatalakeIndex, headlines: Artifact,
     if args.device and args.backend != "local":
         raise ValueError("--device applies to the local backend only")
     sentimeter = load_sentimeter(args.source, args.backend, args.dtype,
+                                 model_path=getattr(args, "model_path", None),
                                  score_rule=args.score_rule,
                                  min_confidence=args.min_confidence,
                                  **_backend_kwargs(args.batch_size, args.device))
@@ -159,13 +160,15 @@ def job_from_args(args, index: DatalakeIndex, headlines: Artifact,
 
 def job_from_artifact(artifact: Artifact, index: DatalakeIndex, *,
                       batch_size: int | None = None, device: str | None = None,
+                      model_path: str | Path | None = None,
                       read_rows: int = 200_000) -> HeadlineSentimentJob:
     """Resume: the Sentimeter and its backend are rebuilt from the model card, and
     the backend must serve the recorded model (a server's metadata is read first)."""
     card, hp = artifact.meta.model_card, artifact.meta.hyperparams
     if card is None:
         raise ValueError(f"{artifact.artifact_id} has no model card; cannot resume it")
-    sentimeter = sentimeter_from_card(card, **_backend_kwargs(batch_size, device))
+    sentimeter = sentimeter_from_card(card, model_path=str(model_path) if model_path else None,
+                                      **_backend_kwargs(batch_size, device))
     check_resume_compatible(card, hp, sentimeter)
     produce = producer(sentimeter, canonical_columns=bool(hp.get("canonical_columns")),
                        read_rows=read_rows)

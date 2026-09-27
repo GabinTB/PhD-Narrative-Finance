@@ -543,11 +543,11 @@ class JobRunner:
                     state.write(out_dir)
                     adapter.info("pause requested: stopping before %s", unit.key)
                     raise JobPaused(unit.key)
-                for backend in job.backends():
-                    backend.check_unchanged()
                 state.current_unit = unit.key
                 state.write(out_dir)
                 adapter.extra["unit"] = unit.key
+                for backend in job.backends():
+                    backend.check_unchanged()
                 t0 = time.monotonic()
                 job.run_unit(unit, ctx)
                 elapsed = time.monotonic() - t0
