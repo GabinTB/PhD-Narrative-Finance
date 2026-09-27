@@ -36,9 +36,7 @@ MU_HAT, N), read back point-in-time by ``resolve_reference``.
 """
 from __future__ import annotations
 
-import argparse
 import logging
-import re
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -48,6 +46,7 @@ import numpy as np
 import pandas as pd
 import polars as pl
 
+from datalake.periods import EXPANDING, Span, parse_span
 from nlp.corrections import LookaheadError
 
 log = logging.getLogger(__name__)
@@ -72,46 +71,28 @@ REFERENCE_SCHEMA: pl.Schema = reference_schema(DEFAULT_DIM)
 
 
 # ---------------------------------------------------------------------------
-# Delay / window specs ('5d', '2W', '3M', 'expanding')
+# Delay / window specs: thin wrappers over the lake's single span parser
+# (datalake.periods.parse_span), kept for their established call sites
 # ---------------------------------------------------------------------------
 
-_PERIOD_RE = re.compile(r"^(\d+)([dWM])$")
-
-
 def parse_period(spec: str, allowed_units: str) -> tuple[int, str]:
-    m = _PERIOD_RE.match(spec)
-    if not m or int(m.group(1)) <= 0:
-        raise argparse.ArgumentTypeError(
-            f"invalid period '{spec}', expected e.g. '5d', '2W', '3M' (n > 0)"
-        )
-    n, unit = int(m.group(1)), m.group(2)
-    if unit not in allowed_units:
-        raise argparse.ArgumentTypeError(
-            f"period '{spec}' uses unit '{unit}', allowed units here are {list(allowed_units)}"
-        )
-    return n, unit
+    span = parse_span(spec, units=allowed_units)
+    return span.n, span.unit
 
 
 def offset_of(n: int, unit: str) -> pd.DateOffset:
-    return {
-        "d": pd.DateOffset(days=n),
-        "W": pd.DateOffset(weeks=n),
-        "M": pd.DateOffset(months=n),
-    }[unit]
+    return Span(n, unit, f"{n}{unit}").offset()
 
 
 def parse_delay(spec: str) -> pd.DateOffset:
-    """Minimum granularity is 1 day: 'Xd', 'XW', 'XM' all allowed."""
-    n, unit = parse_period(spec, allowed_units="dWM")
-    return offset_of(n, unit)
+    """Minimum granularity is 1 day: 'Xd', 'XW', 'XM', 'XQ', 'XY'."""
+    return parse_span(spec, units="dWMQY").offset()
 
 
 def parse_window(spec: str) -> str | pd.DateOffset:
-    """'expanding', or a rolling window >= 1 week: 'XW', 'XM' (no days)."""
-    if spec == "expanding":
-        return "expanding"
-    n, unit = parse_period(spec, allowed_units="WM")
-    return offset_of(n, unit)
+    """'expanding', or a rolling window >= 1 week: 'XW', 'XM', 'XQ', 'XY' (no days)."""
+    span = parse_span(spec, units="WMQY", allow_expanding=True)
+    return EXPANDING if span.expanding else span.offset()
 
 
 def _offset_days(offset: pd.DateOffset, anchor: pd.Timestamp) -> int:

@@ -52,6 +52,7 @@ import numpy as np
 import pandas as pd
 import polars as pl
 
+from datalake.periods import parse_span
 from narrative_scoring.calibration import LookaheadError, TauRecord
 from narrative_scoring.config import ScoringConfig
 from narrative_scoring.f0 import TDigest, Welford, gaussian_tau, tail_probability
@@ -71,13 +72,8 @@ POOL_QUANTILES = (0.99, 0.999, 0.9993, 0.9999)
 
 
 def window_offset(window: str) -> pd.DateOffset | None:
-    if window == WINDOW_EXPANDING:
-        return None
-    if window.endswith("Y") and window[:-1].isdigit() and int(window[:-1]) > 0:
-        return pd.DateOffset(years=int(window[:-1]))
-    if window.endswith("M") and window[:-1].isdigit() and int(window[:-1]) > 0:
-        return pd.DateOffset(months=int(window[:-1]))
-    raise ValueError(f"window must be 'expanding', 'NY' or 'NM', got {window!r}")
+    """None for 'expanding', else the window's offset ('5Y', '60M', '20Q', '26W')."""
+    return parse_span(window, units="WMQY", allow_expanding=True).offset()
 
 
 def window_start(cutoff: date, offset: pd.DateOffset) -> date:
