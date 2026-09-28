@@ -1,24 +1,21 @@
 """Model sentiment (RavenBERT, FinBERT) -> a ``headline_sentiment`` artifact.
 
 RavenPack I/O around an ``nlp.sentiment.Sentimeter``: every headline of a
-``ravenpack_headlines`` month is scored by the sentimeter (``clean_text``
-preprocessing, one inference pass per read batch, on TEI by default or a
-local model). The month's table:
+``ravenpack_headlines`` partition goes through the sentimeter (``clean_text``
+preprocessing, one inference pass per read batch, on TEI by default or a local
+model). The table stores the model's output only, as a distribution on the 41-point
+grid s = linspace(-1, 1, 41):
 
     RP_STORY_ID   String
-    SENT_SCORE    Float32  the sentimeter's score in [-1, 1]; NaN below
-                           ``--min-confidence`` ("no score", never 0)
-    SENT_CONF     Float32  its confidence in [0, 1]
-    P_*           Float16  optional (``--canonical-columns``): the canonical
-                           probabilities (RavenBERT P_00..P_40, FinBERT
-                           P_NEG / P_NEU / P_POS), not selectable as sentiment
+    P_00..P_40    Float16, the grid distribution (RavenBERT: its 41 classes; FinBERT:
+                  its 3 classes spread on the bands [-1, -1/3], [-1/3, 1/3], [1/3, 1]);
+                  all null for an empty cleaned headline (no model output)
 
-The score maps, confidence measures and compatibility checks live in
-``nlp.sentiment`` (``RavenbertSentimeter``: EV or median of 41 ordinal
-classes; ``FinbertSentimeter``: band-consistent score). The artifact's
-model card carries the backend, its full serving metadata, the sentimeter
-settings and the check results; backend, dtype, score rule and the
-confidence threshold are also hyperparams, so they are part of the id.
+No score, confidence or label is stored: they are computed at load time
+(``nlp.sentiment.ordinal_sql``), so thresholds and rules stay scoring choices. The
+artifact's model card carries the backend, its full serving metadata, the sentimeter
+settings (band edges, cleaning) and the check results; backend, dtype and the output
+spec version are also hyperparams, so they are part of the id.
 
     uv run jobs start headline_sentiment --source finbert --start-year 2000 \\
         --end-year 2025 [--temp]
@@ -26,10 +23,9 @@ confidence threshold are also hyperparams, so they are part of the id.
         --dtype float32 --device cuda --start-year 2026 --end-year 2026
     uv run jobs resume <partial artifact id> [--opt batch_size=64 --opt device=cuda]
 
-``resume`` takes everything from the artifact: the Sentimeter (family, score rule,
-confidence threshold) and its backend are rebuilt from the model card, and the
-backend must still serve the recorded model (a remote server's metadata is read
-first); the canonical-column choice and the months come from the hyperparams.
+``resume`` takes everything from the artifact: the Sentimeter family and its backend
+are rebuilt from the model card, and the backend must still serve the recorded model
+(a remote server's metadata is read first).
 """
 from __future__ import annotations
 
@@ -46,8 +42,7 @@ import polars as pl
 import pyarrow.parquet as pq
 
 from nlp.sentiment import (
-    CONFIDENCE_COLUMN,
-    SCORE_COLUMN,
+    GRID_COLUMNS,
     SENTIMETERS,
     load_sentimeter,
     sentimeter_from_card,
@@ -69,47 +64,43 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-def producer(sentimeter: Sentimeter, *, canonical_columns: bool = False,
-             read_rows: int = 200_000) -> MonthProducer:
-    """headlines ``YYYY-MM.parquet`` -> RP_STORY_ID + SENT_SCORE + SENT_CONF (+ P_*), streamed."""
-    names = sentimeter.canonical_columns()
+def grid_frame(story_ids: list[str], G: np.ndarray) -> pl.DataFrame:
+    """RP_STORY_ID + P_00..P_40 (Float16); an all-NaN row of ``G`` becomes all null."""
+    import pyarrow as pa
+
+    G16 = np.asarray(G, dtype=np.float16)
+    empty = np.isnan(G16).all(axis=1)
+    cols: dict[str, Any] = {ID_COL: pa.array(story_ids, type=pa.string())}
+    for j, name in enumerate(GRID_COLUMNS):
+        cols[name] = pa.array(G16[:, j], type=pa.float16(), mask=empty)
+    return pl.from_arrow(pa.table(cols))
+
+
+def producer(sentimeter: Sentimeter, *, read_rows: int = 200_000) -> MonthProducer:
+    """headlines partition -> RP_STORY_ID + P_00..P_40 (Float16 grid), streamed."""
 
     def produce(headlines_month: Path, tag: str) -> pl.DataFrame:
         frames: list[pl.DataFrame] = []
         t0, n = time.monotonic(), 0
         for batch in pq.ParquetFile(headlines_month).iter_batches(
                 batch_size=read_rows, columns=[ID_COL, "HEADLINE"]):
-            out = sentimeter.evaluate(batch.column("HEADLINE").to_pylist())
-            cols: dict[str, Any] = {SCORE_COLUMN: out["score"],
-                                    CONFIDENCE_COLUMN: out["confidence"]}
-            if canonical_columns:
-                P16 = out["canonical"].astype(np.float16)
-                cols.update({name: P16[:, i] for i, name in enumerate(names)})
-            frames.append(pl.DataFrame({ID_COL: batch.column(ID_COL).to_pylist(), **cols}))
+            G = sentimeter.grid_batch(batch.column("HEADLINE").to_pylist())
+            frames.append(grid_frame(batch.column(ID_COL).to_pylist(), G))
             n += batch.num_rows
             log.info("%s  %d headlines scored | %.0f/s", tag, n,
                      n / max(time.monotonic() - t0, 1e-9))
         if not frames:
-            schema = {ID_COL: pl.String, SCORE_COLUMN: pl.Float32, CONFIDENCE_COLUMN: pl.Float32}
-            if canonical_columns:
-                schema.update({name: pl.Float16 for name in names})
-            return pl.DataFrame(schema=schema)
+            return pl.DataFrame(schema={ID_COL: pl.String,
+                                        **{name: pl.Float16 for name in GRID_COLUMNS}})
         return pl.concat(frames)
 
     return produce
 
 
-def run_hyperparams(sentimeter: Sentimeter, canonical_columns: bool = False) -> dict[str, Any]:
-    """What changes the table: model spec version, engine, dtype, score rule, threshold,
-    and whether the canonical probabilities are written."""
-    hp: dict[str, Any] = {"model_version": sentimeter.version,
-                          "backend": sentimeter.backend.name,
-                          "dtype": sentimeter.backend.dtype,
-                          "score_rule": sentimeter.score_rule,
-                          "canonical_columns": canonical_columns}
-    if sentimeter.min_confidence is not None:
-        hp["min_confidence"] = sentimeter.min_confidence
-    return hp
+def run_hyperparams(sentimeter: Sentimeter) -> dict[str, Any]:
+    """What changes the table: output spec version, engine and dtype."""
+    return {"model_version": sentimeter.version, "backend": sentimeter.backend.name,
+            "dtype": sentimeter.backend.dtype}
 
 
 def check_resume_compatible(card: ModelCard | None, hyperparams: dict[str, Any],
@@ -117,22 +108,20 @@ def check_resume_compatible(card: ModelCard | None, hyperparams: dict[str, Any],
     """Refuse to finish an artifact with a sentimeter that scores differently."""
     if card is None:
         raise ValueError("artifact has no model card; cannot verify the sentimeter")
-    want = {"source": sentimeter.name,
-            **run_hyperparams(sentimeter, bool(hyperparams.get("canonical_columns")))}
+    want = {"source": sentimeter.name, **run_hyperparams(sentimeter)}
     got = {k: hyperparams.get(k) for k in want}
     if got != want or card.backend != sentimeter.backend.name:
         raise ValueError(f"artifact was scored with {got} (backend {card.backend}); "
                          f"this run uses {want}; refusing to mix them in one artifact")
 
 
-def job(headlines: Artifact, layout: Layout, sentimeter: Sentimeter, *,
-        canonical_columns: bool = False, temp: bool = False,
+def job(headlines: Artifact, layout: Layout, sentimeter: Sentimeter, *, temp: bool = False,
         read_rows: int = 200_000) -> HeadlineSentimentJob:
     """The model-sentiment job; the backend is re-checked before every partition."""
     return HeadlineSentimentJob(
         headlines, layout, source=sentimeter.name, columns=sentimeter.columns(),
-        produce=producer(sentimeter, canonical_columns=canonical_columns, read_rows=read_rows),
-        extra_hyperparams=run_hyperparams(sentimeter, canonical_columns),
+        produce=producer(sentimeter, read_rows=read_rows),
+        extra_hyperparams=run_hyperparams(sentimeter),
         model_card=sentimeter.model_card(), backends=[sentimeter.backend], temp=temp)
 
 
@@ -151,11 +140,8 @@ def job_from_args(args, index: DatalakeIndex, headlines: Artifact,
         raise ValueError("--device applies to the local backend only")
     sentimeter = load_sentimeter(args.source, args.backend, args.dtype,
                                  model_path=getattr(args, "model_path", None),
-                                 score_rule=args.score_rule,
-                                 min_confidence=args.min_confidence,
                                  **_backend_kwargs(args.batch_size, args.device))
-    return job(headlines, layout, sentimeter, canonical_columns=args.canonical_columns,
-               temp=args.temp)
+    return job(headlines, layout, sentimeter, temp=args.temp)
 
 
 def job_from_artifact(artifact: Artifact, index: DatalakeIndex, *,
@@ -170,8 +156,7 @@ def job_from_artifact(artifact: Artifact, index: DatalakeIndex, *,
     sentimeter = sentimeter_from_card(card, model_path=str(model_path) if model_path else None,
                                       **_backend_kwargs(batch_size, device))
     check_resume_compatible(card, hp, sentimeter)
-    produce = producer(sentimeter, canonical_columns=bool(hp.get("canonical_columns")),
-                       read_rows=read_rows)
+    produce = producer(sentimeter, read_rows=read_rows)
     return job_from_recorded(artifact, index, produce, backends=[sentimeter.backend])
 
 
@@ -193,12 +178,6 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--device", default=None, help="local backend: cuda|mps|cpu (default auto)")
     ap.add_argument("--batch-size", type=int, default=None,
                     help="texts per request / forward pass (default: the backend's)")
-    ap.add_argument("--score-rule", default=None,
-                    help="ravenbert: mean (default) | median; finbert: band")
-    ap.add_argument("--min-confidence", type=float, default=None,
-                    help="score NaN below this confidence (default: keep every score)")
-    ap.add_argument("--canonical-columns", action="store_true",
-                    help="also write the canonical probabilities as P_* (Float16)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     run = sub.add_parser("run")
     run.add_argument("--start-year", type=int, required=True)

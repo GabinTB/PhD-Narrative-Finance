@@ -9,6 +9,7 @@ import polars as pl
 import pytest
 
 from datalake import DatalakeIndex
+from nlp.sentiment import GRID_COLUMNS
 from ravenpack.headlines.sentiment import (
     KIND,
     SentimentContractError,
@@ -68,6 +69,56 @@ class TestAlign:
             align_to_stories(_frame(["a"], SENT_X=[0.1]), pl.Series(["a", "a"]))
         with pytest.raises(SentimentContractError, match="duplicate"):
             align_to_stories(_frame(["a", "a"], SENT_X=[0.1, 0.1]), pl.Series(["a"]))
+
+
+ID_COL = "RP_STORY_ID"
+
+
+def _grid(ids, G) -> pl.DataFrame:
+    """A grid table (Float16, all-NaN rows written as all null)."""
+    import pyarrow as pa
+
+    G16 = np.asarray(G, dtype=np.float16)
+    empty = np.isnan(G16).all(axis=1)
+    cols = {ID_COL: pa.array(ids, type=pa.string())}
+    for j, c in enumerate(GRID_COLUMNS):
+        cols[c] = pa.array(G16[:, j], type=pa.float16(), mask=empty)
+    return pl.from_arrow(pa.table(cols))
+
+
+class TestGridContract:
+    def test_valid_grid_with_a_no_output_row(self):
+        G = np.vstack([np.eye(41)[3], np.full(41, 1 / 41), np.full(41, np.nan)])
+        assert validate_sentiment_frame(_grid(["a", "b", "c"], G)) == list(GRID_COLUMNS)
+
+    def test_some_but_not_all_null_refused(self):
+        df = _grid(["a"], np.full((1, 41), 1 / 41)).with_columns(
+            pl.lit(None, dtype=pl.Float16).alias("P_07"))
+        with pytest.raises(SentimentContractError, match="some but not all"):
+            validate_sentiment_frame(df)
+
+    @pytest.mark.parametrize("scale", [0.95, 1.05])
+    def test_row_sum_outside_tolerance_refused(self, scale):
+        with pytest.raises(SentimentContractError, match="row sum"):
+            validate_sentiment_frame(_grid(["a"], np.full((1, 41), scale / 41)))
+
+    def test_row_sum_within_float16_tolerance_accepted(self):
+        validate_sentiment_frame(_grid(["a"], np.full((1, 41), 1.008 / 41)))
+
+    def test_float32_grid_and_mixed_tables_refused(self):
+        g = _grid(["a"], np.full((1, 41), 1 / 41))
+        with pytest.raises(SentimentContractError, match="Float16"):
+            validate_sentiment_frame(g.with_columns(pl.col("P_00").cast(pl.Float32)))
+        with pytest.raises(SentimentContractError, match="SENT_"):
+            validate_sentiment_frame(g.with_columns(pl.lit(0.1, dtype=pl.Float32)
+                                                    .alias("SENT_CSS")))
+
+    def test_missing_story_stays_all_null_after_alignment(self):
+        g = _grid(["a"], np.full((1, 41), 1 / 41))
+        out = align_to_stories(g, pl.Series(["a", "b"]))
+        assert out.filter(pl.col(ID_COL) == "b").select(
+            pl.all_horizontal(pl.col(GRID_COLUMNS).is_null())).item()
+        validate_sentiment_frame(out)
 
 
 # ---------------------------------------------------------------------------

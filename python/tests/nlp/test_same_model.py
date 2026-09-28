@@ -61,8 +61,8 @@ def test_local_card_requires_the_same_weights(embedder_dir, tmp_path):
 
 def test_sentimeter_card_restores_settings(finbert_like_dir):
     s = FinbertSentimeter(LocalBackend(finbert_like_dir, task="classification",
-                                       dtype="float32", device="cpu"), min_confidence=0.2)
+                                       dtype="float32", device="cpu"), clean=False)
     again = sentimeter_from_card(s.model_card(), model_path=str(finbert_like_dir), device="cpu")
     assert isinstance(again, FinbertSentimeter)
-    assert again.min_confidence == 0.2 and again.score_rule == "band"
+    assert again.clean is False and again.band_edges == s.band_edges
     assert again.backend.identity() == s.backend.identity()

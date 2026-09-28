@@ -1,18 +1,21 @@
 """The ``headline_sentiment`` family: a score database contract shared by every producer.
 
-An artifact of this kind is one ``YYYY-MM.parquet`` per month of its source
-``ravenpack_headlines`` artifact, each holding:
+An artifact of this kind is one parquet file per partition of its source
+``ravenpack_headlines`` artifact, each holding RP_STORY_ID (String, unique, EXACTLY
+the story set of that headlines partition) and ONE of:
 
-    RP_STORY_ID   String, unique, EXACTLY the story set of that headlines month
-    SENT_*        one or more Float32 score columns, finite in [-1, 1] or NaN
-    (anything)    other columns are allowed (e.g. FinBERT's P_NEG/P_NEU/P_POS) but a
-                  consumer may only select a ``SENT_*`` column as a sentiment
+    SENT_*        vendor scores: one or more Float32 columns, finite in [-1, 1] or NaN
+                  (NaN = "no score", never zero; nulls not allowed)
+    P_00..P_40    a model's output as a distribution on s = linspace(-1, 1, 41)
+                  (``nlp.sentiment``): Float16, per row either all null (no model
+                  output, e.g. an empty headline) or all non-null in [0, 1] with a row
+                  sum in [0.99, 1.01] (Float16 carries 2^-11 relative error per value).
+                  Scores and confidences are computed from it at load time
+                  (``nlp.sentiment.ordinal_sql``); none is stored.
 
-NaN means "no score" (no vendor event, empty headline, ...), never zero; nulls are
-not allowed in score columns. Producers (sentiment_vendor.py, sentiment_model.py)
-only compute a month's frame; this module aligns it to the headlines story set,
-validates it, writes it atomically and registers the artifact, so every producer
-obeys the same contract.
+Producers (sentiment_vendor.py, sentiment_model.py) only compute a month's frame;
+this module aligns it to the headlines story set, validates it, writes it atomically
+and registers the artifact, so every producer obeys the same contract.
 
 Point-in-time: a score is a function of the story as published (vendor fields
 emitted with the story at TIMESTAMP_UTC, or a frozen model applied to the
@@ -40,6 +43,7 @@ import pyarrow.parquet as pq
 from datalake.jobs import Job, JobContext, Unit, register_job
 from datalake.layout import Layout, layout_from_hyperparams
 from datalake.periods import partition_file, period_of
+from nlp.sentiment.base import GRID_COLUMNS
 
 if TYPE_CHECKING:
     from datalake import Artifact, DatalakeIndex, ModelCard
@@ -51,6 +55,9 @@ KIND = "headline_sentiment"
 SOURCE_KIND = "ravenpack_headlines"
 ID_COL = "RP_STORY_ID"
 SCORE_PREFIX = "SENT_"
+GRID_ROW_SUM = (0.99, 1.01)                  # Float16 grid: accepted row-sum range
+SUMMARY_FILE = "summary.json"
+DECILES = tuple(round(0.1 * i, 1) for i in range(1, 10))
 
 PIPELINE = "PhD-Narrative-Finance"
 PIPELINE_REPO = "https://github.com/GabinTB/PhD-Narrative-Finance"
@@ -70,16 +77,56 @@ class SentimentContractError(ValueError):
 # ---------------------------------------------------------------------------
 
 def score_columns(columns: Sequence[str]) -> list[str]:
-    """The selectable score columns, in file order."""
+    """The vendor score columns (SENT_*), in file order."""
     return [c for c in columns if c.startswith(SCORE_PREFIX)]
+
+
+def is_grid(columns: Sequence[str]) -> bool:
+    """True when the columns are a model grid table (P_00..P_40)."""
+    return any(c in GRID_COLUMNS for c in columns)
+
+
+def sentiment_columns(columns: Sequence[str]) -> list[str]:
+    """The sentiment columns of a table: the grid P_00..P_40 when present, else SENT_*."""
+    return list(GRID_COLUMNS) if is_grid(columns) else score_columns(columns)
+
+
+def _validate_grid(df: pl.DataFrame, tag: str) -> list[str]:
+    missing = [c for c in GRID_COLUMNS if c not in df.columns]
+    if missing:
+        raise SentimentContractError(f"{tag}grid table lacks {missing[:3]}")
+    if score_columns(df.columns):
+        raise SentimentContractError(f"{tag}a grid table carries no SENT_* column")
+    for c in GRID_COLUMNS:
+        if df.schema[c] != pl.Float16:
+            raise SentimentContractError(f"{tag}{c} is {df.schema[c]}, expected Float16")
+    if not df.height:
+        return list(GRID_COLUMNS)
+    nulls = df.select(pl.sum_horizontal(pl.col(c).is_null().cast(pl.Int32)
+                                        for c in GRID_COLUMNS)).to_series().to_numpy()
+    mixed = (nulls > 0) & (nulls < len(GRID_COLUMNS))
+    if mixed.any():
+        raise SentimentContractError(f"{tag}{int(mixed.sum())} row(s) with some but not all "
+                                     "P_* null")
+    full = df.filter(pl.col(GRID_COLUMNS[0]).is_not_null()).select(GRID_COLUMNS)
+    if full.height:
+        P = full.to_numpy().astype(np.float64)
+        if not np.isfinite(P).all() or (P < 0).any() or (P > 1).any():
+            raise SentimentContractError(f"{tag}P_* values must be finite in [0, 1]")
+        tot = P.sum(axis=1)
+        bad = (tot < GRID_ROW_SUM[0]) | (tot > GRID_ROW_SUM[1])
+        if bad.any():
+            raise SentimentContractError(f"{tag}{int(bad.sum())} row sum(s) outside "
+                                         f"{list(GRID_ROW_SUM)}, e.g. {tot[bad][:3].tolist()}")
+    return list(GRID_COLUMNS)
 
 
 def validate_sentiment_frame(df: pl.DataFrame, *, where: str = "") -> list[str]:
     """Raise ``SentimentContractError`` unless ``df`` satisfies the contract.
 
-    Returns the score column names. Checks: RP_STORY_ID String, no null, unique;
-    at least one SENT_* column; every SENT_* column Float32, no null, every
-    value NaN or finite in [-1, 1].
+    Returns the sentiment column names. Checks: RP_STORY_ID String, no null, unique;
+    then either the grid rules (P_00..P_40, see the module docstring) or: at least
+    one SENT_* column, every one Float32, no null, every value NaN or finite in [-1, 1].
     """
     tag = f"{where}: " if where else ""
     if ID_COL not in df.columns:
@@ -91,6 +138,8 @@ def validate_sentiment_frame(df: pl.DataFrame, *, where: str = "") -> list[str]:
     if df[ID_COL].n_unique() != df.height:
         raise SentimentContractError(f"{tag}{df.height - df[ID_COL].n_unique()} duplicate "
                                      f"{ID_COL}")
+    if is_grid(df.columns):
+        return _validate_grid(df, tag)
     cols = score_columns(df.columns)
     if not cols:
         raise SentimentContractError(f"{tag}no {SCORE_PREFIX}* score column")
@@ -129,8 +178,9 @@ def align_to_stories(scores: pl.DataFrame, story_ids: pl.Series, *,
             f"{tag}{extra.height} scored stor(y/ies) absent from the headlines month, "
             f"e.g. {extra[ID_COL].head(3).to_list()}")
     out = base.join(scores, on=ID_COL, how="left", maintain_order="left")
-    floats = [c for c, t in out.schema.items() if c != ID_COL and t.is_float()]
-    return out.with_columns(pl.col(c).fill_null(float("nan")) for c in floats)
+    # a vendor score of a missing story is NaN ("no score"); a grid row stays all null
+    return out.with_columns(pl.col(c).fill_null(float("nan"))
+                            for c in score_columns(out.columns))
 
 
 def headline_story_ids(headlines_month: Path) -> pl.Series:
@@ -173,7 +223,9 @@ def write_partition(produce: MonthProducer, headlines_part: Path, out_path: Path
     if got != list(columns):
         raise SentimentContractError(f"{tag}: score columns {got} != declared {list(columns)}")
     write_month(frame, out_path)
-    n_scored = int(frame.select(pl.col(columns[0]).is_nan().not_().sum()).item())
+    first = pl.col(columns[0])
+    n_scored = int(frame.select((first.is_not_null() if is_grid(columns)
+                                 else first.is_nan().not_()).sum()).item())
     log.info("%s  wrote %d stories (%d with %s) in %.0fs", tag, frame.height, n_scored,
              columns[0], time.monotonic() - t0)
 
@@ -199,6 +251,48 @@ def fill_months(
         write_partition(produce, headlines_dir / name, out_dir / name, columns,
                         f"[{i}/{len(todo)}] {name.removesuffix('.parquet')}")
     return len(todo)
+
+
+def write_summary(out_dir: Path, columns: Sequence[str]) -> dict[str, Any]:
+    """Per year: the null share and the deciles of SENT and CONF of every rule (grid
+    tables: ``nlp.sentiment.ordinal_sql.RULES``) or of every SENT_* column (vendor; no
+    CONF). Thresholds are scoring choices, so no bucket shares are reported here: the
+    deciles show where any threshold would fall. Written to ``summary.json``."""
+    import json
+
+    import duckdb
+
+    from nlp.sentiment.ordinal_sql import RULES, grid_select_sql, score_select_sql
+
+    by_year: dict[str, list[Path]] = {}
+    for f in sorted(out_dir.glob("*.parquet")):
+        by_year.setdefault(f.stem[:4], []).append(f)
+    grid = is_grid(columns)
+    levels = "[" + ", ".join(str(q) for q in DECILES) + "]"
+    years: dict[str, Any] = {}
+    con = duckdb.connect()
+    try:
+        con.execute("SET enable_progress_bar=false")
+        for year, files in by_year.items():
+            rel = "read_parquet([" + ", ".join(f"'{f}'" for f in files) + "])"
+            measures = ({rule: grid_select_sql(rel, rule) for rule in RULES} if grid
+                        else {c: score_select_sql(rel, c) for c in columns})
+            entry: dict[str, Any] = {}
+            for name, sql in measures.items():
+                n, n_null, sent_q, conf_q = con.sql(
+                    f"SELECT count(*), count(*) - count(SENT), quantile_cont(SENT, {levels}), "
+                    f"quantile_cont(CONF, {levels}) FROM ({sql})").fetchone()
+                entry[name] = {"null_share": n_null / n if n else None,
+                               "sent_deciles": sent_q, "conf_deciles": conf_q}
+            first = next(iter(entry.values()))
+            entry["n"], entry["null_share"] = n, first["null_share"]
+            years[year] = entry
+    finally:
+        con.close()
+    summary = {"columns": "P_00..P_40 (grid)" if grid else list(columns),
+               "deciles": list(DECILES), "years": years}
+    (out_dir / SUMMARY_FILE).write_text(json.dumps(summary, indent=2) + "\n")
+    return summary
 
 
 def sentiment_layout(headlines: Artifact, start: date | None = None,
@@ -283,7 +377,10 @@ class HeadlineSentimentJob(Job):
         if not n:
             raise RuntimeError(f"no sentiment partition written for {self.layout.start}.."
                                f"{self.layout.end} from {self.headlines.artifact_id}")
-        ctx.note(f"{n} {self.layout.freq} partition(s) written")
+        summary = write_summary(ctx.out_dir, self.columns)
+        null_share = {y: v["null_share"] for y, v in summary["years"].items()}
+        ctx.note(f"{n} {self.layout.freq} partition(s) written; null share per year "
+                 f"{null_share}; per-year deciles of SENT / CONF in {SUMMARY_FILE}")
 
     @classmethod
     def from_artifact(cls, artifact: Artifact, index: DatalakeIndex,
@@ -311,11 +408,6 @@ class HeadlineSentimentJob(Job):
         model.add_argument("--model-path", default=None,
                            help="local backend: default the family's model path variable")
         model.add_argument("--batch-size", type=int, default=None)
-        model.add_argument("--score-rule", default=None,
-                           help="ravenbert: mean (default) | median; finbert: band")
-        model.add_argument("--min-confidence", type=float, default=None)
-        model.add_argument("--canonical-columns", action="store_true",
-                           help="also write the canonical probabilities as P_* (Float16)")
 
     @classmethod
     def from_args(cls, args: Any, index: DatalakeIndex) -> HeadlineSentimentJob:
@@ -440,7 +532,7 @@ def verify_artifact(artifact: Artifact) -> list[Finding]:
         err(f"{len(outside)} file(s) outside the declared range: {sorted(outside)[:3]}")
     for name in present:
         names = pq.read_schema(artifact.path / name).names
-        if ID_COL not in names or score_columns(names) != columns:
+        if ID_COL not in names or sentiment_columns(names) != columns:
             err(f"{name}: columns {names} do not match declared {columns}")
 
     headlines = None

@@ -1,23 +1,21 @@
-"""Sentimeters: score maps (hand-checked), confidence, NaN rule, shapes, checks.
-
-The FinBERT band tests are the ones previously in
-tests/ravenpack/headlines/test_sentiment_model.py, moved with the formula.
-"""
+"""Sentimeters: the 41-grid remap, the load-time rules (SQL vs numpy), storage precision,
+the empty-text rule, shapes and head checks."""
 from __future__ import annotations
 
+from pathlib import Path
+
+import duckdb
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from nlp.backends.base import Backend, IncompatibleModelError, softmax64
 from nlp.backends.local import LocalBackend
 from nlp.sentiment import FinbertSentimeter, RavenbertSentimeter, load_sentimeter
-from nlp.sentiment.finbert import THIRD, finbert_band, top_margin
-from nlp.sentiment.ravenbert import (
-    CLASS_VALUES,
-    ordinal_dispersion,
-    ordinal_mean,
-    ordinal_median,
-)
+from nlp.sentiment.base import GRID, GRID_COLUMNS, band_matrix, to_grid
+from nlp.sentiment.finbert import THIRD
+from nlp.sentiment.ordinal_sql import RULES, grid_select_sql, reference
 
 from .conftest import TEXTS
 
@@ -43,142 +41,208 @@ class FixedBackend(Backend):
 
 RB_LABELS = [f"LABEL_{i}" for i in range(41)]
 FB_LABELS = ["positive", "negative", "neutral"]          # not canonical order
+FB_EDGES = FinbertSentimeter.band_edges
 
 
-def _band(neg, neu, pos) -> tuple[float, float]:
-    s, lab = finbert_band(np.array([neg]), np.array([neu]), np.array([pos]))
-    return float(s[0]), float(lab[0])
+def _fb(neg, neu, pos) -> np.ndarray:
+    return to_grid(np.array([[neg, neu, pos]]), FB_EDGES)
 
 
-# ---------------------------------------------------------------------------
-# FinBERT band (moved)
-# ---------------------------------------------------------------------------
+def _write_grid(path: Path, G: np.ndarray) -> Path:
+    """A grid table as the sentiment job writes it: Float16, all-null rows kept null."""
+    G16 = np.asarray(G, dtype=np.float16)
+    empty = np.isnan(G16).all(axis=1)
+    cols = {"RP_STORY_ID": pa.array([f"{i:07d}" for i in range(len(G16))])}
+    for j, c in enumerate(GRID_COLUMNS):
+        cols[c] = pa.array(G16[:, j], type=pa.float16(), mask=empty)
+    pq.write_table(pa.table(cols), path)
+    return path
 
-class TestFinbertBand:
-    def test_hand_checked_values(self):
-        s, lab = _band(0.05, 0.50, 0.45)          # argmax neutral: (0.40 / 0.45) / 3
-        assert s == pytest.approx(0.4 / 0.45 / 3) and s == pytest.approx(0.2963, abs=1e-4)
-        assert lab == 0.0
-        s, lab = _band(0.10, 0.20, 0.70)          # positive: 1/3 + (2/3)(0.70 - 0.20)
-        assert s == pytest.approx(2 / 3) and lab == 1.0
-        s, lab = _band(0.70, 0.20, 0.10)
-        assert s == pytest.approx(-2 / 3) and lab == -1.0
-        assert _band(0.0, 0.0, 1.0) == (pytest.approx(1.0), 1.0)
-        assert _band(1.0, 0.0, 0.0) == (pytest.approx(-1.0), -1.0)
-        assert _band(0.0, 1.0, 0.0) == (0.0, 0.0)
-        assert _band(0.30, 0.40, 0.30)[0] == 0.0
 
-    def test_ties(self):
-        assert _band(0.2, 0.4, 0.4) == (pytest.approx(THIRD), 1.0)
-        assert _band(0.4, 0.4, 0.2) == (pytest.approx(-THIRD), -1.0)
-        assert _band(0.45, 0.10, 0.45) == (0.0, 0.0)
-        assert _band(1 / 3, 1 / 3, 1 / 3) == (0.0, 0.0)
+def _sql(path: Path, rule: str) -> tuple[np.ndarray, np.ndarray]:
+    rows = duckdb.sql(grid_select_sql(f"read_parquet('{path}')", rule)
+                      + " ORDER BY RP_STORY_ID").fetchall()
+    return (np.array([np.nan if r[1] is None else r[1] for r in rows]),
+            np.array([np.nan if r[2] is None else r[2] for r in rows]))
 
-    @pytest.mark.parametrize("p_neg", [0.0, 0.1, 0.25])
-    def test_continuous_across_neutral_polar_boundaries(self, p_neg):
-        rest = 1.0 - p_neg
-        for sign, flip in ((1, False), (-1, True)):
-            for e in (1e-7, 1e-9):
-                a, b = (rest / 2 + e, rest / 2 - e), (rest / 2 - e, rest / 2 + e)
-                for pole, neu in (a, b):
-                    probs = (p_neg, neu, pole) if not flip else (pole, neu, p_neg)
-                    assert _band(*probs)[0] == pytest.approx(sign * THIRD, abs=1e-6)
 
-    def test_band_matches_argmax_on_random_simplex(self):
-        p = np.random.default_rng(0).dirichlet([0.7, 0.7, 0.7], size=200_000)
-        s, lab = finbert_band(p[:, 0], p[:, 1], p[:, 2])
-        np.testing.assert_array_equal(lab, np.array([-1.0, 0.0, 1.0])[np.argmax(p, axis=1)])
-        assert (s[lab == 1] >= THIRD).all() and (s[lab == -1] <= -THIRD).all()
-        assert (np.abs(s[lab == 0]) < THIRD).all() and (np.abs(s) <= 1.0).all()
+def _distributions(rng: np.random.Generator, n: int) -> np.ndarray:
+    """Peaked, flat, bimodal, point masses and FinBERT-remapped rows (all valid)."""
+    k = n // 5
+    bimodal = np.zeros((k, 41))
+    bimodal[:, 2], bimodal[:, 38] = 0.5, 0.5
+    bimodal = 0.9 * bimodal + 0.1 * rng.dirichlet(np.ones(41), size=k)
+    parts = [rng.dirichlet(np.full(41, 0.05), size=k),              # peaked
+             rng.dirichlet(np.full(41, 20.0), size=k),              # flat
+             bimodal,
+             np.eye(41)[rng.integers(0, 41, k)],                    # point masses
+             to_grid(rng.dirichlet(np.ones(3), size=n - 4 * k), FB_EDGES)]
+    return np.vstack(parts)
 
 
 # ---------------------------------------------------------------------------
-# RavenBERT ordinal maps
+# The remap (base.band_matrix / to_grid)
 # ---------------------------------------------------------------------------
 
-class TestRavenbertMaps:
-    def test_mean_hand_checked(self):
-        p = np.zeros((2, 41))
-        p[0, [40, 39, 20, 0]] = [0.5, 0.2, 0.2, 0.1]        # s = 1, 0.95, 0, -1
-        p[1, 20] = 1.0
-        np.testing.assert_allclose(ordinal_mean(p), [0.5 + 0.2 * 0.95 - 0.1, 0.0])
+class TestRemap:
+    def test_ravenbert_is_the_identity(self):
+        assert np.array_equal(band_matrix(RavenbertSentimeter.band_edges), np.eye(41))
 
-    def test_median_point_masses_and_interpolation(self):
-        p = np.zeros((5, 41))
-        p[0, 30] = 1.0                                       # point mass at s = 0.5
-        p[1, 0] = 1.0                                        # point mass at s = -1
-        p[2, 40] = 1.0                                       # point mass at s = +1
-        p[3, [20, 21]] = [0.25, 0.75]                        # bin of s=.05 is [.025, .075]
-        p[4, [0, 40]] = [0.5, 0.5]                           # bimodal: top of the lower bin
-        med = ordinal_median(p)
-        np.testing.assert_allclose(med[:3], [0.5, -1.0, 1.0], atol=1e-12)
-        # j = 21: s_21 - h + (0.5 - 0.25) / 0.75 * step
-        assert med[3] == pytest.approx(0.05 - 0.025 + (0.25 / 0.75) * 0.05)
-        assert med[4] == pytest.approx(-0.975)
+    def test_mass_conservation(self):
+        rng = np.random.default_rng(0)
+        for edges in (FB_EDGES, (-1.0, 0.0, 1.0), (-1.0, -0.6, -0.2, 0.2, 0.6, 1.0)):
+            P = rng.dirichlet(np.ones(len(edges) - 1), size=500)
+            np.testing.assert_allclose(to_grid(P, edges).sum(axis=1), 1.0, atol=1e-12)
 
-    def test_dispersion_orders_adjacent_vs_opposite(self):
-        adjacent = np.zeros(41)
-        adjacent[[26, 27, 28]] = 1 / 3                       # s = 0.30, 0.35, 0.40
-        opposite = np.zeros(41)
-        opposite[[0, 40]] = 0.5                              # bimodal, EV = 0
-        sig = ordinal_dispersion(np.stack([adjacent, opposite]))
-        assert sig[0] < 0.05 and sig[1] == pytest.approx(1.0)
-        # entropy would rank them the other way round
-        ent = [-(q[q > 0] * np.log(q[q > 0])).sum() for q in (adjacent, opposite)]
-        assert ent[0] > ent[1]
+    def test_equal_density_within_each_band_with_split_edge_bins(self):
+        M = band_matrix(FB_EDGES)
+        lo = np.maximum(GRID - 0.025, -1.0)
+        hi = np.minimum(GRID + 0.025, 1.0)
+        for c, (a, b) in enumerate(zip(FB_EDGES[:-1], FB_EDGES[1:])):
+            overlap = np.clip(np.minimum(hi, b) - np.maximum(lo, a), 0.0, None)
+            np.testing.assert_allclose(M[c], overlap / (b - a), atol=1e-12)   # density 1/width
+            full = (lo >= a - 1e-12) & (hi <= b + 1e-12) & (hi - lo > 0.04)
+            assert len(set(M[c, full].tolist())) == 1                   # bit-identical
+        straddle = np.flatnonzero((M > 0).sum(axis=0) == 2)              # bins across +-1/3
+        assert GRID[straddle].round(2).tolist() == [-0.35, 0.35]
+        np.testing.assert_allclose(M[:, straddle].sum(axis=0), [0.075, 0.075], atol=1e-12)
 
-    def test_all_maps_in_range_on_random_simplex(self):
-        q = np.random.default_rng(1).dirichlet(np.ones(41) * 0.3, size=5000)
-        for f in (ordinal_mean, ordinal_median):
-            assert (np.abs(f(q)) <= 1 + 1e-12).all()
-        assert ((ordinal_dispersion(q) >= 0) & (ordinal_dispersion(q) <= 1)).all()
-        np.testing.assert_allclose(ordinal_mean(q), q @ CLASS_VALUES)
+    def test_finbert_mean_argmax_and_confidence(self):
+        rng = np.random.default_rng(1)
+        P = rng.dirichlet(np.ones(3), size=2000)
+        s_mean, _ = reference(to_grid(P, FB_EDGES), "mean")
+        np.testing.assert_allclose(s_mean, (2 / 3) * (P[:, 2] - P[:, 0]), atol=1.5e-3)
+        for p, want_s, want_c in (([0.8, 0.15, 0.05], -0.675, 0.90 * 0.8),
+                                  ([0.1, 0.8, 0.1], 0.0, 0.975 * 0.8),
+                                  ([0.05, 0.15, 0.8], 0.675, 0.90 * 0.8)):
+            s, c = reference(_fb(*p), "argmax")
+            assert s[0] == pytest.approx(want_s, abs=1e-12)
+            assert c[0] == pytest.approx(want_c, abs=1e-12)
+
+    @pytest.mark.parametrize("stored", [np.float64, np.float16])
+    def test_polar_wins_when_most_probable(self, stored):
+        # p_pos = 0.50 vs p_neu = 0.47: with point-count splitting neutral would win
+        s, c = reference(_fb(0.03, 0.47, 0.50).astype(stored), "argmax")
+        assert s[0] > 0 and s[0] == pytest.approx(0.675)
+        assert c[0] == pytest.approx(0.90 * 0.50, abs=1e-3)
+
+    @pytest.mark.parametrize("stored", [np.float64, np.float16])
+    def test_neutral_wins_without_cross_band_tie(self, stored):
+        G = _fb(0.0, 0.51, 0.49).astype(stored)
+        s, c = reference(G, "argmax")
+        assert s[0] == pytest.approx(0.0, abs=1e-12)          # mean of s in [-0.3, 0.3]
+        assert c[0] == pytest.approx(0.975 * 0.51, abs=1e-3)
+        q = G.astype(np.float64) / G.astype(np.float64).sum()
+        top = np.flatnonzero(q[0] == q[0].max())
+        assert np.all(np.abs(GRID[top]) <= THIRD)                        # all in the neutral band
+
+    def test_two_and_five_class_heads(self):
+        G2 = to_grid(np.array([[0.3, 0.7]]), (-1.0, 0.0, 1.0))
+        assert G2[0, GRID < 0].sum() == pytest.approx(0.3 - 0.3 * 0.025)  # s=0 bin splits
+        assert G2[0, 20] == pytest.approx(0.3 * 0.025 + 0.7 * 0.025)
+        edges5 = (-1.0, -0.6, -0.2, 0.2, 0.6, 1.0)
+        G5 = to_grid(np.eye(5), edges5)
+        for c, (a, b) in enumerate(zip(edges5[:-1], edges5[1:])):
+            inside = (GRID > a) & (GRID < b)
+            outside = (GRID < a - 0.03) | (GRID > b + 0.03)
+            assert G5[c, inside].sum() > 0.8 and G5[c, outside].sum() == 0
+
+    def test_bad_edges_refused(self):
+        with pytest.raises(ValueError, match="band edges"):
+            band_matrix((-1.0, 0.5, 0.2, 1.0))
+        with pytest.raises(ValueError, match="band edges"):
+            band_matrix((-0.9, 0.0, 1.0))
 
 
-def test_top_margin():
-    np.testing.assert_allclose(top_margin(np.array([[0.2, 0.5, 0.3], [1 / 3] * 3])),
-                               [0.2, 0.0], atol=1e-12)
+# ---------------------------------------------------------------------------
+# The load-time rules: SQL (ordinal_sql) vs the numpy reference
+# ---------------------------------------------------------------------------
+
+class TestOrdinalSql:
+    def test_sql_matches_numpy_on_the_same_stored_values(self, tmp_path):
+        rng = np.random.default_rng(2)
+        G16 = _distributions(rng, 10_000).astype(np.float16)
+        path = _write_grid(tmp_path / "g.parquet", G16)
+        for rule in RULES:
+            s_sql, c_sql = _sql(path, rule)
+            s_ref, c_ref = reference(G16, rule)
+            np.testing.assert_allclose(s_sql, s_ref, rtol=0, atol=1e-6, err_msg=rule)
+            np.testing.assert_allclose(c_sql, c_ref, rtol=0, atol=1e-6, err_msg=rule)
+            assert np.all((s_sql >= -1) & (s_sql <= 1)) and np.all((c_sql >= 0) & (c_sql <= 1))
+
+    def test_float16_storage_within_1e3_of_float64(self):
+        """Float16 stores each P_i to 2^-11 relative. mean: within 1e-3 everywhere.
+        median: a quantile moves by (error in the cumulative mass) / (density there), so it
+        is within 1e-3 wherever the density at the three quartiles is >= 0.5 (per unit of
+        s); below that (the valley of a bimodal output) it can move more. argmax: within
+        1e-3 unless the two largest probabilities are closer than 2^-10 relative, where
+        Float16 cannot separate them (they may tie, ties are averaged, or flip). The test
+        also asserts that differences occur ONLY in those two zones."""
+        rng = np.random.default_rng(3)
+        G = _distributions(rng, 5_000)
+        top2 = np.sort(G, axis=1)[:, -2:]
+        clear_max = (top2[:, 1] - top2[:, 0]) >= 2.0 ** -10 * top2[:, 1]
+        q = G / G.sum(axis=1, keepdims=True)
+        c = np.cumsum(q, axis=1)
+        width = np.minimum(GRID + 0.025, 1.0) - np.maximum(GRID - 0.025, -1.0)
+        dense = np.ones(len(G), bool)
+        for level in (0.25, 0.5, 0.75):
+            j = np.argmax(c >= level, axis=1)
+            dense &= q[np.arange(len(G)), j] / width[j] >= 0.5
+        zone = {"mean": np.ones(len(G), bool), "median": dense, "argmax": clear_max}
+        for rule in RULES:
+            s64, c64 = reference(G, rule)
+            s16, c16 = reference(G.astype(np.float16), rule)
+            ok = zone[rule]
+            np.testing.assert_allclose(s16[ok], s64[ok], atol=1e-3, err_msg=rule)
+            np.testing.assert_allclose(c16[ok], c64[ok], atol=1e-3, err_msg=rule)
+            differ = ~np.isclose(c16, c64, atol=1e-3) | ~np.isclose(s16, s64, atol=1e-3)
+            assert not (differ & ok).any()
+
+    def test_argmax_ties_are_averaged(self, tmp_path):
+        tie = np.zeros((1, 41))
+        tie[0, [4, 36]] = 0.5                                           # -0.8 and +0.8
+        s, c = _sql(_write_grid(tmp_path / "t.parquet", np.vstack([tie, _fb(0.45, 0.1, 0.45)])),
+                    "argmax")
+        assert s[0] == pytest.approx(0.0) and c[0] == pytest.approx(1.0)
+        assert s[1] == pytest.approx(0.0, abs=1e-12)                    # pos = neg tie -> 0
+
+    def test_null_row_gives_null_sent_and_conf(self, tmp_path):
+        G = np.vstack([np.full((1, 41), np.nan), np.eye(41)[[30]]])
+        path = _write_grid(tmp_path / "n.parquet", G)
+        for rule in RULES:
+            s, c = _sql(path, rule)
+            assert np.isnan(s[0]) and np.isnan(c[0])
+            assert s[1] == pytest.approx(GRID[30]) or rule == "median"
+
+    def test_unknown_rule_refused(self):
+        with pytest.raises(ValueError, match="rule"):
+            grid_select_sql("t", "mode")
 
 
 # ---------------------------------------------------------------------------
 # Sentimeter behaviour (fixed backend)
 # ---------------------------------------------------------------------------
 
-def test_finbert_canonical_order_read_from_labels():
+def test_finbert_canonical_order_and_grid():
     rows = [[0.7, 0.1, 0.2]]                                 # pos, neg, neu
     s = FinbertSentimeter(FixedBackend(FB_LABELS, rows))
     np.testing.assert_allclose(s.canonical("x"), [0.1, 0.2, 0.7])
-    assert s.score("x") == pytest.approx(_band(0.1, 0.2, 0.7)[0])
-    assert s.confidence("x") == pytest.approx(0.5)
+    np.testing.assert_allclose(s.grid("x"), _fb(0.1, 0.2, 0.7)[0], atol=1e-15)
 
 
 def test_shapes_scalar_for_one_text_array_for_many():
     rows = np.full((3, 41), 1 / 41)
     s = RavenbertSentimeter(FixedBackend(RB_LABELS, rows))
-    assert isinstance(s.score("one"), float)
-    assert s.score(["a", "b", "c"]).shape == (3,)
+    assert s.grid("one").shape == (41,) and s.grid(["a", "b", "c"]).shape == (3, 41)
     assert s.canonical("one").shape == (41,) and s.canonical(["a", "b"]).shape == (2, 41)
 
 
-def test_min_confidence_sets_nan_not_zero():
-    bimodal = np.zeros(41)
-    bimodal[[0, 40]] = 0.5
-    peaked = np.zeros(41)
-    peaked[30] = 1.0
-    s = RavenbertSentimeter(FixedBackend(RB_LABELS, [bimodal, peaked]), min_confidence=0.5)
-    out = s.evaluate(["a", "b"])
-    assert np.isnan(out["score"][0]) and out["score"][1] == pytest.approx(0.5)
-    assert out["confidence"][0] == pytest.approx(0.0, abs=1e-6)
-    assert out["score"].dtype == np.float32
-
-
-def test_median_rule_selectable_and_unknown_rule_refused():
-    p = np.zeros(41)
-    p[[20, 21]] = [0.25, 0.75]
-    s = RavenbertSentimeter(FixedBackend(RB_LABELS, [p]), score_rule="median")
-    assert s.score("x") == pytest.approx(0.025 + 0.25 / 0.75 * 0.05, rel=1e-6)
-    with pytest.raises(ValueError, match="score_rule"):
-        FinbertSentimeter(FixedBackend(FB_LABELS, [[1, 0, 0]]), score_rule="mean")
+def test_empty_cleaned_text_is_an_all_nan_row():
+    s = RavenbertSentimeter(FixedBackend(RB_LABELS, np.eye(41)[[5, 6]]), clean=False)
+    G = s.grid_batch(["stocks rally", "   ", "fed"])
+    assert np.isnan(G[1]).all() and not np.isnan(G[[0, 2]]).any()
+    np.testing.assert_allclose(G[[0, 2]], np.eye(41)[[5, 6]])            # rows stay aligned
 
 
 @pytest.mark.parametrize("cls,labels", [
@@ -193,12 +257,12 @@ def test_incompatible_heads_refused(cls, labels):
 
 
 def test_columns_and_card():
-    s = FinbertSentimeter(FixedBackend(FB_LABELS, [[0.2, 0.3, 0.5]]), min_confidence=0.1)
-    assert s.columns() == ["SENT_SCORE", "SENT_CONF"]
-    assert s.columns(canonical=True)[-3:] == ["P_NEG", "P_NEU", "P_POS"]
+    s = FinbertSentimeter(FixedBackend(FB_LABELS, [[0.2, 0.3, 0.5]]))
+    assert s.columns() == list(GRID_COLUMNS)
     card = s.model_card()
-    assert card.model_id == "finbert-sentiment" and card.version == "2.0"
-    assert card.backend == "fixed" and card.serving["sentimeter"]["min_confidence"] == 0.1
+    assert card.model_id == "finbert-sentiment" and card.version == "2.1"
+    assert card.backend == "fixed"
+    assert card.serving["sentimeter"]["band_edges"] == pytest.approx(list(FB_EDGES))
     assert card.serving["checks"]["canonical_order"] == [1, 2, 0]
 
 
@@ -206,14 +270,17 @@ def test_columns_and_card():
 # Real classifiers (tiny random weights) through the local backend
 # ---------------------------------------------------------------------------
 
-def test_ravenbert_score_equals_sentiment_model_predict(ravenbert_like_dir):
+def test_ravenbert_grid_mean_equals_sentiment_model_predict(ravenbert_like_dir):
     from ravenbert.sentiment.model import SentimentModel
 
     ref = SentimentModel.from_path(ravenbert_like_dir, device="cpu", precision="fp32")
     want = ref.predict(TEXTS, batch_size=64, optimized_inference=False)
     s = load_sentimeter("ravenbert", "local", "float32", model_path=str(ravenbert_like_dir),
                         device="cpu", batch_size=2)
-    np.testing.assert_allclose(s.score(TEXTS), want, atol=1e-6)
+    got = reference(s.grid(TEXTS), "mean")[0]
+    empty = np.array([not t.strip() for t in TEXTS])
+    assert np.isnan(got[empty]).all()                        # no model output for ""
+    np.testing.assert_allclose(got[~empty], np.asarray(want)[~empty], atol=1e-6)
 
 
 def test_finbert_local_matches_manual_reorder(finbert_like_dir):
@@ -230,6 +297,10 @@ def test_finbert_local_matches_manual_reorder(finbert_like_dir):
         logits = model(**tok(cleaned, padding=True, return_tensors="pt")).logits.double().numpy()
     want = softmax64(logits)[:, [1, 2, 0]]                  # neg, neu, pos
     np.testing.assert_allclose(s.canonical(TEXTS), want, atol=1e-6)
+    empty = np.array([not t.strip() for t in cleaned])
+    G = s.grid(TEXTS)
+    assert np.isnan(G[empty]).all()
+    np.testing.assert_allclose(G[~empty], to_grid(want[~empty], FB_EDGES), atol=1e-6)
 
 
 def test_load_sentimeter_rejects_embedx_and_unknown_model():
