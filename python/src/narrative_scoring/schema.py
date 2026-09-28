@@ -67,10 +67,15 @@ PRIMITIVE_DAILY_SCHEMA: pl.Schema = pl.Schema(
 #   PCT_TAU_PRUNED_WITHIN_Q   1 - N_RETAINED_PRE_JUMP / N_Q_CANDIDATES
 #   PCT_JUMP_APPLIED          share of headlines whose retained set the jump cut shortened
 #   MEAN_JUMP_GAP             mean cutting gap over those headlines (null when none)
+#   N_HEADLINES               the day's headlines before any sentiment filter (the attention
+#                             denominator); N_SCORED the headlines actually scored (= N_HEADLINES
+#                             in an all-headlines run, the bucket's count in a filtered run).
+#                             Every funnel count and share refers to the N_SCORED headlines.
 DAY_DIAGNOSTICS_SCHEMA: pl.Schema = pl.Schema(
     {
         "DATE":                      pl.Date,
         "N_HEADLINES":               pl.Int64,
+        "N_SCORED":                  pl.Int64,
         "N_UNASSIGNED":              pl.Int64,
         "N_F0_SURVIVORS_PRE_Q":      pl.Int64,
         "N_Q_CANDIDATES":            pl.Int64,
@@ -91,7 +96,7 @@ DAY_DIAGNOSTICS_SCHEMA: pl.Schema = pl.Schema(
         "F0_CONFIG_ID":              pl.String,
         "TAU_SOURCE_ID":             pl.String,
         "MU_ASOF_ID":                pl.String,
-        "SENTIMENT_SOURCE_ID":       pl.String,     # headline_sentiment artifact:column
+        "SENTIMENT_SOURCE_ID":       pl.String,     # sentiment artifact:rule:bucket
         "RSS_GB_BEFORE":             pl.Float64,
         "RSS_GB_AFTER":              pl.Float64,
         "SECONDS":                   pl.Float64,
@@ -100,8 +105,12 @@ DAY_DIAGNOSTICS_SCHEMA: pl.Schema = pl.Schema(
 
 # The day_diagnostics schema before SENTIMENT_SOURCE_ID existed; artifacts written with it
 # stay valid (the verifier accepts both).
+# older layouts, still valid: V2 before N_SCORED (a reader treats its absence as
+# N_SCORED = N_HEADLINES), V1 also before SENTIMENT_SOURCE_ID
+DAY_DIAGNOSTICS_SCHEMA_V2: pl.Schema = pl.Schema(
+    {k: v for k, v in DAY_DIAGNOSTICS_SCHEMA.items() if k != "N_SCORED"})
 DAY_DIAGNOSTICS_SCHEMA_V1: pl.Schema = pl.Schema(
-    {k: v for k, v in DAY_DIAGNOSTICS_SCHEMA.items() if k != "SENTIMENT_SOURCE_ID"})
+    {k: v for k, v in DAY_DIAGNOSTICS_SCHEMA_V2.items() if k != "SENTIMENT_SOURCE_ID"})
 
 # f0_monthly_partitions: one row (one file) per closed calendar month.
 F0_PARTITION_SCHEMA: pl.Schema = pl.Schema(

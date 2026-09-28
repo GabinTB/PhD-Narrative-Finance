@@ -1,5 +1,5 @@
 """End-to-end: streaming vs dense reference, live == historical, point-in-time guards,
-metadata, sentiment split, day diagnostics, null-partition feed."""
+metadata, sentiment-bucket runs, day diagnostics, null-partition feed."""
 from __future__ import annotations
 
 from datetime import date, timedelta
@@ -12,10 +12,11 @@ import pytest
 from narrative_scoring._kernels import HAVE_SELECT
 from narrative_scoring.calibration import LookaheadError, TauRecord
 from narrative_scoring.config import (
+    SENTIMENT_BUCKETS,
     AggRule,
     PoolRule,
     ScoringConfig,
-    SentimentSplit,
+    SentimentFilter,
     n_candidates_for,
 )
 from narrative_scoring.partitions import MonthlyNullPartitionWriter, load_partitions
@@ -24,10 +25,12 @@ from narrative_scoring.primitives import primitive_scores, scoring_matrix
 from narrative_scoring.schema import DAY_DIAGNOSTICS_SCHEMA, EMBEDDING_DIM, NARRATIVE_DAILY_SCHEMA
 from narrative_scoring.streaming import InMemoryHeadlineSource, MemoryBudgetExceeded
 from narrative_scoring.validation import (
+    SentimentRun,
     attention,
     reference_day,
     reference_headline_narrative,
     reference_select,
+    sum_sentiment_runs,
     summarize,
 )
 from nlp.corrections import Correction, apply_mode
@@ -36,8 +39,6 @@ from nlp.reference_vector import resolve_reference
 from .conftest import FixedTauProvider, unit_rows
 
 D0 = date(2008, 9, 15)
-SPLIT = {"sentiment_split": SentimentSplit.SIGN, "sentiment_source": "test",
-         "sentiment_column": "SENT_X"}
 
 
 def _mu_df(dates: list[date], seed: int = 0) -> pl.DataFrame:
@@ -309,8 +310,8 @@ def test_metadata_is_complete(world):
                       use_kernel=False, seed=7, code_version="deadbeef")
     m = res.metadata.to_dict()
     for key in ("mode", "paraphrase_style", "paraphrase_pooling", "q", "narrative_agg",
-                "jump_cut", "jump_min_candidates", "alpha", "trim_frac", "sentiment_split",
-                "neutral_eps", "null_draws_per_headline"):
+                "jump_cut", "jump_min_candidates", "alpha", "trim_frac", "sentiment",
+                "sentiment_rule", "neg_max", "pos_min", "min_conf", "null_draws_per_headline"):
         assert key in m["config"]
     assert m["percentile_axis"] == "row_wise"
     assert m["n_candidates"] == n_candidates_for(0.75, world["table"].n_primitives)
@@ -369,144 +370,206 @@ def test_date_range_helper():
 
 
 # ---------------------------------------------------------------------------
-# Sentiment split
+# Sentiment-bucket runs (in memory: a keep mask per day plays the bucket filter)
 # ---------------------------------------------------------------------------
 
-def _sentiment_world(world, seed=5):
+def _bucket_labels(world, seed=5) -> dict[date, np.ndarray]:
+    """One bucket per headline; the second day has no negative headline at all."""
     rng = np.random.default_rng(seed)
-    sent = {}
-    for d, X in world["X"].items():
-        s = rng.normal(size=X.shape[0]).astype(np.float32)
-        s[::4] = np.nan                                  # missing every 4th
-        s[1::9] = 0.0                                    # exact zeros
-        sent[d] = s
-    return sent
+    names = np.array([b.value for b in SENTIMENT_BUCKETS])
+    out = {}
+    for i, (d, X) in enumerate(sorted(world["X"].items())):
+        lab = names[rng.integers(0, 4, X.shape[0])]
+        if i == 1:
+            lab[lab == "negative"] = "neutral"
+        out[d] = lab
+    return out
+
+
+def _bucket_cfg(bucket, **kw) -> ScoringConfig:
+    return ScoringConfig(q=0.75, sentiment=bucket, sentiment_source="ravenbert", **kw)
+
+
+def _bucket_runs(world, cal, *, use_kernel=False, keep_primitive_daily=False, labels=None,
+                 tau_missing="raise"):
+    labels = labels or _bucket_labels(world)
+    runs = {}
+    for b in SENTIMENT_BUCKETS:
+        keep = {d: lab == b.value for d, lab in labels.items()}
+        runs[b] = score_dates(world["days"], _bucket_cfg(b), table=world["table"],
+                              primitive_embeddings=world["P"],
+                              source=InMemoryHeadlineSource(world["X"], chunk_size=11, keep=keep),
+                              calibration=cal, use_kernel=use_kernel,
+                              keep_primitive_daily=keep_primitive_daily,
+                              sentiment_artifact_id="hs-1", tau_missing=tau_missing)
+    return runs, labels
 
 
 @pytest.mark.parametrize("use_kernel", [False, KERNEL])
-@pytest.mark.parametrize("eps", [0.0, 0.3])
-def test_sentiment_split_reconciles(world, eps, use_kernel):
-    sent = _sentiment_world(world)
-    cfg = ScoringConfig(q=0.75, **SPLIT, neutral_eps=eps)
+def test_bucket_runs_add_up_to_the_all_headlines_run(world, use_kernel):
     cal = FixedTauProvider(_tau(0.2), world["mu_df"])
-    src = InMemoryHeadlineSource(world["X"], chunk_size=11, sentiment=sent)
-    res = score_dates(world["days"], cfg, table=world["table"], primitive_embeddings=world["P"],
-                      source=src, calibration=cal, use_kernel=use_kernel,
-                      keep_primitive_daily=True)
-    labels = {"all", "pos", "neg"} | ({"neu"} if eps > 0 else set())
-    assert set(res.narrative_daily["SENTIMENT"].unique()) == labels
-    for day in world["days"]:
-        s = sent[day]
-        nd = res.narrative_daily.filter(pl.col("DATE") == day)
-        all_rows = nd.filter(pl.col("SENTIMENT") == "all").sort("narrative_key")
-        n_head = s.shape[0]
-        assert (all_rows["N_HEADLINES"] == n_head).all()
-        assert (all_rows["N_LABELLED"] == n_head).all()
-        # every label row matches the dense reference on its own headline subset
-        masks = {"pos": np.isfinite(s) & (s > eps), "neg": np.isfinite(s) & (s < -eps)}
-        if eps > 0:
-            masks["neu"] = np.isfinite(s) & (np.abs(s) <= eps)
-        support_sum = np.zeros(world["table"].n_narratives, dtype=np.int64)
-        total_sum = np.zeros(world["table"].n_narratives)
-        for lab, mask in masks.items():
-            rows = nd.filter(pl.col("SENTIMENT") == lab).sort("narrative_key")
-            ref_narr, _, n_lab = _dense_reference(world, cfg, 0.2, cal.mu_for(day), day, mask)
-            _assert_day_matches(rows, ref_narr)
-            assert (rows["N_HEADLINES"] == n_head).all() and (rows["N_LABELLED"] == n_lab).all()
-            support_sum += rows["SUPPORT"].to_numpy()
-            total_sum += rows["TOTAL_SCORE"].fill_null(0.0).to_numpy()
-        # split rows reconcile with "all" MINUS the headlines that carry no label
-        unl = ~np.isfinite(s) | (s == 0.0) if eps == 0 else ~np.isfinite(s)
-        ref_unl, _, _ = _dense_reference(world, cfg, 0.2, cal.mu_for(day), day, unl)
-        np.testing.assert_array_equal(support_sum + ref_unl["SUPPORT"],
-                                      all_rows["SUPPORT"].to_numpy())
-        np.testing.assert_allclose(total_sum + np.nan_to_num(ref_unl["TOTAL_SCORE"]),
-                                   all_rows["TOTAL_SCORE"].fill_null(0.0).to_numpy(), rtol=1e-5)
-        d = res.day_diagnostics.filter(pl.col("DATE") == day).row(0, named=True)
-        assert d["N_WITH_SENTIMENT"] == int(sum(m.sum() for m in masks.values()))
-    assert res.primitive_daily.filter(pl.col("SENTIMENT") == "pos").height > 0
+    full = score_dates(world["days"], ScoringConfig(q=0.75), table=world["table"],
+                       primitive_embeddings=world["P"],
+                       source=InMemoryHeadlineSource(world["X"], chunk_size=11), calibration=cal,
+                       use_kernel=use_kernel, keep_primitive_daily=True)
+    runs, labels = _bucket_runs(world, cal, use_kernel=use_kernel, keep_primitive_daily=True)
+    for primitive in (False, True):
+        key = "primitive" if primitive else "narrative_key"
+        total = sum_sentiment_runs([SentimentRun.from_result(r, primitive=primitive)
+                                    for r in runs.values()]).sort(["DATE", key])
+        ref = (full.primitive_daily if primitive else full.narrative_daily).sort(["DATE", key])
+        assert total.columns == ref.columns and total.height == ref.height
+        np.testing.assert_array_equal(total["SUPPORT"].to_numpy(), ref["SUPPORT"].to_numpy())
+        # a headline's float32 scores depend slightly (~1e-7) on the rows batched with it
+        # (BLAS blocking): the statistics agree to float rounding; SUPPORT is exact here
+        for col, tol in (("TOTAL_SCORE", 1e-6), ("INTENSITY", 1e-5), ("STD_SCORE", 2e-4),
+                         ("PEAK", 1e-6)):
+            np.testing.assert_allclose(total[col].to_numpy(), ref[col].to_numpy(), rtol=tol,
+                                       atol=tol, equal_nan=True)
+        assert (total["N_HEADLINES"] == ref["N_HEADLINES"]).all()
+        assert (total["N_LABELLED"] == ref["N_LABELLED"]).all()
+        assert total["SENTIMENT"].unique().to_list() == ["all"]
+    # attention adds up: each bucket run shares the day's total as denominator
+    att = sum(attention(r.narrative_daily).sort(["DATE", "narrative_key"])["ATTENTION"]
+              .fill_null(0.0).to_numpy() for r in runs.values())
+    np.testing.assert_allclose(att, attention(full.narrative_daily).sort(
+        ["DATE", "narrative_key"])["ATTENTION"].fill_null(0.0).to_numpy(), rtol=1e-6, atol=1e-12)
+    # the same day set, every day with the day's total; the empty bucket day is written
+    days = sorted(world["days"])
+    for b, r in runs.items():
+        d = r.day_diagnostics.sort("DATE")
+        assert d["DATE"].to_list() == full.day_diagnostics["DATE"].sort().to_list()
+        assert d["N_HEADLINES"].to_list() == [world["X"][x].shape[0] for x in days]
+        assert d["N_SCORED"].to_list() == [int((labels[x] == b.value).sum()) for x in days]
+        assert (d["N_WITH_SENTIMENT"] == d["N_SCORED"]).all()
+        assert r.narrative_daily["SENTIMENT"].unique().to_list() == [b.value]
+    neg = runs[SentimentFilter.NEGATIVE].narrative_daily.filter(pl.col("DATE") == days[1])
+    assert neg.height == world["table"].n_narratives and (neg["SUPPORT"] == 0).all()
+    assert neg["TOTAL_SCORE"].null_count() == neg.height and (neg["N_LABELLED"] == 0).all()
 
 
-def test_sentiment_all_labelled_reconciles_exactly(world):
-    """With no missing sentiment and eps > 0, sum of split rows == the 'all' row."""
-    rng = np.random.default_rng(6)
-    sent = {d: rng.normal(size=X.shape[0]).astype(np.float32) for d, X in world["X"].items()}
-    cfg = ScoringConfig(q=0.75, **SPLIT, neutral_eps=0.2)
+def test_a_day_without_mu_is_skipped_by_every_run(world):
+    days = sorted(world["days"])
+    late_mu = world["mu_df"].filter(pl.col("DATE") >= days[1])       # day 0 cannot be corrected
+    cal = FixedTauProvider(_tau(0.2), late_mu)
+    full = score_dates(days, ScoringConfig(q=0.75), table=world["table"],
+                       primitive_embeddings=world["P"], source=InMemoryHeadlineSource(world["X"]),
+                       calibration=cal, use_kernel=False, tau_missing="null_only")
+    runs, _ = _bucket_runs(world, cal, tau_missing="null_only")
+    want = full.day_diagnostics["DATE"].to_list()
+    assert days[0] not in want and len(want) == len(days) - 1
+    for r in runs.values():
+        assert r.day_diagnostics["DATE"].to_list() == want
+
+
+def test_a_bucket_run_never_feeds_null_partitions(world, tmp_path):
     cal = FixedTauProvider(_tau(0.2), world["mu_df"])
-    res = score_dates(world["days"], cfg, table=world["table"], primitive_embeddings=world["P"],
-                      source=InMemoryHeadlineSource(world["X"], sentiment=sent), calibration=cal,
-                      use_kernel=False)
-    nd = res.narrative_daily
-    split = (nd.filter(pl.col("SENTIMENT") != "all")
-             .group_by(["DATE", "narrative_key"])
-             .agg(pl.col("SUPPORT").sum(), pl.col("TOTAL_SCORE").sum(),
-                  pl.col("N_LABELLED").sum())
-             .sort(["DATE", "narrative_key"]))
-    all_rows = nd.filter(pl.col("SENTIMENT") == "all").sort(["DATE", "narrative_key"])
-    np.testing.assert_array_equal(split["SUPPORT"].to_numpy(), all_rows["SUPPORT"].to_numpy())
-    np.testing.assert_allclose(split["TOTAL_SCORE"].fill_null(0.0).to_numpy(),
-                               all_rows["TOTAL_SCORE"].fill_null(0.0).to_numpy(), rtol=1e-9)
-    assert (split["N_LABELLED"] == all_rows["N_LABELLED"]).all()
-
-
-def test_split_disabled_is_current_artifact_plus_all_label(world):
-    sent = _sentiment_world(world)
-    cal = FixedTauProvider(_tau(0.2), world["mu_df"])
-    off = score_dates(world["days"], ScoringConfig(q=0.75), table=world["table"],
-                      primitive_embeddings=world["P"],
-                      source=InMemoryHeadlineSource(world["X"], sentiment=sent),
-                      calibration=cal, use_kernel=False)
-    on = score_dates(world["days"], ScoringConfig(q=0.75, **SPLIT),
-                     table=world["table"], primitive_embeddings=world["P"],
-                     source=InMemoryHeadlineSource(world["X"], sentiment=sent),
-                     calibration=cal, use_kernel=False)
-    assert set(off.narrative_daily["SENTIMENT"].unique()) == {"all"}
-    assert off.narrative_daily.equals(on.narrative_daily.filter(pl.col("SENTIMENT") == "all"))
-    assert off.day_diagnostics["N_WITH_SENTIMENT"].sum() == 0
+    sink = MonthlyNullPartitionWriter(tmp_path, config=_bucket_cfg(SentimentFilter.POSITIVE),
+                                      table=world["table"], seed=0)
+    with pytest.raises(ValueError, match="never feeds the null partitions"):
+        score_dates(world["days"], _bucket_cfg(SentimentFilter.POSITIVE), table=world["table"],
+                    primitive_embeddings=world["P"], source=InMemoryHeadlineSource(world["X"]),
+                    calibration=cal, null_sink=sink, use_kernel=False)
 
 
 def test_sentiment_config_validation_and_identity():
-    with pytest.raises(ValueError, match="needs sentiment_source"):
-        ScoringConfig(sentiment_split=SentimentSplit.SIGN)
-    with pytest.raises(ValueError, match="needs sentiment_source"):
-        ScoringConfig(sentiment_split=SentimentSplit.SIGN, sentiment_source="finbert")
     with pytest.raises(ValueError, match="only meaningful"):
-        ScoringConfig(sentiment_source="finbert", sentiment_column="SENT_BAND")
-    with pytest.raises(ValueError, match="SENT_"):
-        ScoringConfig(sentiment_split=SentimentSplit.SIGN, sentiment_source="finbert",
-                      sentiment_column="P_POS")
-    a = ScoringConfig(**SPLIT)
-    b = ScoringConfig(**{**SPLIT, "sentiment_column": "SENT_Y"})
-    c = ScoringConfig(**{**SPLIT, "sentiment_source": "other"})
-    assert len({a.digest(), b.digest(), c.digest()}) == 3
-    assert a.f0_digest() == ScoringConfig().f0_digest()       # the null model is sentiment-free
+        ScoringConfig(sentiment_source="finbert")
+    with pytest.raises(ValueError, match="sentiment_source must be one of"):
+        ScoringConfig(sentiment="positive")
+    with pytest.raises(ValueError, match="neg_max < pos_min"):
+        _bucket_cfg("positive", neg_max=0.2, pos_min=0.2)
+    with pytest.raises(ValueError, match="neg_max < pos_min"):
+        _bucket_cfg("positive", neg_max=-1.5)
+    with pytest.raises(ValueError, match="model sources only"):
+        ScoringConfig(sentiment="positive", sentiment_source="ravenpack", sentiment_rule="css",
+                      min_conf=0.2)
+    with pytest.raises(ValueError, match="sentiment_rule"):
+        ScoringConfig(sentiment="positive", sentiment_source="ravenpack")      # rule mean
+    with pytest.raises(ValueError, match="sentiment_rule"):
+        _bucket_cfg("positive", sentiment_rule="css")
+    # a no-filter config hashes exactly as before the filter existed
+    import hashlib
+    import json
+
+    legacy = {**ScoringConfig().to_dict(), "sentiment_split": "none", "neutral_eps": 0.0,
+              "sentiment_source": "none", "sentiment_column": ""}
+    for k in ("sentiment", "sentiment_rule", "neg_max", "pos_min", "min_conf", "label"):
+        legacy.pop(k)
+    want = hashlib.sha1(json.dumps(legacy, sort_keys=True).encode()).hexdigest()[:16]
+    assert ScoringConfig().digest() == want
+    old_form = {**ScoringConfig().to_dict(), "sentiment_split": "none", "neutral_eps": 0.0,
+                "sentiment_column": ""}
+    for k in ("sentiment", "sentiment_rule", "neg_max", "pos_min", "min_conf"):
+        old_form.pop(k)
+    assert ScoringConfig.from_dict(old_form).digest() == want
+    with pytest.raises(ValueError, match="removed in-run sentiment split"):
+        ScoringConfig.from_dict({**old_form, "sentiment_split": "sign"})
+    # buckets differ in config_id, not in the filter-free digest nor in the null model
+    cfgs = [_bucket_cfg(b) for b in SENTIMENT_BUCKETS]
+    assert len({c.digest() for c in cfgs}) == 4
+    assert len({c.digest_without_filter() for c in cfgs}) == 1
+    assert {c.f0_digest() for c in cfgs} == {ScoringConfig().f0_digest()}
+    assert _bucket_cfg("positive", min_conf=0.1).digest_without_filter() != \
+        cfgs[0].digest_without_filter()
 
 
-def test_split_without_source_sentiment_raises(world):
+def test_bucket_identity_in_metadata_and_diagnostics(world):
     cal = FixedTauProvider(_tau(0.2), world["mu_df"])
-    with pytest.raises(RuntimeError, match="yields no sentiment"):
-        score_dates(world["days"], ScoringConfig(q=0.75, **SPLIT), table=world["table"],
-                    primitive_embeddings=world["P"],
-                    source=InMemoryHeadlineSource(world["X"]), calibration=cal,
-                    use_kernel=False)
-
-
-def test_sentiment_identity_in_metadata_and_diagnostics(world):
-    sent = _sentiment_world(world)
-    cal = FixedTauProvider(_tau(0.2), world["mu_df"])
-    res = score_dates(world["days"], ScoringConfig(q=0.75, **SPLIT), table=world["table"],
-                      primitive_embeddings=world["P"],
-                      source=InMemoryHeadlineSource(world["X"], sentiment=sent),
-                      calibration=cal, use_kernel=False, sentiment_artifact_id="hs-1")
-    assert res.metadata.sentiment_artifact_id == "hs-1"
-    assert res.metadata.config["sentiment_column"] == "SENT_X"
-    assert res.day_diagnostics["SENTIMENT_SOURCE_ID"].unique().to_list() == ["hs-1:SENT_X"]
+    runs, _ = _bucket_runs(world, cal)
+    r = runs[SentimentFilter.NEGATIVE]
+    assert r.metadata.sentiment_artifact_id == "hs-1"
+    assert r.metadata.config["sentiment"] == "negative"
+    assert r.day_diagnostics["SENTIMENT_SOURCE_ID"].unique().to_list() == ["hs-1:mean:negative"]
     off = score_dates(world["days"], ScoringConfig(q=0.75), table=world["table"],
                       primitive_embeddings=world["P"],
                       source=InMemoryHeadlineSource(world["X"]), calibration=cal,
                       use_kernel=False)
     assert off.day_diagnostics["SENTIMENT_SOURCE_ID"].null_count() == off.n_days
+    assert (off.day_diagnostics["N_SCORED"] == off.day_diagnostics["N_HEADLINES"]).all()
     assert off.metadata.sentiment_artifact_id is None
+
+
+def test_sum_sentiment_runs_checks_that_the_runs_belong_together(world):
+    cal = FixedTauProvider(_tau(0.2), world["mu_df"])
+    runs, _ = _bucket_runs(world, cal)
+    good = [SentimentRun.from_result(r) for r in runs.values()]
+    sum_sentiment_runs(good)
+
+    def swap(i, **kw):
+        out = list(good)
+        out[i] = SentimentRun(**{**good[i].__dict__, **kw})
+        return out
+
+    with pytest.raises(ValueError, match="exactly once"):
+        sum_sentiment_runs(good[:3])
+    with pytest.raises(ValueError, match="exactly once"):
+        sum_sentiment_runs(good[:3] + [good[0]])
+    with pytest.raises(ValueError, match="sentiment artifact"):
+        sum_sentiment_runs(swap(1, sentiment_artifact_id="hs-other"))
+    other_rule = ScoringConfig(**{**good[2].config.to_dict(), "sentiment_rule": "median"})
+    with pytest.raises(ValueError, match="sentiment_rule"):
+        sum_sentiment_runs(swap(2, config=other_rule))
+    other_q = ScoringConfig(**{**good[2].config.to_dict(), "q": 0.9})
+    with pytest.raises(ValueError, match="bucket removed"):
+        sum_sentiment_runs(swap(2, config=other_q))
+    with pytest.raises(ValueError, match="tau_asof"):
+        sum_sentiment_runs(swap(0, tau_asof_id="tau_other"))
+    with pytest.raises(ValueError, match="mu_asof"):
+        sum_sentiment_runs(swap(3, mu_asof_id="mu_other"))
+    bumped = good[1].frame.with_columns(
+        pl.when(pl.col("DATE") == D0).then(pl.col("N_HEADLINES") + 1)
+        .otherwise(pl.col("N_HEADLINES")).alias("N_HEADLINES"))
+    with pytest.raises(ValueError, match="N_HEADLINES differs"):
+        sum_sentiment_runs(swap(1, frame=bumped))
+    with pytest.raises(ValueError, match="day sets"):
+        sum_sentiment_runs(swap(1, frame=good[1].frame.filter(pl.col("DATE") != D0)))
+    # a missing (zero-support) row in one run is treated as zero: the sum is unchanged
+    sparse = good[0].frame.filter(pl.col("SUPPORT") > 0)
+    assert sparse.height < good[0].frame.height
+    a = sum_sentiment_runs(good).sort(["DATE", "narrative_key"])
+    b = sum_sentiment_runs(swap(0, frame=sparse)).sort(["DATE", "narrative_key"])
+    assert a.equals(b)
 
 
 # ---------------------------------------------------------------------------
@@ -572,39 +635,3 @@ def test_cold_start_without_mu_skips_day_entirely(world, tmp_path: Path):
         score_dates([D0], cfg, table=world["table"], primitive_embeddings=world["P"],
                     source=InMemoryHeadlineSource(world["X"]), calibration=early,
                     use_kernel=False)
-
-
-def test_combine_sentiment_reproduces_all_row(world):
-    from narrative_scoring.validation import combine_sentiment
-
-    rng = np.random.default_rng(6)
-    sent = {d: rng.normal(size=X.shape[0]).astype(np.float32) for d, X in world["X"].items()}
-    cfg = ScoringConfig(q=0.75, **SPLIT, neutral_eps=0.2)
-    cal = FixedTauProvider(_tau(0.2), world["mu_df"])
-    res = score_dates(world["days"], cfg, table=world["table"], primitive_embeddings=world["P"],
-                      source=InMemoryHeadlineSource(world["X"], sentiment=sent), calibration=cal,
-                      use_kernel=False, keep_primitive_daily=True)
-    for df in (res.narrative_daily, res.primitive_daily):
-        allc = combine_sentiment(df, ["pos", "neg", "neu"]).sort(["DATE", "narrative_key"])
-        ref = df.filter(pl.col("SENTIMENT") == "all").sort(["DATE", "narrative_key"])
-        if "primitive" in df.columns:
-            allc, ref = allc.sort(["DATE", "primitive"]), ref.sort(["DATE", "primitive"])
-        assert allc["SENTIMENT"].unique().to_list() == ["pos+neg+neu"]
-        np.testing.assert_array_equal(allc["SUPPORT"].to_numpy(), ref["SUPPORT"].to_numpy())
-        for col, tol in (("TOTAL_SCORE", 1e-9), ("INTENSITY", 1e-5), ("STD_SCORE", 2e-4),
-                         ("PEAK", 0.0)):
-            np.testing.assert_allclose(allc[col].to_numpy(), ref[col].to_numpy(), rtol=tol,
-                                       atol=tol, equal_nan=True)
-        assert (allc["N_HEADLINES"] == ref["N_HEADLINES"]).all()
-        assert (allc["N_LABELLED"] == ref["N_LABELLED"]).all()
-        assert allc.columns == ref.columns
-    # an owner panel: neu + pos, checked against a direct rescore of that subset
-    np_ = combine_sentiment(res.narrative_daily, ["neu", "pos"])
-    s0 = sent[D0]
-    mask = np.isfinite(s0) & (s0 > -0.2)
-    ref_narr, _, n_lab = _dense_reference(world, cfg, 0.2, cal.mu_for(D0), D0, mask)
-    day = np_.filter(pl.col("DATE") == D0).sort("narrative_key")
-    _assert_day_matches(day, ref_narr)
-    assert (day["N_LABELLED"] == n_lab).all()
-    with pytest.raises(ValueError, match="not present"):
-        combine_sentiment(res.narrative_daily, ["pos", "zzz"])

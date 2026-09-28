@@ -25,15 +25,13 @@ differs. Per day, in order:
        sentiment label), optional day x primitive diagnostics, the day
        diagnostics row with RSS before/after, hand to the writer and the sink.
 
-Sentiment split (config.sentiment_split = sign, reading the config's
-sentiment_source / sentiment_column through the source's SentimentSource; a
-split run whose source yields no sentiment raises): every headline contributes
-to the "all" rows; headlines with a sentiment score contribute additionally
-to their label's rows (pos: s > eps, neg: s < -eps, neu: |s| <= eps when
-eps > 0). Headlines with missing sentiment (NaN, or exactly 0 when eps == 0)
-appear in "all" only. N_HEADLINES on every row is the day's total, so
-ATTENTION = TOTAL_SCORE / N_HEADLINES decomposes across labels;
-N_LABELLED is the row's own headline count.
+Sentiment filter (config.sentiment = positive / neutral / negative / unscored, see
+sentiment_filter.py): the source yields only that bucket's headlines, and the run
+is otherwise identical to the all-headlines run: the SAME days are written (every
+``scorable_day``, including days with no headline in the bucket: SUPPORT 0), with
+the SAME mu and tau, no null draws, and N_HEADLINES = the day's total
+(``source.day_total``), so ATTENTION = TOTAL_SCORE / N_HEADLINES of the four bucket
+runs adds up to the all-headlines run; N_LABELLED is the bucket's own count.
 
 Every number comes from selection.py / aggregation.py / f0.py (or the
 kernel asserted equal to them); this module only sequences calls.
@@ -56,11 +54,9 @@ from narrative_scoring.aggregation import DayAccumulator, headline_narrative_sco
 from narrative_scoring.calibration import CalibrationProvider, LookaheadError, TauRecord
 from narrative_scoring.config import (
     PERCENTILE_AXIS,
-    SENTIMENT_ALL,
     AggRule,
     RunMetadata,
     ScoringConfig,
-    SentimentSplit,
     n_candidates_for,
 )
 from narrative_scoring.f0 import n_keep, n_trim, sample_null_draws, trim_threshold
@@ -89,8 +85,6 @@ from nlp.corrections import Correction
 from nlp.reference_vector import ReferenceValue
 
 log = logging.getLogger(__name__)
-
-_LABEL_CODES = {"pos": 1, "neg": 2, "neu": 3}
 
 
 # ---------------------------------------------------------------------------
@@ -207,25 +201,36 @@ class _Funnel:
 
 @dataclass
 class _DayState:
-    narr: dict[str, DayAccumulator]
-    prim: dict[str, DayAccumulator] | None
+    narr: DayAccumulator
+    prim: DayAccumulator | None
+    n_total: int                          # the day's headlines before any sentiment filter
     funnel: _Funnel = field(default_factory=_Funnel)
-    n_with_sentiment: int = 0
 
 
-def sentiment_labels(sentiment: np.ndarray | None, n: int, config: ScoringConfig) -> np.ndarray:
-    """int8 per headline: 0 = unlabelled, 1 = pos, 2 = neg, 3 = neu."""
-    codes = np.zeros(n, dtype=np.int8)
-    if sentiment is None or config.sentiment_split is SentimentSplit.NONE:
-        return codes
-    s = np.asarray(sentiment, dtype=np.float64)
-    eps = config.neutral_eps
-    ok = np.isfinite(s)
-    codes[ok & (s > eps)] = 1
-    codes[ok & (s < -eps)] = 2
-    if eps > 0:
-        codes[ok & (np.abs(s) <= eps)] = 3
-    return codes
+def calibration_for(calibration: CalibrationProvider, config: ScoringConfig,
+                    day: date) -> tuple[ReferenceValue | None, TauRecord | None] | None:
+    """(mu, tau) as of ``day``. None when there is no usable mu row (the day cannot be
+    corrected, so it is never scored); tau None when no tau row is old enough yet."""
+    try:
+        mu = calibration.mu_for(day) if config.mode is not Correction.RAW else None
+    except LookaheadError:
+        return None
+    try:
+        tau: TauRecord | None = calibration.tau_for(day)
+    except LookaheadError:
+        tau = None
+    return mu, tau
+
+
+def scorable_day(calibration: CalibrationProvider, config: ScoringConfig, day: date,
+                 day_total: int) -> bool:
+    """THE rule for which days a scoring run writes rows: at least one headline, a usable
+    mu row and a tau row. The all-headlines run and every sentiment-filtered run use it
+    (through ``calibration_for``), so they write exactly the same day set."""
+    if day_total <= 0:
+        return False
+    cal = calibration_for(calibration, config, day)
+    return cal is not None and cal[1] is not None
 
 
 def _accumulate_block(
@@ -330,8 +335,8 @@ def score_dates(
         threads: kernel thread count; BLAS keeps its own pool (phases are sequential).
         rss_budget_gb: raise ``MemoryBudgetExceeded`` naming the day when RSS exceeds it.
         seed: recorded; the scorer itself is deterministic (null sampling is seeded by the sink).
-        sentiment_artifact_id: the headline_sentiment artifact behind ``source``'s sentiment
-            (split runs); recorded in the metadata and in day_diagnostics.
+        sentiment_artifact_id: the headline_sentiment artifact behind ``source``'s bucket
+            filter (filtered runs); recorded in the metadata and in day_diagnostics.
         embeddings_provenance: what produced the primitive and headline embeddings
             (``artifacts.embeddings_provenance``); recorded in the run metadata.
     Days with no headlines are skipped (listed in ``skipped_days``) but still closed
@@ -351,16 +356,20 @@ def score_dates(
     n_prim, n_narr = table.n_primitives, table.n_narratives
     prim_to_narr = table.primitive_to_narrative
     n_candidates = n_candidates_for(config.q, n_prim)
-    labels = config.sentiment_labels()
+    filtered = config.filtered
+    if filtered and null_sink is not None:
+        raise ValueError("a sentiment-filtered run never feeds the null partitions")
+    row_label = config.row_label
     sentiment_source_id = (f"{sentiment_artifact_id or config.sentiment_source}:"
-                           f"{config.sentiment_column}" if labels else None)
+                           f"{config.sentiment_rule}:{config.sentiment.value}" if filtered
+                           else None)
     narr_nodes, prim_nodes = table.narrative_nodes, table.primitive_nodes
     n_trim_rows = n_trim(n_prim, config.trim_frac) if null_sink is not None else 0
     n_keep_rows = n_keep(n_prim, config.trim_frac)
-    log.info("scoring %d day(s) [%s .. %s] mode=%s pooling=%s q=%g (k=%d) jump=%s split=%s "
-             "path=%s null_sink=%s",
+    log.info("scoring %d day(s) [%s .. %s] mode=%s pooling=%s q=%g (k=%d) jump=%s "
+             "sentiment=%s path=%s null_sink=%s",
              len(days), days[0], days[-1], config.mode.value, config.paraphrase_pooling.value,
-             config.q, n_candidates, config.jump_cut, config.sentiment_split.value,
+             config.q, n_candidates, config.jump_cut, config.sentiment.value,
              "kernel" if use_kernel else "numpy", null_sink is not None)
 
     matrix_cache: dict[date | None, np.ndarray] = {}
@@ -383,21 +392,21 @@ def score_dates(
     first_tau: TauRecord | None = None
     current: dict[str, Any] | None = None
 
-    def open_day(day: date) -> dict[str, Any] | None:
-        try:
-            mu = calibration.mu_for(day) if config.mode is not Correction.RAW else None
-        except LookaheadError:
+    def open_day(day: date, n_total: int | None = None) -> dict[str, Any] | None:
+        cal = calibration_for(calibration, config, day)
+        if cal is None:
             if tau_missing != "null_only":
-                raise
+                calibration.mu_for(day)                  # re-raises the LookaheadError
             log.info("%s: no mu_asof row yet; day skipped entirely (nothing to correct with)",
                      day)
             return None
-        try:
-            tau_rec: TauRecord | None = calibration.tau_for(day)
-        except LookaheadError:
+        mu, tau_rec = cal
+        if tau_rec is None:
+            if filtered:                                 # the all-headlines run wrote none
+                log.info("%s: no tau row old enough; no rows (as the all-headlines run)", day)
+                return None
             if tau_missing != "null_only" or null_sink is None:
-                raise
-            tau_rec = None
+                calibration.tau_for(day)                 # re-raises the LookaheadError
             null_only_days.append(day)
             log.info("%s: no tau row old enough; null-only day (partitions fed, no scores)", day)
         return {
@@ -407,9 +416,10 @@ def score_dates(
             "tau32": float(np.float32(tau_rec.tau)) if tau_rec is not None else None,
             "P_scoring": scoring_matrix_for(mu),
             "state": _DayState(
-                narr={lab: DayAccumulator(n_narr) for lab in (SENTIMENT_ALL, *labels)},
-                prim=({lab: DayAccumulator(n_prim) for lab in (SENTIMENT_ALL, *labels)}
-                      if keep_primitive_daily else None),
+                narr=DayAccumulator(n_narr),
+                prim=DayAccumulator(n_prim) if keep_primitive_daily else None,
+                n_total=(n_total if n_total is not None
+                         else source.day_total(day) if filtered else -1),
             ),
         }
 
@@ -425,32 +435,35 @@ def score_dates(
             if null_sink is not None:
                 null_sink.close_day(day, rss_after)
             return
-        all_acc = state.narr[SENTIMENT_ALL]
-        n_head = all_acc.n_headlines
+        acc = state.narr
+        n_scored = acc.n_headlines
+        # the attention denominator: the day's total, shared with the all-headlines run
+        n_head = state.n_total if filtered else n_scored
+        if filtered and n_scored > n_head:
+            raise RuntimeError(f"{day}: {n_scored} headlines in the bucket but only {n_head} "
+                               "in the day (day_total and the filtered query disagree)")
 
-        nd = pl.concat([
-            acc.frame(narr_nodes, day, sentiment=lab, n_headlines=n_head)
-            for lab, acc in state.narr.items()
-        ]).select(list(NARRATIVE_DAILY_SCHEMA.keys()))
+        nd = acc.frame(narr_nodes, day, sentiment=row_label, n_headlines=n_head).select(
+            list(NARRATIVE_DAILY_SCHEMA.keys()))
         pd_ = None
         if state.prim is not None:
-            pd_ = pl.concat([
-                acc.frame(prim_nodes, day, sentiment=lab, n_headlines=n_head)
-                for lab, acc in state.prim.items()
-            ]).select(list(PRIMITIVE_DAILY_SCHEMA.keys()))
+            pd_ = state.prim.frame(prim_nodes, day, sentiment=row_label,
+                                   n_headlines=n_head).select(
+                list(PRIMITIVE_DAILY_SCHEMA.keys()))
 
         f = state.funnel
         diag = {
-            "DATE": day, "N_HEADLINES": n_head, "N_UNASSIGNED": all_acc.n_unassigned,
+            "DATE": day, "N_HEADLINES": n_head, "N_SCORED": n_scored,
+            "N_UNASSIGNED": acc.n_unassigned,
             "N_F0_SURVIVORS_PRE_Q": f.n_f0_survivors, "N_Q_CANDIDATES": f.n_candidates,
             "N_RETAINED_PRE_JUMP": f.n_retained_pre_jump,
             "N_RETAINED_POST_Q_TAU": f.n_retained,
-            "MEAN_RETAINED_PER_HEADLINE": f.n_retained / max(n_head, 1),
+            "MEAN_RETAINED_PER_HEADLINE": f.n_retained / max(n_scored, 1),
             "PCT_TAU_PRUNED_WITHIN_Q": 1.0 - f.n_retained_pre_jump / max(f.n_candidates, 1),
-            "PCT_JUMP_APPLIED": f.n_jump_trimmed / max(n_head, 1),
+            "PCT_JUMP_APPLIED": f.n_jump_trimmed / max(n_scored, 1),
             "MEAN_JUMP_GAP": (f.jump_gap_sum / f.n_jump_trimmed) if f.n_jump_trimmed else None,
-            "NARRATIVES_TOUCHED": int((all_acc.count > 0).sum()),
-            "N_WITH_SENTIMENT": state.n_with_sentiment,
+            "NARRATIVES_TOUCHED": int((acc.count > 0).sum()),
+            "N_WITH_SENTIMENT": n_scored if filtered else 0,
             "MU_DATE": mu.date if mu else None, "MU_NORM": mu.norm if mu else None,
             "TAU": ctx["tau32"], "TAU_MONTH_END": tau_rec.month_end, "N_EFF": tau_rec.n_eff,
             "CONFIG_ID": config.digest(), "F0_CONFIG_ID": config.f0_digest(),
@@ -474,20 +487,29 @@ def score_dates(
             null_sink.close_day(day, rss_after)
 
     unusable: set[date] = set()
-    for day, chunk in prefetch(_day_chunks(source, days), depth=prefetch_depth):
+    for day, chunk in prefetch(_day_chunks(source, days, emit_empty=filtered),
+                               depth=prefetch_depth):
         if day in unusable:
             continue
         if current is None or current["day"] != day:
             if current is not None:
                 close_day(current)
                 current = None
-            ctx = open_day(day)
+            n_total = None
+            if filtered:
+                n_total = source.day_total(day)
+                if not scorable_day(calibration, config, day, n_total):
+                    unusable.add(day)       # the all-headlines run writes no row either
+                    continue
+            ctx = open_day(day, n_total)
             if ctx is None:
                 unusable.add(day)
                 continue
             current = ctx
             seen_days.add(day)
             first_tau = first_tau or current["tau_rec"]
+        if chunk is None:                   # no headline of the bucket: a zero-support day
+            continue
         mu, state = current["mu"], current["state"]
         X = chunk.embeddings
         H, _ = config.mode.correct(X, mu, as_of=day)     # raises on a future-dated mu
@@ -501,22 +523,7 @@ def score_dates(
             continue
         thresholds = _accumulate_block(
             S, current["tau32"], n_candidates, config, prim_to_narr, n_narr,
-            state.narr[SENTIMENT_ALL], state.prim[SENTIMENT_ALL] if state.prim else None,
-            use_kernel, threads, state.funnel, n_trim_rows)
-        if labels:
-            if chunk.sentiment is None:
-                raise RuntimeError(
-                    f"{current['day']}: sentiment_split=sign ({config.sentiment_source}:"
-                    f"{config.sentiment_column}) but the headline source yields no sentiment")
-            codes = sentiment_labels(chunk.sentiment, S.shape[0], config)
-            state.n_with_sentiment += int((codes > 0).sum())
-            for lab in labels:
-                mask = codes == _LABEL_CODES[lab]
-                if mask.any():
-                    _accumulate_block(
-                        S[mask], current["tau32"], n_candidates, config, prim_to_narr, n_narr,
-                        state.narr[lab], state.prim[lab] if state.prim else None,
-                        use_kernel, threads, None, 0)
+            state.narr, state.prim, use_kernel, threads, state.funnel, n_trim_rows)
         if null_sink is not None:
             draws = sample_null_draws(S, thresholds, config.null_draws_per_headline,
                                       null_sink.rng_for(day))
@@ -589,11 +596,18 @@ def _mu_available(calibration: CalibrationProvider, config: ScoringConfig, day: 
         return False
 
 
-def _day_chunks(source: HeadlineSource, days: list[date]) -> Iterator[tuple[date, Chunk]]:
-    """Day-ordered (day, chunk) stream over ``days``; days without headlines yield nothing."""
+def _day_chunks(source: HeadlineSource, days: list[date], *,
+                emit_empty: bool = False) -> Iterator[tuple[date, Chunk | None]]:
+    """Day-ordered (day, chunk) stream over ``days``. A day without headlines yields
+    nothing, or one ``(day, None)`` with ``emit_empty`` (a filtered run must still decide,
+    in day order, whether to write that day with zero support)."""
     for day in days:
+        empty = True
         for chunk in source.iter_day(day):
+            empty = False
             yield day, chunk
+        if empty and emit_empty:
+            yield day, None
 
 
 def date_range(start: date, end: date) -> Iterator[date]:

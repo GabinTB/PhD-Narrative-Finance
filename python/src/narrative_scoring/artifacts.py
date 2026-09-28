@@ -4,8 +4,10 @@ Families (registered exactly like mu_asof / headline_embeddings: slug id,
 per-file content hashes, hyperparams carrying the config hashes, source
 artifact ids, git revision, timestamps):
 
-    headline_sentiment      (read only) a score database (RP_STORY_ID + SENT_* columns, see
-                            ravenpack/headlines/sentiment.py); a split run reads one column
+    headline_sentiment      (read only) a sentiment database (RP_STORY_ID + a model's 41-grid
+                            P_00..P_40 or vendor SENT_* scores, see
+                            ravenpack/headlines/sentiment.py); a sentiment-filtered run
+                            reads one bucket of it (sentiment_filter.py)
     narrative_taxonomy      (raw layer) one dir per taxonomy version: authored CSV + the
                             headline and semantic paraphrase JSONLs, validated before
                             registration; the scorer loads the taxonomy from here
@@ -37,7 +39,7 @@ import json
 import logging
 import shutil
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -51,7 +53,8 @@ from datalake import Artifact, DatalakeError, DatalakeIndex
 from datalake.jobs import Job, JobContext, Unit, register_job
 from datalake.layout import Layout, layout_of
 from datalake.meta import git_commit
-from narrative_scoring.config import ScoringConfig, SentimentSplit
+from narrative_scoring.calibration import LookaheadError
+from narrative_scoring.config import MODEL_SOURCES, ScoringConfig
 from narrative_scoring.partitions import (
     NullPartitionWriter,
     SkipClosedDays,
@@ -69,14 +72,15 @@ from narrative_scoring.primitives import (
 from narrative_scoring.schema import (
     DAY_DIAGNOSTICS_SCHEMA,
     DAY_DIAGNOSTICS_SCHEMA_V1,
+    DAY_DIAGNOSTICS_SCHEMA_V2,
     F0_PARTITION_SCHEMA,
     NARRATIVE_DAILY_SCHEMA,
     TAU_ASOF_SCHEMA,
 )
+from narrative_scoring.sentiment_filter import VENDOR_COLUMN, SentimentBucket
 from narrative_scoring.streaming import (
     HeadlineSource,
     ParquetHeadlineSource,
-    ParquetSentimentSource,
 )
 from narrative_scoring.tau_asof import (
     CALIBRATION_DELAY_DEFAULT,
@@ -390,22 +394,24 @@ def load_tau_series(art: Artifact | None) -> pl.DataFrame:
 # ---------------------------------------------------------------------------
 
 def headline_source(upstream: DatalakeIndex, chunk_size: int = 8_192, threads: int = 8,
-                    sentiment: Artifact | None = None, sentiment_column: str = "", *,
+                    sentiment: Artifact | None = None, config: ScoringConfig | None = None, *,
                     headlines: Artifact | None = None,
                     embeddings: Artifact | None = None) -> ParquetHeadlineSource:
-    """Headlines + embeddings (the latest, or the given ones), with one column of
-    ``sentiment`` joined in."""
+    """Headlines + embeddings (the latest, or the given ones); with ``sentiment`` (a
+    ``headline_sentiment`` artifact) and a filtered ``config``, only the headlines of
+    ``config.sentiment``'s bucket are read."""
     hl = headlines or upstream.latest(KIND_HEADLINES)
     em = embeddings or upstream.latest(KIND_EMBEDDINGS)
     layout = shared_layout(hl, em, *([sentiment] if sentiment is not None else []))
-    sent = None
+    bucket = None
     if sentiment is not None:
-        check_sentiment(sentiment, headlines_id=hl.artifact_id, column=sentiment_column)
-        sent = ParquetSentimentSource(sentiment.path, sentiment_column, sentiment.artifact_id,
-                                      layout=layout)
+        if config is None or not config.filtered:
+            raise ValueError("a sentiment artifact needs a config with a sentiment filter")
+        check_sentiment(sentiment, headlines_id=hl.artifact_id, config=config)
+        bucket = SentimentBucket(config, sentiment.path, sentiment.artifact_id)
     return ParquetHeadlineSource(hl.path, em.path, chunk_size=chunk_size, threads=threads,
                                  source_id=f"{hl.artifact_id}+{em.artifact_id}",
-                                 sentiment=sent, layout=layout)
+                                 sentiment=bucket, layout=layout)
 
 
 def shared_layout(*artifacts: Artifact) -> Layout:
@@ -424,27 +430,31 @@ def sentiment_columns(art: Artifact) -> list[str]:
     return [c for c in str(art.meta.hyperparams.get("columns", "")).split(",") if c]
 
 
-def check_sentiment(art: Artifact, *, headlines_id: str, column: str,
-                    source: str | None = None) -> None:
-    """Refuse a sentiment artifact that is not scoring-compatible: wrong kind, built on
-    another headlines artifact (story sets would differ), unknown column, other source."""
+def check_sentiment(art: Artifact, *, headlines_id: str, config: ScoringConfig) -> None:
+    """Refuse a sentiment artifact that cannot serve ``config``'s filter: wrong kind, built
+    on another headlines artifact (story sets would differ), another source, or without
+    the columns its rule reads (model sources: the grid P_00..P_40; vendor: SENT_CSS)."""
     hp = art.meta.hyperparams
     if art.kind != KIND_SENTIMENT:
         raise DatalakeError(f"{art.artifact_id} is a {art.kind}, not a {KIND_SENTIMENT}")
     if hp.get("headlines_id") != headlines_id:
         raise DatalakeError(f"{art.artifact_id} was built on {hp.get('headlines_id')}, the "
                             f"scorer reads {headlines_id}")
-    if column not in sentiment_columns(art):
-        raise DatalakeError(f"{art.artifact_id} has no column {column!r} "
-                            f"(has {sentiment_columns(art)})")
-    if source is not None and hp.get("source") != source:
+    if hp.get("source") != config.sentiment_source:
         raise DatalakeError(f"{art.artifact_id} is source {hp.get('source')!r}, config says "
-                            f"{source!r}")
+                            f"{config.sentiment_source!r}")
+    cols = sentiment_columns(art)
+    need = (["P_00", "P_40"] if config.sentiment_source in MODEL_SOURCES
+            else [VENDOR_COLUMN[config.sentiment_source]])
+    if not all(c in cols for c in need):
+        raise DatalakeError(f"{art.artifact_id} has no {need} column(s) for rule "
+                            f"{config.sentiment_rule!r} (has {cols[:5]}...); a model table "
+                            "must be a grid table (sentiment spec 2.1)")
 
 
-def resolve_sentiment(indexes: list[DatalakeIndex], *, headlines_id: str, column: str,
+def resolve_sentiment(indexes: list[DatalakeIndex], *, headlines_id: str, config: ScoringConfig,
                       source: str | None = None, artifact_id: str | None = None) -> Artifact:
-    """A scoring-compatible ``headline_sentiment``: the exact ``artifact_id`` if given,
+    """A ``headline_sentiment`` able to serve ``config``: the exact ``artifact_id`` if given,
     else the latest of ``source`` built on ``headlines_id``; checked by ``check_sentiment``."""
     if (source is None) == (artifact_id is None):
         raise ValueError("give exactly one of source / artifact_id")
@@ -455,11 +465,10 @@ def resolve_sentiment(indexes: list[DatalakeIndex], *, headlines_id: str, column
                                         headlines_id=headlines_id))
         except DatalakeError:
             continue
-        check_sentiment(art, headlines_id=headlines_id, column=column, source=source)
+        check_sentiment(art, headlines_id=headlines_id, config=config)
         return art
     raise DatalakeError(f"no {KIND_SENTIMENT} {artifact_id or source!r} built on "
-                        f"{headlines_id}; run ravenpack.headlines.sentiment_vendor / "
-                        f"sentiment_model first")
+                        f"{headlines_id}; run `jobs start headline_sentiment` first")
 
 
 def earliest_headline_day(headlines: Artifact) -> date:
@@ -666,15 +675,13 @@ class ScoringJob(Job):
         em = upstream.get(inputs["embeddings"]) if inputs.get("embeddings") \
             else upstream.latest(KIND_EMBEDDINGS)
         mu_id = inputs.get("mu_asof")
-        split = config.sentiment_split is SentimentSplit.SIGN
-        if split != (sentiment is not None):
-            raise ValueError("a sentiment artifact is required iff sentiment_split=sign")
+        if config.filtered != (sentiment is not None):
+            raise ValueError("a sentiment artifact is required iff the config selects a "
+                             "sentiment bucket")
         if sentiment is not None:
-            check_sentiment(sentiment, headlines_id=hl.artifact_id,
-                            column=config.sentiment_column, source=config.sentiment_source)
+            check_sentiment(sentiment, headlines_id=hl.artifact_id, config=config)
         source = source or headline_source(upstream, threads=threads, sentiment=sentiment,
-                                           sentiment_column=config.sentiment_column,
-                                           headlines=hl, embeddings=em)
+                                           config=config, headlines=hl, embeddings=em)
         mu_art, first_mu = _mu_inputs(upstream, config, mu_id)
 
         earliest = earliest_headline_day(hl)
@@ -689,7 +696,7 @@ class ScoringJob(Job):
             log.warning("nothing to score: end %s precedes the shifted start %s", end, start)
 
         emb_key = embedding_key(P, primitive_meta)
-        parts_art = (dl.get(resume["partitions"]) if resume
+        parts_art = (dl.get(resume["partitions"]) if resume and resume.get("partitions")
                      else find_partitions(dl, config, table, emb_key, seed, temp, calendar))
         check_scoring_lineage(dl, hl=hl, em=em, mu_art=mu_art, parts_art=parts_art,
                               tau_hp=tau_params(config, table, emb_key, window, seed, temp,
@@ -705,13 +712,15 @@ class ScoringJob(Job):
               "config_id": config.digest(),
               "f0_config_id": config.f0_digest(), "mode": config.mode.value,
               "pooling": config.paraphrase_pooling.value, "q": config.q,
-              "split": config.sentiment_split.value, "window": window, "seed": seed,
+              "split": config.sentiment.value if config.filtered else "none",
+              "window": window, "seed": seed,
               "start": start.isoformat(), "end": end.isoformat(), "label": label,
               "taxonomy_artifact_id": taxonomy_id, "agent_created": temp,
               **calendar.hyperparams()}
         if sentiment is not None:
-            hp.update(sentiment_source=config.sentiment_source,
-                      sentiment_column=config.sentiment_column,
+            hp.update(sentiment=config.sentiment.value, sentiment_source=config.sentiment_source,
+                      sentiment_rule=config.sentiment_rule, neg_max=config.neg_max,
+                      pos_min=config.pos_min, min_conf=config.min_conf,
                       sentiment_artifact_id=sentiment.artifact_id)
 
         self.dl, self.upstream, self.config, self.table, self.P = dl, upstream, config, table, P
@@ -738,12 +747,39 @@ class ScoringJob(Job):
             all_days = period.days()
             days = [d for d in all_days if d <= end]
             if period.first < start_period:
+                if config.filtered:          # the null model is the all-headlines run's
+                    continue
                 mode = "null-only (pre-start)"
             else:
                 days = [d for d in days if d >= start]
                 mode = "score"
             if days:
                 self._plan[period.key] = (period, days, mode)
+        if config.filtered:
+            self._check_tau_covers()
+
+    def _check_tau_covers(self) -> None:
+        """A filtered run reads the all-headlines run's tau_asof and never builds one: it
+        must exist and hold the row the live loop had for the last period scored."""
+        tau_art = find_tau_asof(self.dl, self.config, self.table, self.emb_key, self.window,
+                                self.seed, self.temp, self.calendar)
+        todo = ("run the all-headlines scoring first: `jobs start narrative_daily "
+                f"--sentiment none --from {self.start} --to {self.end}` with the same "
+                "taxonomy, embeddings, window and calibration")
+        if tau_art is None:
+            raise DatalakeError(f"no tau_asof for this config and taxonomy; {todo}")
+        if not self._plan:
+            return
+        last = list(self._plan.values())[-1][0]
+        cal = calibration_as_of(self.dl, self.config, self.table, self.emb_key,
+                                upstream=self.upstream, window=self.window, seed=self.seed,
+                                temp=self.temp, mu_id=self.mu_id, as_of=last.first,
+                                calendar=self.calendar)
+        try:
+            cal.tau_for(last.first)
+        except LookaheadError:
+            raise DatalakeError(f"{tau_art.artifact_id} has no tau row for {last.key} (built "
+                                f"as of {last.first}); {todo}") from None
 
     # -- identity -------------------------------------------------------------
 
@@ -773,17 +809,23 @@ class ScoringJob(Job):
         parts_art = self.parts_art
         pt_partial = bool(parts_art) and parts_art.partial
         nd_run = ctx.run
-        with dl.run(kind=KIND_DAY_DIAGNOSTICS, hyperparams=self.hp, sources=self.sources(),
-                    verifier=KIND_DAY_DIAGNOSTICS, hash_pattern="*",
-                    resume=self.resume.get("day_diagnostics"), **run_kw) as dg_run, \
-             dl.run(kind=KIND_PARTITIONS,
+        with ExitStack() as stack:
+            dg_run = stack.enter_context(dl.run(
+                kind=KIND_DAY_DIAGNOSTICS, hyperparams=self.hp, sources=self.sources(),
+                verifier=KIND_DAY_DIAGNOSTICS, hash_pattern="*",
+                resume=self.resume.get("day_diagnostics"), **run_kw))
+            pt_run = None
+            if not config.filtered:          # a bucket run never feeds the null model
+                pt_run = stack.enter_context(dl.run(
+                    kind=KIND_PARTITIONS,
                     hyperparams=partitions_params(config, self.table, self.emb_key, self.seed,
                                                   self.temp, calendar),
                     sources=self._sources, verifier=KIND_PARTITIONS, hash_pattern="*.parquet",
                     extend=parts_art.artifact_id if parts_art and not pt_partial else None,
-                    resume=parts_art.artifact_id if pt_partial else None, **run_kw) as pt_run:
-            for out_dir in (nd_run.out_dir, dg_run.out_dir, pt_run.out_dir):
-                record_provenance(out_dir, self.provenance)
+                    resume=parts_art.artifact_id if pt_partial else None, **run_kw))
+            for run in (nd_run, dg_run, pt_run):
+                if run is not None:
+                    record_provenance(run.out_dir, self.provenance)
             if not self.resume:
                 write_run_config(nd_run.out_dir, {
                     "config": config.to_dict(), "start": self.start.isoformat(),
@@ -803,33 +845,40 @@ class ScoringJob(Job):
                         "model_card": (self.primitive_meta or {}).get("model_card")},
                     "artifacts": {"narrative_daily": nd_run.artifact_id,
                                   "day_diagnostics": dg_run.artifact_id,
-                                  "partitions": pt_run.artifact_id},
+                                  "partitions": pt_run.artifact_id if pt_run else None},
                 })
             self.nd_run, self.dg_run, self.pt_run = nd_run, dg_run, pt_run
             self.writer = ParquetMonthWriter(nd_run.out_dir, dg_run.out_dir, freq=calendar.freq)
-            partition_writer = NullPartitionWriter(
-                pt_run.out_dir, config=config, table=self.table, seed=self.seed,
-                input_ids={"headlines": self.hl.artifact_id, "embeddings": self.em.artifact_id,
-                           "mu_asof": self.mu_art.artifact_id if self.mu_art else None},
-                code_version=pt_run.record.pipeline_commit, freq=calendar.freq)
-            self.sink = SkipClosedDays(partition_writer) if self.resume else partition_writer
+            self.sink = None
+            if pt_run is not None:
+                partition_writer = NullPartitionWriter(
+                    pt_run.out_dir, config=config, table=self.table, seed=self.seed,
+                    input_ids={"headlines": self.hl.artifact_id,
+                               "embeddings": self.em.artifact_id,
+                               "mu_asof": self.mu_art.artifact_id if self.mu_art else None},
+                    code_version=pt_run.record.pipeline_commit, freq=calendar.freq)
+                self.sink = (SkipClosedDays(partition_writer) if self.resume
+                             else partition_writer)
             self.last_metadata = None
             yield
         self.summary.update(narrative_daily_id=nd_run.artifact_id,
                             day_diagnostics_id=dg_run.artifact_id,
-                            partitions_id=pt_run.artifact_id)
+                            partitions_id=pt_run.artifact_id if pt_run else None)
 
     def run_unit(self, unit: Unit, ctx: JobContext) -> None:
         """(1) the tau job as of the period's first day; (2) its days, through the one
         pipeline; (3) the period's null partition closes when the period does."""
         period, days, mode = self._plan[unit.key]
         dl, config, calendar, summary = self.dl, self.config, self.calendar, self.summary
-        tau_art = build_tau_asof(dl, config, self.table, self.P, upstream=self.upstream,
-                                 window=self.window, seed=self.seed, today=period.first,
-                                 temp=self.temp, partitions_art=dl.get(self.pt_run.artifact_id),
-                                 taxonomy_id=self.taxonomy_id,
-                                 primitive_meta=self.primitive_meta, mu_id=self.mu_id,
-                                 calendar=calendar)
+        tau_art = None
+        if self.pt_run is not None:          # a bucket run reads the existing tau_asof
+            tau_art = build_tau_asof(dl, config, self.table, self.P, upstream=self.upstream,
+                                     window=self.window, seed=self.seed, today=period.first,
+                                     temp=self.temp,
+                                     partitions_art=dl.get(self.pt_run.artifact_id),
+                                     taxonomy_id=self.taxonomy_id,
+                                     primitive_meta=self.primitive_meta, mu_id=self.mu_id,
+                                     calendar=calendar)
         cal = calibration_as_of(dl, config, self.table, self.emb_key, upstream=self.upstream,
                                 window=self.window, seed=self.seed, temp=self.temp,
                                 mu_id=self.mu_id, as_of=period.first, calendar=calendar)
@@ -849,22 +898,24 @@ class ScoringJob(Job):
             embeddings_provenance=self.provenance,
             extra_metadata={"narrative_daily_id": self.nd_run.artifact_id,
                             "day_diagnostics_id": self.dg_run.artifact_id,
-                            "partitions_id": self.pt_run.artifact_id})
+                            "partitions_id": self.pt_run.artifact_id if self.pt_run else None})
         summary["n_days_scored"] += res.n_days
         summary["n_days_null_only"] += len(res.null_only_days)
         summary["peak_rss_gb"] = max(summary["peak_rss_gb"], res.peak_rss_gb)
         if res.metadata is not None:
             self.last_metadata = res.metadata
-        if days[-1] == period.last:                # the period closed on schedule
+        if self.sink is not None and days[-1] == period.last:   # the period closed on schedule
             self.sink.finalise_before(period.next().first)
 
     def finalize(self, ctx: JobContext) -> None:
         summary, calendar = self.summary, self.calendar
-        summary["months_finalised"] = [p.name for p in self.sink.finalised]
+        summary["months_finalised"] = ([p.name for p in self.sink.finalised]
+                                       if self.sink is not None else [])
         if self.last_metadata is not None:
             self.writer.close(self.last_metadata)
-        self.pt_run.note(f"{len(self.sink.finalised)} {calendar.freq} partition(s) finalised "
-                         f"in [{self.earliest}, {self.end}]")
+        if self.pt_run is not None:
+            self.pt_run.note(f"{len(self.sink.finalised)} {calendar.freq} partition(s) "
+                             f"finalised in [{self.earliest}, {self.end}]")
         self.nd_run.note(f"{summary['n_days_scored']} day(s) scored, "
                          f"{summary['n_days_null_only']} null-only, peak RSS "
                          f"{summary['peak_rss_gb']:.2f} GB")
@@ -904,7 +955,7 @@ class ScoringJob(Job):
             raise ValueError(f"{nd.artifact_id} has no {RUN_CONFIG_FILE} (written before "
                              "resume support); it cannot be resumed")
         rc = json.loads(path.read_text())
-        config = ScoringConfig(**rc["config"])
+        config = ScoringConfig.from_dict(rc["config"])
         tax_art = resolve_taxonomy([dl, upstream], artifact_id=rc["taxonomy_artifact_id"])
         table = load_registered_table(tax_art, rc["primitive_embeddings"]["paraphrase_style"])
         card = rc["primitive_embeddings"]["model_card"]
@@ -924,7 +975,7 @@ class ScoringJob(Job):
                              if ix.exists(rc["sentiment_artifact_id"]))
         inputs = rc["inputs"]
         source = headline_source(upstream, chunk_size=chunk_size, threads=threads,
-                                 sentiment=sentiment, sentiment_column=config.sentiment_column,
+                                 sentiment=sentiment, config=config,
                                  headlines=upstream.get(inputs["headlines"]),
                                  embeddings=upstream.get(inputs["embeddings"]))
         calendar = CalibrationCalendar(**rc.get("calibration", {}))   # absent: the default
@@ -990,10 +1041,11 @@ def score_range_to_datalake(dl: DatalakeIndex, start: date, end: date, config: S
     loud warning, never an error. narrative_daily / day_diagnostics are
     partitioned by the same period.
 
-    A split run (``config.sentiment_split = sign``) needs ``sentiment``, the
-    ``headline_sentiment`` artifact whose ``config.sentiment_column`` is joined in; it
-    is checked against the headlines artifact and cited in the lineage. The null
-    partitions and tau never see sentiment.
+    A sentiment-filtered run (``config.sentiment`` = a bucket) needs ``sentiment``, the
+    ``headline_sentiment`` artifact its bucket is read from; it is checked against the
+    headlines artifact and cited in the lineage. It scores the same days as the
+    all-headlines run with the same tau and mu, reads that run's tau_asof (and refuses
+    to start without one covering its dates), and never opens the null partitions.
 
     ``primitive_meta`` is the primitive-embedding cache sidecar (backend, serving
     metadata, checks); with the headline-embeddings model card it is written to
@@ -1116,10 +1168,26 @@ def verify_narrative_daily(artifact: Artifact):
     return _findings(KIND_NARRATIVE_DAILY, artifact, check)
 
 
+def load_day_diagnostics(artifact: Artifact) -> pl.DataFrame:
+    """Every day_diagnostics row of an artifact, whatever layout its files were written
+    with: columns absent from an older layout come back null, and a missing N_SCORED is
+    N_HEADLINES (an all-headlines run scores every headline)."""
+    files = sorted(p for p in artifact.files() if p.suffix == ".parquet")
+    if not files:
+        return pl.DataFrame(schema=DAY_DIAGNOSTICS_SCHEMA)
+    df = pl.concat([pl.read_parquet(f) for f in files], how="diagonal_relaxed")
+    if "N_SCORED" not in df.columns:
+        df = df.with_columns(pl.lit(None, dtype=pl.Int64).alias("N_SCORED"))
+    df = df.with_columns(pl.col("N_SCORED").fill_null(pl.col("N_HEADLINES")))
+    return df.select([pl.col(c).cast(t) if c in df.columns else pl.lit(None, dtype=t).alias(c)
+                      for c, t in DAY_DIAGNOSTICS_SCHEMA.items()]).sort("DATE")
+
+
 def verify_day_diagnostics(artifact: Artifact):
     def check():
         yield from _schema_check(artifact.files(), DAY_DIAGNOSTICS_SCHEMA, KIND_DAY_DIAGNOSTICS,
-                                 accepted=(DAY_DIAGNOSTICS_SCHEMA_V1,))
+                                 accepted=(DAY_DIAGNOSTICS_SCHEMA_V2,
+                                           DAY_DIAGNOSTICS_SCHEMA_V1))
     return _findings(KIND_DAY_DIAGNOSTICS, artifact, check)
 
 

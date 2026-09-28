@@ -61,15 +61,31 @@ def n_candidates_for(q: float, n_primitives: int) -> int:
     return max(1, int(math.ceil((1.0 - q) * n_primitives - 1e-9)))
 
 
-class SentimentSplit(str, Enum):
-    NONE = "none"    # one "all" row per (day, narrative)
-    SIGN = "sign"    # "all" plus "pos" / "neg" (and "neu" when neutral_eps > 0)
+class SentimentFilter(str, Enum):
+    """Which headlines a run scores. ``none`` = all of them; the four others are the
+    sentiment buckets, which partition the headlines (see ``ScoringConfig``)."""
+
+    NONE = "none"
+    POSITIVE = "positive"
+    NEUTRAL = "neutral"
+    NEGATIVE = "negative"
+    UNSCORED = "unscored"
 
 
-SENTIMENT_ALL = "all"
+SENTIMENT_ALL = "all"          # narrative_daily SENTIMENT value of a ``none`` run
 SENTIMENT_NONE = "none"
-SENTIMENT_COLUMN_PREFIX = "SENT_"
-SENTIMENT_SCORE_COLUMN = "SENT_SCORE"     # the nlp Sentimeter score, the default split column
+SENTIMENT_BUCKETS = (SentimentFilter.POSITIVE, SentimentFilter.NEUTRAL,
+                     SentimentFilter.NEGATIVE, SentimentFilter.UNSCORED)
+MODEL_SOURCES = ("ravenbert", "finbert")      # grid tables (P_00..P_40)
+VENDOR_SOURCES = ("ravenpack",)               # one score column (SENT_CSS)
+MODEL_RULES = ("argmax", "mean", "median")    # nlp.sentiment.ordinal_sql.RULES
+VENDOR_RULES = ("css",)
+_SENTIMENT_FIELDS = ("sentiment", "sentiment_source", "sentiment_rule", "neg_max", "pos_min",
+                     "min_conf")
+# what a no-filter config hashed as before the sentiment filter existed: kept so the
+# config_id of every existing all-headlines run stays the same
+_LEGACY_NO_SENTIMENT = {"sentiment_split": "none", "neutral_eps": 0.0,
+                        "sentiment_source": "none", "sentiment_column": ""}
 
 
 @dataclass(frozen=True)
@@ -91,13 +107,25 @@ class ScoringConfig:
         min_month_draws: the tau job extends its window backwards until the merged pool
             holds at least this many draws (tau_asof.py).
         gap_alert_threshold: |tau_gauss - tau_empirical| above this is logged (warning only).
-        sentiment_split: ``none`` (default) or ``sign``; see pipeline.py.
-        neutral_eps: |sentiment| <= eps is "neu" (only when > 0).
-        sentiment_source: the ``headline_sentiment`` producer the split reads (e.g.
-            ``ravenpack``, ``ravenbert``, ``finbert``); ``none`` without a split.
-        sentiment_column: the ``SENT_*`` column of that artifact; "" without a split.
-            Source and column are numerical choices (different scores, different
-            pos/neg rows), so both enter ``digest``; the exact artifact id is lineage.
+        sentiment: which headlines are scored: ``none`` (all) or one bucket. A bucket is
+            selected at load time, from the ``headline_sentiment`` artifact of
+            ``sentiment_source``, with SENT and CONF computed by ``sentiment_rule``
+            (``nlp.sentiment.ordinal_sql``; vendor: the SENT_CSS score, no CONF):
+
+                unscored = SENT null OR CONF < min_conf
+                negative = SENT <= neg_max          (and not unscored)
+                positive = SENT >= pos_min          (and not unscored)
+                neutral  = neg_max < SENT < pos_min (and not unscored)
+
+            -1 <= neg_max < pos_min <= 1, so the four buckets partition the headlines,
+            and a bucket run reuses the all-headlines tau and mu: the four bucket runs
+            add up exactly to the ``none`` run (validation.sum_sentiment_runs).
+        sentiment_source: ``ravenbert`` | ``finbert`` (grid tables) | ``ravenpack`` (SENT_CSS).
+        sentiment_rule: ``argmax`` | ``mean`` | ``median`` (models) or ``css`` (vendor).
+        neg_max, pos_min, min_conf: the bucket thresholds above; ``min_conf`` applies to
+            model sources only.
+        The sentiment fields do not enter ``f0_digest`` / ``warmup_digest``, and a
+        ``none`` config hashes exactly as before they existed.
     """
 
     mode: Correction = Correction.R2
@@ -113,17 +141,19 @@ class ScoringConfig:
     null_draws_per_headline: int = 64
     min_month_draws: int = 20_000_000
     gap_alert_threshold: float = 0.05
-    sentiment_split: SentimentSplit = SentimentSplit.NONE
-    neutral_eps: float = 0.0
+    sentiment: SentimentFilter = SentimentFilter.NONE
     sentiment_source: str = SENTIMENT_NONE
-    sentiment_column: str = ""
+    sentiment_rule: str = "mean"
+    neg_max: float = -1.0 / 3.0
+    pos_min: float = 1.0 / 3.0
+    min_conf: float = 0.0
     label: str = ""
 
     def __post_init__(self) -> None:
         # accept the string form of every enum (CLI / JSON round trips)
         for name, enum_type in (("mode", Correction), ("paraphrase_style", ParaphraseStyle),
                                 ("paraphrase_pooling", PoolRule), ("narrative_agg", AggRule),
-                                ("sentiment_split", SentimentSplit)):
+                                ("sentiment", SentimentFilter)):
             value = getattr(self, name)
             if not isinstance(value, enum_type):
                 object.__setattr__(self, name, enum_type(value))
@@ -141,18 +171,40 @@ class ScoringConfig:
             raise ValueError("min_month_draws must be >= 1")
         if self.gap_alert_threshold <= 0:
             raise ValueError("gap_alert_threshold must be > 0")
-        if self.neutral_eps < 0.0:
-            raise ValueError("neutral_eps must be >= 0")
-        split = self.sentiment_split is SentimentSplit.SIGN
-        has_source = self.sentiment_source != SENTIMENT_NONE or bool(self.sentiment_column)
-        if split and (self.sentiment_source == SENTIMENT_NONE or not self.sentiment_column):
-            raise ValueError("sentiment_split=sign needs sentiment_source and sentiment_column")
-        if not split and has_source:
-            raise ValueError("sentiment_source/sentiment_column are only meaningful with "
-                             "sentiment_split=sign")
-        if split and not self.sentiment_column.startswith(SENTIMENT_COLUMN_PREFIX):
-            raise ValueError(f"sentiment_column must be a {SENTIMENT_COLUMN_PREFIX}* column, "
-                             f"got {self.sentiment_column!r}")
+        if self.sentiment is SentimentFilter.NONE:
+            if self.sentiment_source != SENTIMENT_NONE:
+                raise ValueError("sentiment_source is only meaningful with a sentiment filter")
+            return
+        if self.sentiment_source in MODEL_SOURCES:
+            rules = MODEL_RULES
+        elif self.sentiment_source in VENDOR_SOURCES:
+            rules = VENDOR_RULES
+            if self.min_conf != 0.0:
+                raise ValueError(f"min_conf applies to model sources only; "
+                                 f"{self.sentiment_source} has no confidence")
+        else:
+            raise ValueError(f"sentiment_source must be one of "
+                             f"{MODEL_SOURCES + VENDOR_SOURCES}, got {self.sentiment_source!r}")
+        if self.sentiment_rule not in rules:
+            raise ValueError(f"sentiment_rule for {self.sentiment_source} must be one of "
+                             f"{rules}, got {self.sentiment_rule!r}")
+        if not -1.0 <= self.neg_max < self.pos_min <= 1.0:
+            raise ValueError(f"need -1 <= neg_max < pos_min <= 1, got neg_max={self.neg_max}, "
+                             f"pos_min={self.pos_min}")
+        if not 0.0 <= self.min_conf <= 1.0:
+            raise ValueError(f"min_conf must be in [0, 1], got {self.min_conf}")
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> ScoringConfig:
+        """A config from its ``to_dict`` form, including the pre-filter form recorded by
+        older runs (``sentiment_split`` / ``neutral_eps`` / ``sentiment_column``)."""
+        d = dict(d)
+        legacy = {k: d.pop(k) for k in ("sentiment_split", "neutral_eps", "sentiment_column")
+                  if k in d}
+        if legacy.get("sentiment_split", "none") != "none":
+            raise ValueError("this run used the removed in-run sentiment split "
+                             f"({legacy}); it cannot be rebuilt")
+        return cls(**d)
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -161,10 +213,26 @@ class ScoringConfig:
                 d[k] = v.value
         return d
 
-    def digest(self) -> str:
-        """Stable hash of every numerical choice (``label`` excluded)."""
+    def _hashable(self, *, with_filter: bool = True) -> dict[str, Any]:
         d = self.to_dict()
         d.pop("label")
+        if self.sentiment is SentimentFilter.NONE:
+            for k in _SENTIMENT_FIELDS:
+                d.pop(k)
+            d.update(_LEGACY_NO_SENTIMENT)
+        elif not with_filter:
+            d.pop("sentiment")
+        return d
+
+    def digest(self) -> str:
+        """Stable hash of every numerical choice (``label`` excluded). A ``none`` config
+        hashes as it did before the sentiment filter existed."""
+        return hashlib.sha1(json.dumps(self._hashable(), sort_keys=True).encode()).hexdigest()[:16]
+
+    def digest_without_filter(self) -> str:
+        """``digest`` with the bucket removed: equal across the four bucket runs of one
+        sentiment setup (same source, rule and thresholds)."""
+        d = self._hashable(with_filter=False)
         return hashlib.sha1(json.dumps(d, sort_keys=True).encode()).hexdigest()[:16]
 
     def f0_digest(self) -> str:
@@ -181,10 +249,14 @@ class ScoringConfig:
             "mode", "paraphrase_style", "paraphrase_pooling", "include_master")}
         return hashlib.sha1(json.dumps(d, sort_keys=True).encode()).hexdigest()[:16]
 
-    def sentiment_labels(self) -> tuple[str, ...]:
-        if self.sentiment_split is SentimentSplit.NONE:
-            return ()
-        return ("pos", "neg", "neu") if self.neutral_eps > 0 else ("pos", "neg")
+    @property
+    def filtered(self) -> bool:
+        return self.sentiment is not SentimentFilter.NONE
+
+    @property
+    def row_label(self) -> str:
+        """The narrative_daily SENTIMENT value of this run: "all" or the bucket."""
+        return SENTIMENT_ALL if not self.filtered else self.sentiment.value
 
 
 @dataclass

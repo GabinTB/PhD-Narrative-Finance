@@ -4,9 +4,9 @@
     uv run python -m narrative_scoring.jobs score    --from 2004-01-01 --to 2004-12-31 \
                                                      --taxonomy Evergreen_v5
     uv run python -m narrative_scoring.jobs score    --from 2004-01-01 --to 2004-12-31 \
-                                                     --split sign --sentiment-source finbert \
-                                                     --sentiment-column SENT_SCORE \
-                                                     --neutral-eps 0.3333333
+                                                     --sentiment negative \
+                                                     --sentiment-source ravenbert \
+                                                     --sentiment-rule mean
     uv run python -m narrative_scoring.jobs tau-asof [--window 5Y | expanding] [--today ...]
     uv run python -m narrative_scoring.jobs resume <partial narrative_daily artifact id>
     uv run jobs start narrative_daily --from ... --to ... [same flags]   (same as score)
@@ -20,11 +20,16 @@ $RAW_DATA_PATH/Narrative_Taxonomy and registers them as a ``narrative_taxonomy``
 Scoring against several taxonomies = one run per taxonomy; their outputs never mix (every
 family is resolved by the taxonomy hash).
 
-``--split sign`` adds pos/neg(/neu) rows from one SENT_* column of a ``headline_sentiment``
-artifact: ``--sentiment-source NAME`` (latest of that producer built on the scored headlines)
-or ``--sentiment-artifact ID`` (an exact one), plus ``--sentiment-column`` (default
-SENT_SCORE, the Sentimeter score) and ``--neutral-eps``. Source and column enter config_id;
-the artifact is cited in the lineage.
+``--sentiment positive | neutral | negative | unscored`` scores only that bucket's headlines
+(default ``none``: all), selected at load time from a ``headline_sentiment`` artifact:
+``--sentiment-source`` ravenbert | finbert (grid tables) | ravenpack (SENT_CSS), latest of
+that producer built on the scored headlines, or ``--sentiment-artifact ID`` (an exact one);
+``--sentiment-rule`` argmax | mean | median (models, default mean) or css (vendor, default);
+``--neg-max`` / ``--pos-min`` (default -1/3, 1/3) and ``--min-conf`` (models only, default 0).
+See narrative_scoring/sentiment_filter.py for the buckets. A bucket run reuses the tau_asof
+and mu of the all-headlines run (it refuses to start without one covering its dates), so
+the four bucket runs add up exactly to it (validation.sum_sentiment_runs). The settings
+enter config_id; the artifact is cited in the lineage.
 
 Primitive texts are embedded through ``nlp`` (``--embedding-backend`` tei | local | embedx,
 ``--embedding-dtype`` float16 | float32; default TEI fp16), cached locally by texts +
@@ -53,11 +58,11 @@ from pathlib import Path
 
 from narrative_scoring.config import (
     SENTIMENT_NONE,
-    SENTIMENT_SCORE_COLUMN,
+    VENDOR_SOURCES,
     ParaphraseStyle,
     PoolRule,
     ScoringConfig,
-    SentimentSplit,
+    SentimentFilter,
     default_pooling,
 )
 from nlp.corrections import Correction
@@ -75,13 +80,15 @@ def _env(name: str) -> Path:
 def _config(args: argparse.Namespace) -> ScoringConfig:
     style = ParaphraseStyle(args.style)
     pooling = PoolRule(args.pooling) if args.pooling else default_pooling(style)
+    bucket = SentimentFilter(args.sentiment)
+    source = _sentiment_source_name(args) if bucket is not SentimentFilter.NONE \
+        else SENTIMENT_NONE
+    rule = args.sentiment_rule or ("css" if source in VENDOR_SOURCES else "mean")
     return ScoringConfig(
         mode=Correction(args.mode), paraphrase_style=style, paraphrase_pooling=pooling,
-        q=args.q, jump_cut=args.jump_cut, sentiment_split=SentimentSplit(args.split),
-        neutral_eps=args.neutral_eps,
-        sentiment_source=_sentiment_source_name(args),
-        sentiment_column=args.sentiment_column or (
-            SENTIMENT_SCORE_COLUMN if args.split == "sign" else ""),
+        q=args.q, jump_cut=args.jump_cut, sentiment=bucket, sentiment_source=source,
+        sentiment_rule=rule, neg_max=args.neg_max, pos_min=args.pos_min,
+        min_conf=args.min_conf,
         min_month_draws=args.min_month_draws, gap_alert_threshold=args.gap_alert_threshold,
         label=args.label,
     )
@@ -103,17 +110,18 @@ def _sentiment_source_name(args: argparse.Namespace) -> str:
 
 
 def _sentiment(args: argparse.Namespace, config: ScoringConfig, dl, upstream):
-    """The headline_sentiment artifact of a split run (None without a split)."""
-    if config.sentiment_split is not SentimentSplit.SIGN:
+    """The headline_sentiment artifact of a filtered run (None for sentiment=none)."""
+    if not config.filtered:
         return None
     from narrative_scoring.artifacts import KIND_HEADLINES, resolve_sentiment
 
     art = resolve_sentiment(
         [dl, upstream], headlines_id=upstream.latest(KIND_HEADLINES).artifact_id,
-        column=config.sentiment_column,
+        config=config,
         source=None if args.sentiment_artifact else config.sentiment_source,
         artifact_id=args.sentiment_artifact)
-    log.info("sentiment: %s column %s", art.artifact_id, config.sentiment_column)
+    log.info("sentiment: %s (%s, rule %s, bucket %s)", art.artifact_id,
+             config.sentiment_source, config.sentiment_rule, config.sentiment.value)
     return art
 
 
@@ -169,7 +177,7 @@ def scoring_job_from_args(args: argparse.Namespace, dl, upstream):
     sentiment = _sentiment(args, config, dl, upstream)
     tax_art, table, P, p_meta = _table_and_embeddings(args, dl, upstream)
     source = headline_source(upstream, chunk_size=args.chunk_size, threads=args.threads,
-                             sentiment=sentiment, sentiment_column=config.sentiment_column)
+                             sentiment=sentiment, config=config)
     return ScoringJob(
         dl, date.fromisoformat(args.start), date.fromisoformat(args.end), config,
         table=table, P=P, upstream=upstream, source=source, window=args.window,
@@ -188,7 +196,7 @@ def cmd_score(args: argparse.Namespace) -> int:
     for k in ("start", "end", "n_days_scored", "n_days_null_only", "peak_rss_gb",
               "months_finalised", "narrative_daily_id", "day_diagnostics_id",
               "partitions_id", "tau_asof_id"):
-        print(f"{k}={summary[k]}")
+        print(f"{k}={summary.get(k)}")
     return 0
 
 
@@ -247,16 +255,21 @@ def add_scoring_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--pooling", default=None, choices=[p.value for p in PoolRule])
     parser.add_argument("--q", type=float, default=0.99)
     parser.add_argument("--jump-cut", action="store_true")
-    parser.add_argument("--split", default="none", choices=[s.value for s in SentimentSplit])
-    parser.add_argument("--neutral-eps", type=float, default=0.0,
-                        help="|sentiment| <= eps is 'neu' (split runs)")
+    parser.add_argument("--sentiment", default="none",
+                        choices=[b.value for b in SentimentFilter],
+                        help="score only this bucket's headlines (default none: all)")
     parser.add_argument("--sentiment-source", default=None,
-                        help="headline_sentiment producer: ravenpack | ravenbert | finbert")
+                        help="headline_sentiment producer: ravenbert | finbert | ravenpack")
     parser.add_argument("--sentiment-artifact", default=None,
                         help="exact headline_sentiment artifact id (overrides the source)")
-    parser.add_argument("--sentiment-column", default=None,
-                        help="SENT_* column of the sentiment artifact (split runs; "
-                             "default SENT_SCORE)")
+    parser.add_argument("--sentiment-rule", default=None,
+                        help="argmax | mean | median (models, default mean); css (vendor)")
+    parser.add_argument("--neg-max", type=float, default=-1.0 / 3.0,
+                        help="negative = SENT <= neg-max (default -1/3)")
+    parser.add_argument("--pos-min", type=float, default=1.0 / 3.0,
+                        help="positive = SENT >= pos-min (default 1/3)")
+    parser.add_argument("--min-conf", type=float, default=0.0,
+                        help="unscored = SENT null or CONF < min-conf (models only; default 0)")
     parser.add_argument("--min-month-draws", type=int, default=20_000_000)
     parser.add_argument("--gap-alert-threshold", type=float, default=0.05)
     parser.add_argument("--label", default="")

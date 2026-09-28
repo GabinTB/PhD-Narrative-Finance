@@ -17,21 +17,21 @@ next chunk's I/O with the current chunk's scoring. Rows are ordered by
 RP_STORY_ID so the chunk stream, and with it the seeded null-draw sample,
 is deterministic across runs (a hash join's output order is not).
 
-Sentiment is an optional side channel (``SentimentSource``): one SENT_* column
-of a ``headline_sentiment`` artifact (ravenpack/headlines/sentiment.py, the
-score database contract), LEFT JOINed on RP_STORY_ID in the same day query,
-so the score arrives in the same Arrow batch as the embedding, already
-aligned, with no per-row Python lookup. Strict: a missing partition file or
-column, a scored headline without a sentiment row, or a value outside
-[-1, 1] raises; a NaN value is a legitimate "no score" and passes through.
-The score is a function of the story as published, hence available at the
-headline's own timestamp (point-in-time).
+A filtered run (``config.sentiment`` = a bucket, sentiment_filter.py) scores only the
+headlines of its bucket: the day query LEFT JOINs the SENT / CONF of the day's stories,
+computed from the ``headline_sentiment`` partition (ravenpack/headlines/sentiment.py)
+restricted to those stories, and keeps the rows of the bucket, so nothing else is read
+into Python or scored. Strict coverage: a headline without a sentiment ROW raises; a row
+with null P_* (no model output) is "unscored", not an error. ``day_total(day)`` counts
+the day's headlines x embeddings rows with the SAME query builder and no filter: the
+denominator a filtered run shares with the all-headlines run, so attention adds up.
+The score is a function of the story as published, hence available at the headline's
+own timestamp (point-in-time).
 """
 from __future__ import annotations
 
 import logging
 import queue
-import re
 import threading
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -41,10 +41,10 @@ from typing import Any, Iterator, Protocol
 import duckdb
 import numpy as np
 import pyarrow as pa
-import pyarrow.parquet as pq
 
 from datalake.layout import Layout
 from narrative_scoring.schema import EMBEDDING_DIM
+from narrative_scoring.sentiment_filter import SentimentBucket
 
 log = logging.getLogger(__name__)
 
@@ -70,54 +70,19 @@ class Chunk:
     """One bounded block of a day's headlines."""
 
     embeddings: np.ndarray                 # float32 (n, EMBEDDING_DIM), C-contiguous
-    sentiment: np.ndarray | None = None    # float32 (n,), NaN = missing; None = no provider
 
     @property
     def n(self) -> int:
         return int(self.embeddings.shape[0])
 
 
-class SentimentSource(Protocol):
-    """Where a day's sentiment scores live: one column of partitioned parquet files keyed
-    by RP_STORY_ID (the headline_sentiment contract)."""
-
-    column: str
-    artifact_id: str
-
-    def partition_path(self, day: date) -> Path: ...
-
-    def describe(self) -> str: ...
-
-
-SCORE_COLUMN_RE = re.compile(r"^SENT_[A-Z0-9_]+$")
-
-
-@dataclass
-class ParquetSentimentSource:
-    """One ``SENT_*`` column of a registered ``headline_sentiment`` artifact."""
-
-    sentiment_dir: Path
-    column: str
-    artifact_id: str = ""
-    layout: Layout = field(default_factory=Layout)
-
-    def __post_init__(self) -> None:
-        self.sentiment_dir = Path(self.sentiment_dir)
-        if not SCORE_COLUMN_RE.match(self.column):
-            raise ValueError(f"sentiment column must match {SCORE_COLUMN_RE.pattern}, "
-                             f"got {self.column!r}")
-
-    def partition_path(self, day: date) -> Path:
-        return self.layout.file_for(self.sentiment_dir, day)
-
-    def describe(self) -> str:
-        return f"{self.artifact_id or self.sentiment_dir.name}:{self.column}"
-
-
 class HeadlineSource(Protocol):
-    """Point-in-time day access."""
+    """Point-in-time day access: the day's (possibly bucket-filtered) headlines, and the
+    day's total headline count before any filter."""
 
     def iter_day(self, day: date) -> Iterator[Chunk]: ...
+
+    def day_total(self, day: date) -> int: ...
 
     def describe(self) -> str: ...
 
@@ -128,7 +93,8 @@ class ParquetHeadlineSource:
 
     Both artifacts share one ``layout`` (an embedding partition has the key of the
     headlines partition it was computed from), so a day is read from the one pair
-    of files that holds it, whatever the partition frequency.
+    of files that holds it, whatever the partition frequency. With ``sentiment`` (a
+    ``SentimentBucket``), only the headlines of that bucket are yielded.
     """
 
     headlines_dir: Path
@@ -138,7 +104,7 @@ class ParquetHeadlineSource:
     duckdb_memory_limit: str = "6GB"
     temp_directory: str | None = "/tmp/duckdb_spill"
     source_id: str = ""
-    sentiment: SentimentSource | None = None
+    sentiment: SentimentBucket | None = None
     layout: Layout = field(default_factory=Layout)
 
     def __post_init__(self) -> None:
@@ -155,78 +121,75 @@ class ParquetHeadlineSource:
         return (self.layout.file_for(self.headlines_dir, day).exists()
                 and self.layout.file_for(self.embeddings_dir, day).exists())
 
+    def _connect(self) -> duckdb.DuckDBPyConnection:
+        conn = duckdb.connect()
+        conn.execute("SET enable_progress_bar=false")
+        conn.execute(f"SET threads={int(self.threads)}")
+        conn.execute(f"SET memory_limit='{self.duckdb_memory_limit}'")
+        if self.temp_directory:
+            Path(self.temp_directory).mkdir(parents=True, exist_ok=True)
+            conn.execute(f"SET temp_directory='{self.temp_directory}'")
+        return conn
+
+    def _day_sql(self, day: date, *, count: bool = False) -> str:
+        """THE day query: headlines x embeddings on RP_STORY_ID within the day. ``count``
+        gives its row count with no sentiment filter (``day_total``); otherwise the
+        embeddings (+ the strict-coverage flag, filtered to the bucket, when ``sentiment``
+        is set) ordered by RP_STORY_ID."""
+        hl = self.layout.file_for(self.headlines_dir, day)
+        emb = self.layout.file_for(self.embeddings_dir, day)
+        within = (f"h.TIMESTAMP_UTC >= '{day.isoformat()}' "
+                  f"AND h.TIMESTAMP_UTC < '{(day + timedelta(days=1)).isoformat()}'")
+        joined = f"read_parquet('{hl}') h JOIN read_parquet('{emb}') e USING (RP_STORY_ID)"
+        if count:
+            return f"SELECT COUNT(*) FROM {joined} WHERE {within}"
+        if self.sentiment is None:
+            return (f"SELECT CAST(e.EMBEDDING AS FLOAT[{EMBEDDING_DIM}]) AS EMBEDDING "
+                    f"FROM {joined} WHERE {within} ORDER BY h.RP_STORY_ID")
+        day_ids = (f"SELECT h.RP_STORY_ID FROM read_parquet('{hl}') h WHERE {within}")
+        sent = self.sentiment.select_sql(self._sentiment_file(day), day_ids)
+        return (f"SELECT CAST(e.EMBEDDING AS FLOAT[{EMBEDDING_DIM}]) AS EMBEDDING, "
+                f"s.RP_STORY_ID IS NULL AS NO_ROW "
+                f"FROM {joined} LEFT JOIN ({sent}) s USING (RP_STORY_ID) "
+                f"WHERE {within} AND ({self.sentiment.predicate()} OR s.RP_STORY_ID IS NULL) "
+                f"ORDER BY h.RP_STORY_ID")
+
+    def day_total(self, day: date) -> int:
+        """The day's headlines x embeddings rows, unfiltered (= a ``none`` run's N_HEADLINES)."""
+        if not self.has_day(day):
+            return 0
+        conn = self._connect()
+        try:
+            return int(conn.sql(self._day_sql(day, count=True)).fetchone()[0])
+        finally:
+            conn.close()
+
     def iter_day(self, day: date) -> Iterator[Chunk]:
         if not self.has_day(day):
             return
-        hl = self.layout.file_for(self.headlines_dir, day)
-        emb = self.layout.file_for(self.embeddings_dir, day)
-        day_after = (day + timedelta(days=1)).isoformat()
-        sent_cols, sent_join = "", ""
-        if self.sentiment is not None:
-            sent_path = self._sentiment_file(day)
-            col = self.sentiment.column
-            sent_cols = f", CAST(s.{col} AS FLOAT) AS SENT, s.RP_STORY_ID IS NULL AS NO_ROW"
-            sent_join = f"LEFT JOIN read_parquet('{sent_path}') s USING (RP_STORY_ID)"
-        conn = duckdb.connect()
+        conn = self._connect()
         try:
-            conn.execute("SET enable_progress_bar=false")
-            conn.execute(f"SET threads={int(self.threads)}")
-            conn.execute(f"SET memory_limit='{self.duckdb_memory_limit}'")
-            if self.temp_directory:
-                Path(self.temp_directory).mkdir(parents=True, exist_ok=True)
-                conn.execute(f"SET temp_directory='{self.temp_directory}'")
-            query = f"""
-                SELECT CAST(e.EMBEDDING AS FLOAT[{EMBEDDING_DIM}]) AS EMBEDDING{sent_cols}
-                FROM read_parquet('{hl}') h
-                JOIN read_parquet('{emb}') e USING (RP_STORY_ID)
-                {sent_join}
-                WHERE h.TIMESTAMP_UTC >= '{day.isoformat()}'
-                  AND h.TIMESTAMP_UTC < '{day_after}'
-                ORDER BY h.RP_STORY_ID
-            """
-            for batch in conn.sql(query).to_arrow_reader(self.chunk_size):
+            for batch in conn.sql(self._day_sql(day)).to_arrow_reader(self.chunk_size):
                 if not batch.num_rows:
                     continue
-                X = arrow_embeddings_to_numpy(batch.column(0))
-                sent = (self._checked_sentiment(batch, day) if self.sentiment is not None
-                        else None)
-                yield Chunk(X, sent)
+                if self.sentiment is not None:
+                    no_row = batch.column(1).to_numpy(zero_copy_only=False)
+                    if no_row.any():
+                        raise LookupError(
+                            f"{day}: {int(no_row.sum())} headline(s) have no row in "
+                            f"{self.sentiment.describe()} (strict coverage)")
+                yield Chunk(arrow_embeddings_to_numpy(batch.column(0)))
         finally:
             conn.close()
 
     def _sentiment_file(self, day: date) -> Path:
-        """The day's sentiment partition file, after the file and column checks."""
+        """The day's sentiment partition file (must exist)."""
         assert self.sentiment is not None
-        path = self.sentiment.partition_path(day)
+        path = self.layout.file_for(self.sentiment.sentiment_dir, day)
         if not path.exists():
             raise FileNotFoundError(f"{day}: sentiment partition file missing: {path} "
                                     f"({self.sentiment.describe()})")
-        schema = pq.read_schema(path)
-        col = self.sentiment.column
-        if col not in schema.names:
-            raise KeyError(f"{day}: sentiment column {col!r} not in {path.name} "
-                           f"(has {[n for n in schema.names if n.startswith('SENT_')]})")
-        if schema.field(col).type != pa.float32():
-            raise TypeError(f"{day}: sentiment column {col!r} is {schema.field(col).type}, "
-                            f"expected float32")
         return path
-
-    def _checked_sentiment(self, batch: pa.RecordBatch, day: date) -> np.ndarray:
-        """float32 scores of the batch; raises on unmatched stories or out-of-range values."""
-        no_row = batch.column(2).to_numpy(zero_copy_only=False)
-        if no_row.any():
-            raise LookupError(f"{day}: {int(no_row.sum())} scored headline(s) have no row in "
-                              f"{self.sentiment.describe()} (strict coverage)")
-        col = batch.column(1)
-        if col.null_count:
-            raise ValueError(f"{day}: {col.null_count} null sentiment value(s) in "
-                             f"{self.sentiment.describe()}; the contract uses NaN")
-        sent = col.to_numpy(zero_copy_only=False).astype(np.float32, copy=False)
-        bad = ~np.isnan(sent) & ~((sent >= -1.0) & (sent <= 1.0))
-        if bad.any():
-            raise ValueError(f"{day}: {int(bad.sum())} sentiment value(s) outside [-1, 1] in "
-                             f"{self.sentiment.describe()}")
-        return sent
 
 
 def arrow_embeddings_to_numpy(column: pa.Array) -> np.ndarray:
@@ -242,32 +205,37 @@ def arrow_embeddings_to_numpy(column: pa.Array) -> np.ndarray:
 
 @dataclass
 class InMemoryHeadlineSource:
-    """Embeddings (and optional sentiment) already in memory, keyed by day. Tests/notebooks."""
+    """Embeddings already in memory, keyed by day. Tests/notebooks.
+
+    ``keep`` (optional, per day, a boolean mask over that day's rows) plays the role of a
+    sentiment bucket: only kept rows are yielded, while ``day_total`` still counts all.
+    """
 
     days: dict[date, np.ndarray] = field(default_factory=dict)
     chunk_size: int = 8_192
     source_id: str = "in-memory"
-    sentiment: dict[date, np.ndarray] | None = None
+    keep: dict[date, np.ndarray] | None = None
 
     def describe(self) -> str:
         return self.source_id
+
+    def day_total(self, day: date) -> int:
+        X = self.days.get(day)
+        return 0 if X is None else int(X.shape[0])
 
     def iter_day(self, day: date) -> Iterator[Chunk]:
         X = self.days.get(day)
         if X is None:
             return
         X = np.ascontiguousarray(X, dtype=np.float32)
-        sent = None
-        if self.sentiment is not None:
-            s = self.sentiment.get(day)
-            sent = (np.asarray(s, dtype=np.float32) if s is not None
-                    else np.full(X.shape[0], np.nan, dtype=np.float32))
-            if sent.shape != (X.shape[0],):
-                raise ValueError(f"sentiment for {day} has shape {sent.shape}, expected "
+        if self.keep is not None:
+            mask = np.asarray(self.keep.get(day, np.zeros(X.shape[0], bool)), dtype=bool)
+            if mask.shape != (X.shape[0],):
+                raise ValueError(f"keep mask for {day} has shape {mask.shape}, expected "
                                  f"({X.shape[0]},)")
+            X = X[mask]
         for i in range(0, X.shape[0], self.chunk_size):
-            yield Chunk(X[i:i + self.chunk_size],
-                        None if sent is None else sent[i:i + self.chunk_size])
+            yield Chunk(X[i:i + self.chunk_size])
 
 
 def prefetch(iterator: Iterator[Any], depth: int = 2) -> Iterator[Any]:
