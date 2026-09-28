@@ -108,6 +108,7 @@ def trim_threshold(S: np.ndarray, trim_frac: float = 0.10) -> np.ndarray:
 
 def sample_null_draws(
     S: np.ndarray, thresholds: np.ndarray, draws_per_headline: int, rng: np.random.Generator,
+    n_masked: np.ndarray | None = None,
 ) -> np.ndarray:
     """Uniform subsample of each headline's kept null draws.
 
@@ -115,11 +116,29 @@ def sample_null_draws(
     replacement) and those at or above the row's trim threshold are rejected,
     which leaves a uniform sample of the kept set. Returns the accepted draws
     as float64, row-major order (deterministic for a given ``rng`` state).
+
+    ``n_masked`` (per row) is the number of scores the bipolar pole mask set to -inf
+    (selection.apply_pole_mask). Those are not scores, so they are excluded from the
+    null pool by construction: the row must hold exactly that many non-finite values,
+    all -inf, and the rejection step skips them. Any other non-finite value (a NaN, or
+    an -inf the mask did not put there) raises.
     """
     n, p = S.shape
+    expected = np.zeros(n, dtype=np.int64) if n_masked is None else np.asarray(n_masked)
+    finite = np.isfinite(S)
+    n_bad = p - finite.sum(axis=1)
+    if not np.array_equal(n_bad, expected):
+        raise ValueError(f"{int((n_bad != expected).sum())} row(s) hold non-finite scores "
+                         "other than the pole mask's")
+    if n_bad.any() and not np.isneginf(S[~finite]).all():
+        raise ValueError("a non-finite score that is not the pole mask's -inf")
+    if n_masked is not None and not np.isfinite(thresholds[expected > 0]).all():
+        raise ValueError("a masked row has fewer finite scores than the trim keeps out")
     cols = rng.integers(0, p, size=(n, draws_per_headline))
     vals = np.take_along_axis(S, cols, axis=1)
     keep = vals < thresholds[:, None]
+    if n_bad.any():                      # the masked columns are never draws
+        keep &= np.take_along_axis(finite, cols, axis=1)
     return vals[keep].astype(np.float64)
 
 

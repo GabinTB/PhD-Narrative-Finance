@@ -17,7 +17,8 @@ differs. Per day, in order:
        (calibration.tau_for) -- both refuse to look ahead;
     2. the mode-corrected scoring matrix for that mu (cached per mu date);
     3. for each bounded chunk of headline embeddings: mode.correct, S = H @ P.T
-       with paraphrase pooling, then select + aggregate into the day's
+       with paraphrase pooling, the bipolar pole mask when ``config.mask_bipolar``
+       (in place on S, selection.apply_pole_mask), then select + aggregate into the day's
        accumulators (compiled kernel when built, numpy otherwise -- same
        numbers), sample the chunk's null draws into the month partition, and
        drop S;
@@ -62,6 +63,7 @@ from narrative_scoring.config import (
 from narrative_scoring.f0 import n_keep, n_trim, sample_null_draws, trim_threshold
 from narrative_scoring.partitions import NullDrawSink
 from narrative_scoring.primitives import (
+    BipolarPairs,
     PrimitiveTable,
     embeddings_digest,
     primitive_scores,
@@ -73,7 +75,7 @@ from narrative_scoring.schema import (
     NARRATIVE_DAILY_SCHEMA,
     PRIMITIVE_DAILY_SCHEMA,
 )
-from narrative_scoring.selection import select
+from narrative_scoring.selection import apply_pole_mask, select, select_with_pole_mask
 from narrative_scoring.streaming import (
     Chunk,
     HeadlineSource,
@@ -197,6 +199,8 @@ class _Funnel:
     n_retained: int = 0
     n_jump_trimmed: int = 0
     jump_gap_sum: float = 0.0
+    n_pole_masked: int = 0
+    n_mask_changed_retention: int = 0
 
 
 @dataclass
@@ -237,16 +241,25 @@ def _accumulate_block(
     S: np.ndarray, tau32: float, n_candidates: int, config: ScoringConfig,
     prim_to_narr: np.ndarray, n_narr: int, narr: DayAccumulator, prim: DayAccumulator | None,
     use_kernel: bool, threads: int, funnel: _Funnel | None, n_trim_rows: int,
-) -> np.ndarray | None:
-    """Steps 3-5 for one block into ``narr``/``prim``. Returns the trim thresholds when asked."""
+    pairs: BipolarPairs | None = None,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Steps 3-5 for one block into ``narr``/``prim``. Returns (the trim thresholds when
+    asked, the per-row masked counts when ``pairs`` is set). With ``pairs`` the bipolar
+    pole mask is applied to ``S`` IN PLACE first, so the caller's null draws come from the
+    masked row."""
     n_head = S.shape[0]
     jump_min = config.jump_min_candidates if config.jump_cut else -1
     thresholds = None
+    n_masked = None
+    if pairs is not None and (S.dtype != np.float32 or not S.flags.c_contiguous):
+        raise ValueError("the pole mask needs S as a C-contiguous float32 block")
     if use_kernel:
         k = select_aggregate_rowwise(
             np.ascontiguousarray(S, dtype=np.float32), tau32, n_candidates, jump_min,
             prim_to_narr, n_narr, config.narrative_agg is AggRule.MEDIAN,
             prim is not None, threads, n_trim_rows,
+            *((pairs.a_start, pairs.a_len, pairs.b_start, pairs.b_len) if pairs is not None
+              else ()),
         )
         narr.add_arrays(k["narr_count"], k["narr_total"], k["narr_sumsq"], k["narr_peak"])
         if prim is not None:
@@ -254,6 +267,8 @@ def _accumulate_block(
         n_unassigned = int(k["n_unassigned"])
         if n_trim_rows:
             thresholds = k["trim_threshold"]
+        if pairs is not None:
+            n_masked = k["n_masked"]
         if funnel is not None:
             funnel.n_candidates += int(k["n_candidates"])
             funnel.n_f0_survivors += int(k["n_f0_survivors"])
@@ -261,9 +276,20 @@ def _accumulate_block(
             funnel.n_retained += int(k["n_retained"])
             funnel.n_jump_trimmed += int(k["n_jump_trimmed"])
             funnel.jump_gap_sum += float(k["jump_gap_sum"])
+            funnel.n_pole_masked += int(k["n_pole_masked"])
+            funnel.n_mask_changed_retention += int(k["n_mask_changed_retention"])
     else:
-        sel = select(S, tau32, n_candidates, jump_cut=config.jump_cut,
-                     jump_min_candidates=config.jump_min_candidates)
+        if pairs is not None:
+            ms = select_with_pole_mask(S, tau32, n_candidates, pairs, prim_to_narr,
+                                       jump_cut=config.jump_cut,
+                                       jump_min_candidates=config.jump_min_candidates)
+            sel, n_masked = ms.selection, ms.n_masked
+            if funnel is not None:
+                funnel.n_pole_masked += ms.n_pole_masked
+                funnel.n_mask_changed_retention += ms.n_changed_retention
+        else:
+            sel = select(S, tau32, n_candidates, jump_cut=config.jump_cut,
+                         jump_min_candidates=config.jump_min_candidates)
         _, nid, nval = headline_narrative_scores(
             sel.rows, sel.cols, sel.vals, prim_to_narr, n_narr, config.narrative_agg)
         narr.add_values(nid, nval)
@@ -271,7 +297,7 @@ def _accumulate_block(
             prim.add_values(sel.cols.astype(np.int64), sel.vals)
         n_unassigned = sel.n_unassigned
         if n_trim_rows:
-            thresholds = trim_threshold(S, config.trim_frac)
+            thresholds = trim_threshold(S, config.trim_frac)       # S is masked by now
         if funnel is not None:
             funnel.n_candidates += int(sel.n_candidates.sum())
             funnel.n_f0_survivors += int(sel.n_f0_survivors.sum())
@@ -284,7 +310,7 @@ def _accumulate_block(
     if prim is not None:
         prim.n_headlines += n_head
         prim.n_unassigned += n_unassigned
-    return thresholds
+    return thresholds, n_masked
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +381,7 @@ def score_dates(
         raise ValueError("no dates to score")
     n_prim, n_narr = table.n_primitives, table.n_narratives
     prim_to_narr = table.primitive_to_narrative
+    pairs = table.bipolar_pairs if config.mask_bipolar else None
     n_candidates = n_candidates_for(config.q, n_prim)
     filtered = config.filtered
     if filtered and null_sink is not None:
@@ -367,9 +394,10 @@ def score_dates(
     n_trim_rows = n_trim(n_prim, config.trim_frac) if null_sink is not None else 0
     n_keep_rows = n_keep(n_prim, config.trim_frac)
     log.info("scoring %d day(s) [%s .. %s] mode=%s pooling=%s q=%g (k=%d) jump=%s "
-             "sentiment=%s path=%s null_sink=%s",
+             "mask_bipolar=%s (%d pairs) sentiment=%s path=%s null_sink=%s",
              len(days), days[0], days[-1], config.mode.value, config.paraphrase_pooling.value,
-             config.q, n_candidates, config.jump_cut, config.sentiment.value,
+             config.q, n_candidates, config.jump_cut, config.mask_bipolar,
+             pairs.n_pairs if pairs is not None else 0, config.sentiment.value,
              "kernel" if use_kernel else "numpy", null_sink is not None)
 
     matrix_cache: dict[date | None, np.ndarray] = {}
@@ -463,6 +491,9 @@ def score_dates(
             "PCT_JUMP_APPLIED": f.n_jump_trimmed / max(n_scored, 1),
             "MEAN_JUMP_GAP": (f.jump_gap_sum / f.n_jump_trimmed) if f.n_jump_trimmed else None,
             "NARRATIVES_TOUCHED": int((acc.count > 0).sum()),
+            "N_POLE_MASKED": f.n_pole_masked if pairs is not None else None,
+            "N_MASK_CHANGED_RETENTION": (f.n_mask_changed_retention if pairs is not None
+                                         else None),
             "N_WITH_SENTIMENT": n_scored if filtered else 0,
             "MU_DATE": mu.date if mu else None, "MU_NORM": mu.norm if mu else None,
             "TAU": ctx["tau32"], "TAU_MONTH_END": tau_rec.month_end, "N_EFF": tau_rec.n_eff,
@@ -516,18 +547,22 @@ def score_dates(
         S = primitive_scores(H, current["P_scoring"], n_prim, table.n_texts,
                              config.paraphrase_pooling)
         if current["tau32"] is None:             # null-only day
+            n_masked = apply_pole_mask(S, pairs) if pairs is not None else None
             draws = sample_null_draws(S, trim_threshold(S, config.trim_frac),
-                                      config.null_draws_per_headline, null_sink.rng_for(day))
-            null_sink.add_draws(day, draws, S.shape[0] * n_keep_rows, S.shape[0])
+                                      config.null_draws_per_headline, null_sink.rng_for(day),
+                                      n_masked=n_masked)
+            null_sink.add_draws(day, draws, _n_available(S.shape[0], n_keep_rows, n_masked),
+                                S.shape[0])
             del H, S, X, chunk
             continue
-        thresholds = _accumulate_block(
+        thresholds, n_masked = _accumulate_block(
             S, current["tau32"], n_candidates, config, prim_to_narr, n_narr,
-            state.narr, state.prim, use_kernel, threads, state.funnel, n_trim_rows)
+            state.narr, state.prim, use_kernel, threads, state.funnel, n_trim_rows, pairs)
         if null_sink is not None:
             draws = sample_null_draws(S, thresholds, config.null_draws_per_headline,
-                                      null_sink.rng_for(day))
-            null_sink.add_draws(day, draws, S.shape[0] * n_keep_rows, S.shape[0])
+                                      null_sink.rng_for(day), n_masked=n_masked)
+            null_sink.add_draws(day, draws, _n_available(S.shape[0], n_keep_rows, n_masked),
+                                S.shape[0])
         del H, S, X, chunk
     if current is not None:
         close_day(current)
@@ -583,6 +618,12 @@ def score_dates(
         metadata=metadata, peak_rss_gb=peak_rss, skipped_days=skipped,
         null_only_days=null_only_days,
     )
+
+
+def _n_available(n_head: int, n_keep_rows: int, n_masked: np.ndarray | None) -> int:
+    """Null draws available in a block: n_keep per headline, minus the masked scores (all
+    below the trim threshold, since sample_null_draws checks the threshold is finite)."""
+    return n_head * n_keep_rows - (int(n_masked.sum()) if n_masked is not None else 0)
 
 
 def _mu_available(calibration: CalibrationProvider, config: ScoringConfig, day: date) -> bool:

@@ -761,3 +761,47 @@ def test_unrecorded_lineage_warns_and_runs(tmp_path, toy_table, toy_embeddings, 
         s = _score(lake, date(2008, 3, 1), date(2008, 3, 31), cfg, toy_table, toy_embeddings)
     assert s["narrative_daily_id"]
     assert "records no ravenpack_headlines source" in caplog.text
+
+
+def test_verifiers_accept_the_layouts_before_type_and_the_pole_mask(tmp_path):
+    from narrative_scoring.schema import DAY_DIAGNOSTICS_SCHEMA_V3, NARRATIVE_DAILY_SCHEMA_V1
+
+    f = tmp_path / "2008-03.parquet"
+    row = {k: None for k in DAY_DIAGNOSTICS_SCHEMA_V3}
+    row["DATE"] = date(2008, 3, 3)
+    pl.DataFrame([row], schema=DAY_DIAGNOSTICS_SCHEMA_V3).write_parquet(f)
+    assert list(A._schema_check([f], DAY_DIAGNOSTICS_SCHEMA, "dg",
+                                accepted=(DAY_DIAGNOSTICS_SCHEMA_V3,))) == []
+    g = tmp_path / "nd" / "2008-03.parquet"
+    g.parent.mkdir()
+    row = {k: None for k in NARRATIVE_DAILY_SCHEMA_V1}
+    row["DATE"] = date(2008, 3, 3)
+    pl.DataFrame([row], schema=NARRATIVE_DAILY_SCHEMA_V1).write_parquet(g)
+    assert list(A._schema_check([g], NARRATIVE_DAILY_SCHEMA, "nd",
+                                accepted=(NARRATIVE_DAILY_SCHEMA_V1,))) == []
+    assert list(A._schema_check([g], NARRATIVE_DAILY_SCHEMA, "nd")) == [
+        "2008-03.parquet: schema mismatch"]
+
+
+def test_masked_run_builds_its_own_null_model(lake, toy_table, toy_embeddings, cfg):
+    """mask_bipolar enters f0_digest: the masked run never reuses (or extends) the unmasked
+    run's partitions / tau, and its artifacts say it is masked."""
+    plain = _score(lake, date(2008, 4, 1), date(2008, 4, 30), cfg, toy_table, toy_embeddings)
+    masked_cfg = ScoringConfig(**{**cfg.to_dict(), "mask_bipolar": True})
+    masked = _score(lake, date(2008, 4, 1), date(2008, 4, 30), masked_cfg, toy_table,
+                    toy_embeddings)
+    assert masked["partitions_id"] != plain["partitions_id"]
+    assert masked["tau_asof_id"] != plain["tau_asof_id"]
+    nd = lake.get(masked["narrative_daily_id"])
+    assert nd.meta.hyperparams["mask_bipolar"] is True
+    assert "mask_bipolar" not in lake.get(plain["narrative_daily_id"]).meta.hyperparams
+    assert lake.get(masked["partitions_id"]).meta.hyperparams["f0_config_id"] == \
+        masked_cfg.f0_digest()
+    dg = A.load_day_diagnostics(lake.get(masked["day_diagnostics_id"]))
+    assert dg["N_POLE_MASKED"].min() > 0 and dg["N_MASK_CHANGED_RETENTION"].null_count() == 0
+    plain_dg = A.load_day_diagnostics(lake.get(plain["day_diagnostics_id"]))
+    assert plain_dg["N_POLE_MASKED"].null_count() == plain_dg.height == dg.height
+    frame = pl.concat([pl.read_parquet(p) for p in sorted(nd.path.glob("*.parquet"))])
+    assert frame.schema == NARRATIVE_DAILY_SCHEMA
+    from narrative_scoring.validation import merge_poles
+    assert merge_poles(frame).height == frame.height - frame["DATE"].n_unique()

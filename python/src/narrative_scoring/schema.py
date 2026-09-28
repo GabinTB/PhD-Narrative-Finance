@@ -11,7 +11,8 @@ EMBEDDING_DIM: int = 384
 # had no retained match (SUPPORT == 0). N_HEADLINES is the DAY's scored
 # headline count, repeated per row so ATTENTION = TOTAL_SCORE / N_HEADLINES
 # needs no join; N_LABELLED is the number of those headlines carrying the
-# row's sentiment label (== N_HEADLINES on "all" rows).
+# row's sentiment label (== N_HEADLINES on "all" rows). TYPE is the narrative
+# stem: the two poles of a bipolar pair share it (validation.merge_poles).
 # ---------------------------------------------------------------------------
 
 NARRATIVE_DAILY_SCHEMA: pl.Schema = pl.Schema(
@@ -20,6 +21,7 @@ NARRATIVE_DAILY_SCHEMA: pl.Schema = pl.Schema(
         "SENTIMENT":     pl.String,
         "reservoir":     pl.String,
         "dimension":     pl.String,
+        "TYPE":          pl.String,
         "narrative":     pl.String,
         "pole":          pl.String,
         "narrative_key": pl.String,
@@ -33,6 +35,10 @@ NARRATIVE_DAILY_SCHEMA: pl.Schema = pl.Schema(
         "N_LABELLED":    pl.Int32,
     }
 )
+
+# the layout before TYPE (e.g. narrative_daily v2.2.0), still valid
+NARRATIVE_DAILY_SCHEMA_V1: pl.Schema = pl.Schema(
+    {k: v for k, v in NARRATIVE_DAILY_SCHEMA.items() if k != "TYPE"})
 
 # primitive_daily: optional diagnostics at primitive grain, same statistics.
 # Never the datalake artifact of record (owner ruling R1).
@@ -71,6 +77,10 @@ PRIMITIVE_DAILY_SCHEMA: pl.Schema = pl.Schema(
 #                             denominator); N_SCORED the headlines actually scored (= N_HEADLINES
 #                             in an all-headlines run, the bucket's count in a filtered run).
 #                             Every funnel count and share refers to the N_SCORED headlines.
+#   N_POLE_MASKED             primitive scores the bipolar pole mask set to -inf that day
+#   N_MASK_CHANGED_RETENTION  (headline, narrative) pairs whose retained primitive set differs
+#                             from the unmasked selection of the same row
+#                             (both null when the run has mask_bipolar off)
 DAY_DIAGNOSTICS_SCHEMA: pl.Schema = pl.Schema(
     {
         "DATE":                      pl.Date,
@@ -86,6 +96,8 @@ DAY_DIAGNOSTICS_SCHEMA: pl.Schema = pl.Schema(
         "PCT_JUMP_APPLIED":          pl.Float64,
         "MEAN_JUMP_GAP":             pl.Float64,
         "NARRATIVES_TOUCHED":        pl.Int32,
+        "N_POLE_MASKED":             pl.Int64,
+        "N_MASK_CHANGED_RETENTION":  pl.Int64,
         "N_WITH_SENTIMENT":          pl.Int64,
         "MU_DATE":                   pl.Date,
         "MU_NORM":                   pl.Float64,
@@ -103,12 +115,14 @@ DAY_DIAGNOSTICS_SCHEMA: pl.Schema = pl.Schema(
     }
 )
 
-# The day_diagnostics schema before SENTIMENT_SOURCE_ID existed; artifacts written with it
-# stay valid (the verifier accepts both).
-# older layouts, still valid: V2 before N_SCORED (a reader treats its absence as
+# Older day_diagnostics layouts, still valid (the verifier accepts them): V3 before the pole
+# mask columns (read back as null), V2 also before N_SCORED (a reader treats its absence as
 # N_SCORED = N_HEADLINES), V1 also before SENTIMENT_SOURCE_ID
+DAY_DIAGNOSTICS_SCHEMA_V3: pl.Schema = pl.Schema(
+    {k: v for k, v in DAY_DIAGNOSTICS_SCHEMA.items()
+     if k not in ("N_POLE_MASKED", "N_MASK_CHANGED_RETENTION")})
 DAY_DIAGNOSTICS_SCHEMA_V2: pl.Schema = pl.Schema(
-    {k: v for k, v in DAY_DIAGNOSTICS_SCHEMA.items() if k != "N_SCORED"})
+    {k: v for k, v in DAY_DIAGNOSTICS_SCHEMA_V3.items() if k != "N_SCORED"})
 DAY_DIAGNOSTICS_SCHEMA_V1: pl.Schema = pl.Schema(
     {k: v for k, v in DAY_DIAGNOSTICS_SCHEMA_V2.items() if k != "SENTIMENT_SOURCE_ID"})
 

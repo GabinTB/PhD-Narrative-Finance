@@ -36,6 +36,11 @@ Primitive texts are embedded through ``nlp`` (``--embedding-backend`` tei | loca
 embedder identity; the embedding provenance is written into every artifact of the run and
 the primitive-embedding digest is part of every lookup key.
 
+``--mask-bipolar`` keeps, per headline, one pole of every bipolar pair (selection.py); it
+changes config_id and the f0 / warmup digests, so the masked run builds its own null
+partitions and tau_asof, and its bucket runs must carry the flag too. ``primitive_daily``
+(day x primitive diagnostics) is written by default; ``--no-primitive-daily`` skips it.
+
 ``score`` is the one scoring path: it replays the live loop over the dates
 in order (monthly tau_asof job, then the days), enforcing the 1-month delay
 of the mu/tau providers and feeding the f0_monthly_partitions family. A
@@ -88,7 +93,7 @@ def _config(args: argparse.Namespace) -> ScoringConfig:
         mode=Correction(args.mode), paraphrase_style=style, paraphrase_pooling=pooling,
         q=args.q, jump_cut=args.jump_cut, sentiment=bucket, sentiment_source=source,
         sentiment_rule=rule, neg_max=args.neg_max, pos_min=args.pos_min,
-        min_conf=args.min_conf,
+        min_conf=args.min_conf, mask_bipolar=args.mask_bipolar,
         min_month_draws=args.min_month_draws, gap_alert_threshold=args.gap_alert_threshold,
         label=args.label,
     )
@@ -182,6 +187,7 @@ def scoring_job_from_args(args: argparse.Namespace, dl, upstream):
         dl, date.fromisoformat(args.start), date.fromisoformat(args.end), config,
         table=table, P=P, upstream=upstream, source=source, window=args.window,
         seed=args.seed, threads=args.threads, rss_budget_gb=args.rss_budget_gb,
+        keep_primitive_daily=not args.no_primitive_daily,
         temp=args.temp, label=args.label, taxonomy_id=tax_art.artifact_id,
         sentiment=sentiment, primitive_meta=p_meta, calendar=_calendar(args))
 
@@ -255,6 +261,12 @@ def add_scoring_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--pooling", default=None, choices=[p.value for p in PoolRule])
     parser.add_argument("--q", type=float, default=0.99)
     parser.add_argument("--jump-cut", action="store_true")
+    parser.add_argument("--mask-bipolar", action="store_true",
+                        help="keep one pole per bipolar pair per headline (enters config_id, "
+                             "f0 and warmup digests: tau and the null partitions are rebuilt)")
+    parser.add_argument("--no-primitive-daily", action="store_true",
+                        help="do not write the day x primitive diagnostics (written by default, "
+                             "~300 MB per run)")
     parser.add_argument("--sentiment", default="none",
                         choices=[b.value for b in SentimentFilter],
                         help="score only this bucket's headlines (default none: all)")

@@ -5,7 +5,8 @@ transcription of the selection and aggregation rules; the vectorised numpy
 path and the compiled kernel are asserted against them in the test suite.
 ``attention`` is the downstream Sadka-style measure, derived here and never
 stored by the scorer; ``sum_sentiment_runs`` adds the four sentiment-bucket runs of
-one setup back into the all-headlines panel, without rescoring.
+one setup back into the all-headlines panel, without rescoring; ``merge_poles`` adds the
+two pole rows of every bipolar pair into one narrative row (exact on a mask_bipolar run).
 """
 from __future__ import annotations
 
@@ -125,6 +126,7 @@ def check_sentiment_runs(runs: Sequence[SentimentRun]) -> None:
                                          for r, v in zip(runs, values)))
 
     same("sentiment artifact", [r.sentiment_artifact_id for r in runs])
+    same("mask_bipolar", [r.config.mask_bipolar for r in runs])
     for field_name in ("sentiment_source", "sentiment_rule", "neg_max", "pos_min", "min_conf"):
         same(field_name, [getattr(r.config, field_name) for r in runs])
     same("config (bucket removed)", [r.config.digest_without_filter() for r in runs])
@@ -172,18 +174,13 @@ def sum_sentiment_runs(runs: Sequence[SentimentRun]) -> pl.DataFrame:
     frames = [r.frame for r in runs]
     cols = frames[0].columns
     key_cols = [c for c in cols if c not in _STAT_COLUMNS and c != "SENTIMENT"]
-    n = pl.col("SUPPORT").cast(pl.Float64)
-    sumsq = n * (pl.col("STD_SCORE").cast(pl.Float64) ** 2
-                 + pl.col("INTENSITY").cast(pl.Float64) ** 2)
     labelled = (pl.concat([f.select("DATE", "N_LABELLED").with_columns(pl.lit(i).alias("_run"))
                            for i, f in enumerate(frames)])
                 .group_by("_run", "DATE").agg(pl.col("N_LABELLED").max())
                 .group_by("DATE").agg(pl.col("N_LABELLED").sum()))
     agg = (
         pl.concat([f.select(cols) for f in frames])
-        .with_columns(sumsq.fill_null(0.0).alias("_sumsq"),
-                      pl.col("TOTAL_SCORE").fill_null(0.0).alias("_total"),
-                      pl.col("SUPPORT").fill_null(0))
+        .with_columns(*_moment_columns())
         .group_by(key_cols, maintain_order=True)
         .agg(
             pl.col("SUPPORT").sum().alias("SUPPORT"),
@@ -194,10 +191,28 @@ def sum_sentiment_runs(runs: Sequence[SentimentRun]) -> pl.DataFrame:
         )
         .join(labelled, on="DATE", how="left")
     )
+    out = _recombined(agg).with_columns(pl.lit(SENTIMENT_ALL).alias("SENTIMENT"))
+    schema = frames[0].schema
+    return out.select([pl.col(c).cast(schema[c]) for c in cols])
+
+
+def _moment_columns() -> list[pl.Expr]:
+    """Per row: the recoverable sums ``_total`` = TOTAL_SCORE and ``_sumsq`` =
+    n (STD^2 + INTENSITY^2) (from the stored ddof=0 statistics), 0 where SUPPORT is 0."""
+    n = pl.col("SUPPORT").cast(pl.Float64)
+    sumsq = n * (pl.col("STD_SCORE").cast(pl.Float64) ** 2
+                 + pl.col("INTENSITY").cast(pl.Float64) ** 2)
+    return [sumsq.fill_null(0.0).alias("_sumsq"),
+            pl.col("TOTAL_SCORE").fill_null(0.0).alias("_total"),
+            pl.col("SUPPORT").fill_null(0)]
+
+
+def _recombined(agg: pl.DataFrame) -> pl.DataFrame:
+    """TOTAL_SCORE / INTENSITY / STD_SCORE (ddof=0) from summed SUPPORT, _total, _sumsq;
+    null where SUPPORT is 0."""
     n = pl.col("SUPPORT").cast(pl.Float64)
     has = pl.col("SUPPORT") > 0
-    out = agg.with_columns(
-        pl.lit(SENTIMENT_ALL).alias("SENTIMENT"),
+    return agg.with_columns(
         pl.when(has).then(pl.col("_total")).otherwise(None).alias("TOTAL_SCORE"),
         pl.when(has).then(pl.col("_total") / n).otherwise(None).cast(pl.Float32)
         .alias("INTENSITY"),
@@ -205,8 +220,62 @@ def sum_sentiment_runs(runs: Sequence[SentimentRun]) -> pl.DataFrame:
         .then(((pl.col("_sumsq") - pl.col("_total") ** 2 / n) / n).clip(lower_bound=0.0).sqrt())
         .otherwise(None).cast(pl.Float32).alias("STD_SCORE"),
     ).drop(["_total", "_sumsq"])
-    schema = frames[0].schema
-    return out.select([pl.col(c).cast(schema[c]) for c in cols])
+
+
+_PAIR_KEY = ["reservoir", "dimension", "TYPE"]
+
+
+def merge_poles(narrative_daily: pl.DataFrame) -> pl.DataFrame:
+    """The narrative-level view: the two pole rows of every bipolar pair added into one row.
+    Pure; never rescores. A pair is a (reservoir, dimension, TYPE) group holding exactly two
+    distinct signed poles; monopolar (one signed pole) and unsigned rows pass through
+    unchanged. Per (DATE, SENTIMENT, reservoir, dimension, TYPE), with the recovered sums of
+    squares, the same arithmetic as ``sum_sentiment_runs``::
+
+        SUPPORT, TOTAL_SCORE    summed
+        INTENSITY, STD_SCORE    recombined (ddof=0)
+        PEAK                    max
+        N_HEADLINES, N_LABELLED the day's counts (equal on both pole rows; checked)
+        n_primitives            summed
+        narrative = TYPE, pole = "", narrative_key = reservoir|dimension|TYPE
+
+    Exact only on a ``mask_bipolar`` run: there a headline retains at most one pole of a
+    pair, so SUPPORT adds up. On an unmasked run a headline hitting both poles is counted
+    twice and the sum overstates the narrative (the reason the mask exists).
+    """
+    if "TYPE" not in narrative_daily.columns:
+        raise ValueError("narrative_daily has no TYPE column (written before it existed, e.g. "
+                         "v2.2.0); its pairs cannot be identified")
+    cols = narrative_daily.columns
+    schema = narrative_daily.schema
+    pairs = (narrative_daily.filter(pl.col("pole").fill_null("") != "")
+             .group_by(_PAIR_KEY).agg(pl.col("pole").n_unique().alias("_n_poles"))
+             .filter(pl.col("_n_poles") == 2).drop("_n_poles"))
+    rest = narrative_daily.join(pairs, on=_PAIR_KEY, how="anti")
+    pair_rows = narrative_daily.join(pairs, on=_PAIR_KEY, how="semi")
+    merged = (
+        pair_rows.with_columns(*_moment_columns())
+        .group_by(["DATE", "SENTIMENT", *_PAIR_KEY], maintain_order=True)
+        .agg(
+            pl.col("SUPPORT").sum(), pl.col("_total").sum(), pl.col("_sumsq").sum(),
+            pl.col("PEAK").max(), pl.col("n_primitives").sum(),
+            pl.col("N_HEADLINES").first(), pl.col("N_LABELLED").first(),
+            (pl.col("N_HEADLINES").n_unique() + pl.col("N_LABELLED").n_unique())
+            .alias("_n_counts"),
+            pl.len().alias("_n_rows"),
+        )
+    )
+    bad = merged.filter((pl.col("_n_counts") != 2) | (pl.col("_n_rows") != 2))
+    if bad.height:
+        raise ValueError(f"{bad.height} pair-day(s) without exactly two pole rows sharing "
+                         f"N_HEADLINES / N_LABELLED, e.g. {bad.head(3).to_dicts()}")
+    merged = _recombined(merged.drop(["_n_counts", "_n_rows"])).with_columns(
+        pl.col("TYPE").alias("narrative"), pl.lit("").alias("pole"),
+        pl.concat_str([pl.col(c) for c in _PAIR_KEY], separator="|").alias("narrative_key"),
+    )
+    out = pl.concat([rest.select(cols),
+                     merged.select([pl.col(c).cast(schema[c]) for c in cols])])
+    return out.sort(["DATE", "SENTIMENT", "narrative_key"], maintain_order=True)
 
 
 _STAT_COLUMNS = {"SUPPORT", "TOTAL_SCORE", "INTENSITY", "STD_SCORE", "PEAK", "N_HEADLINES",

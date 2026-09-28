@@ -73,8 +73,10 @@ from narrative_scoring.schema import (
     DAY_DIAGNOSTICS_SCHEMA,
     DAY_DIAGNOSTICS_SCHEMA_V1,
     DAY_DIAGNOSTICS_SCHEMA_V2,
+    DAY_DIAGNOSTICS_SCHEMA_V3,
     F0_PARTITION_SCHEMA,
     NARRATIVE_DAILY_SCHEMA,
+    NARRATIVE_DAILY_SCHEMA_V1,
     TAU_ASOF_SCHEMA,
 )
 from narrative_scoring.sentiment_filter import VENDOR_COLUMN, SentimentBucket
@@ -713,6 +715,7 @@ class ScoringJob(Job):
               "f0_config_id": config.f0_digest(), "mode": config.mode.value,
               "pooling": config.paraphrase_pooling.value, "q": config.q,
               "split": config.sentiment.value if config.filtered else "none",
+              **({"mask_bipolar": True} if config.mask_bipolar else {}),
               "window": window, "seed": seed,
               "start": start.isoformat(), "end": end.isoformat(), "label": label,
               "taxonomy_artifact_id": taxonomy_id, "agent_created": temp,
@@ -1160,7 +1163,8 @@ def verify_tau_asof(artifact: Artifact):
 
 def verify_narrative_daily(artifact: Artifact):
     def check():
-        yield from _schema_check(artifact.files(), NARRATIVE_DAILY_SCHEMA, KIND_NARRATIVE_DAILY)
+        yield from _schema_check(artifact.files(), NARRATIVE_DAILY_SCHEMA, KIND_NARRATIVE_DAILY,
+                                 accepted=(NARRATIVE_DAILY_SCHEMA_V1,))
         if not (artifact.path / "run_metadata.json").exists():
             yield "run_metadata.json missing"
         else:
@@ -1186,7 +1190,7 @@ def load_day_diagnostics(artifact: Artifact) -> pl.DataFrame:
 def verify_day_diagnostics(artifact: Artifact):
     def check():
         yield from _schema_check(artifact.files(), DAY_DIAGNOSTICS_SCHEMA, KIND_DAY_DIAGNOSTICS,
-                                 accepted=(DAY_DIAGNOSTICS_SCHEMA_V2,
+                                 accepted=(DAY_DIAGNOSTICS_SCHEMA_V3, DAY_DIAGNOSTICS_SCHEMA_V2,
                                            DAY_DIAGNOSTICS_SCHEMA_V1))
     return _findings(KIND_DAY_DIAGNOSTICS, artifact, check)
 

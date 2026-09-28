@@ -494,13 +494,14 @@ def test_sentiment_config_validation_and_identity():
 
     legacy = {**ScoringConfig().to_dict(), "sentiment_split": "none", "neutral_eps": 0.0,
               "sentiment_source": "none", "sentiment_column": ""}
-    for k in ("sentiment", "sentiment_rule", "neg_max", "pos_min", "min_conf", "label"):
+    for k in ("sentiment", "sentiment_rule", "neg_max", "pos_min", "min_conf", "label",
+              "mask_bipolar"):
         legacy.pop(k)
     want = hashlib.sha1(json.dumps(legacy, sort_keys=True).encode()).hexdigest()[:16]
     assert ScoringConfig().digest() == want
     old_form = {**ScoringConfig().to_dict(), "sentiment_split": "none", "neutral_eps": 0.0,
                 "sentiment_column": ""}
-    for k in ("sentiment", "sentiment_rule", "neg_max", "pos_min", "min_conf"):
+    for k in ("sentiment", "sentiment_rule", "neg_max", "pos_min", "min_conf", "mask_bipolar"):
         old_form.pop(k)
     assert ScoringConfig.from_dict(old_form).digest() == want
     with pytest.raises(ValueError, match="removed in-run sentiment split"):
@@ -553,6 +554,9 @@ def test_sum_sentiment_runs_checks_that_the_runs_belong_together(world):
     other_q = ScoringConfig(**{**good[2].config.to_dict(), "q": 0.9})
     with pytest.raises(ValueError, match="bucket removed"):
         sum_sentiment_runs(swap(2, config=other_q))
+    masked = ScoringConfig(**{**good[1].config.to_dict(), "mask_bipolar": True})
+    with pytest.raises(ValueError, match="mask_bipolar"):
+        sum_sentiment_runs(swap(1, config=masked))
     with pytest.raises(ValueError, match="tau_asof"):
         sum_sentiment_runs(swap(0, tau_asof_id="tau_other"))
     with pytest.raises(ValueError, match="mu_asof"):

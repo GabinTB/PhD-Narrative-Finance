@@ -126,6 +126,14 @@ class ScoringConfig:
             model sources only.
         The sentiment fields do not enter ``f0_digest`` / ``warmup_digest``, and a
         ``none`` config hashes exactly as before they existed.
+        mask_bipolar: per headline, keep one pole of every bipolar pair (two signed
+            SUB_TYPEs under one TOPIC/GROUP/TYPE): the pole with the higher mean of its
+            top-3 primitive scores (first pole in table order on an exact tie); every
+            primitive of the other pole is set to -inf before selection, the F0 trim and the
+            null draws (selection.apply_pole_mask). The two pole rows then add up exactly to
+            the narrative level (validation.merge_poles). It enters ``digest``,
+            ``f0_digest`` and ``warmup_digest`` only when True, so every config without it
+            hashes as before it existed.
     """
 
     mode: Correction = Correction.R2
@@ -147,6 +155,7 @@ class ScoringConfig:
     neg_max: float = -1.0 / 3.0
     pos_min: float = 1.0 / 3.0
     min_conf: float = 0.0
+    mask_bipolar: bool = False
     label: str = ""
 
     def __post_init__(self) -> None:
@@ -216,6 +225,7 @@ class ScoringConfig:
     def _hashable(self, *, with_filter: bool = True) -> dict[str, Any]:
         d = self.to_dict()
         d.pop("label")
+        _drop_default_mask(d)
         if self.sentiment is SentimentFilter.NONE:
             for k in _SENTIMENT_FIELDS:
                 d.pop(k)
@@ -240,13 +250,16 @@ class ScoringConfig:
         trim, alpha, draws per headline. Selection/aggregation choices do not enter."""
         d = {k: self.to_dict()[k] for k in (
             "mode", "paraphrase_style", "paraphrase_pooling", "include_master",
-            "trim_frac", "alpha", "null_draws_per_headline")}
+            "trim_frac", "alpha", "null_draws_per_headline", "mask_bipolar")}
+        _drop_default_mask(d)
         return hashlib.sha1(json.dumps(d, sort_keys=True).encode()).hexdigest()[:16]
 
     def warmup_digest(self) -> str:
         """Hash of what N_eff depends on: mode, pooling, style, master inclusion."""
         d = {k: self.to_dict()[k] for k in (
-            "mode", "paraphrase_style", "paraphrase_pooling", "include_master")}
+            "mode", "paraphrase_style", "paraphrase_pooling", "include_master",
+            "mask_bipolar")}
+        _drop_default_mask(d)
         return hashlib.sha1(json.dumps(d, sort_keys=True).encode()).hexdigest()[:16]
 
     @property
@@ -257,6 +270,12 @@ class ScoringConfig:
     def row_label(self) -> str:
         """The narrative_daily SENTIMENT value of this run: "all" or the bucket."""
         return SENTIMENT_ALL if not self.filtered else self.sentiment.value
+
+
+def _drop_default_mask(d: dict[str, Any]) -> None:
+    """``mask_bipolar`` off hashes as before the field existed."""
+    if not d.get("mask_bipolar"):
+        d.pop("mask_bipolar", None)
 
 
 @dataclass

@@ -46,7 +46,8 @@ PRIMITIVE_KEY = ("TOPIC", "GROUP", "CATEGORY", "ROLE", CHANNEL_COLUMN)
 # The authoring notebook (author_primitives.ipynb, cell 9) uses the same rule.
 PATH_FIELDS = ("TOPIC", "GROUP", "TYPE", "SUB_TYPE", "CATEGORY", "ROLE", CHANNEL_COLUMN)
 
-NARRATIVE_COLUMNS = ["reservoir", "dimension", "narrative", "pole", "narrative_key", "n_primitives"]
+NARRATIVE_COLUMNS = ["reservoir", "dimension", "TYPE", "narrative", "pole", "narrative_key",
+                     "n_primitives"]
 PRIMITIVE_COLUMNS = [
     "reservoir", "dimension", "narrative", "pole", "sub_mechanism",
     "observability_channel", "primitive", "narrative_key",
@@ -63,6 +64,30 @@ def file_sha1(path: Path) -> str:
 
 def primitive_path(row: dict[str, str]) -> str:
     return "/".join(row[c] for c in PATH_FIELDS)
+
+
+@dataclass(frozen=True)
+class BipolarPairs:
+    """The bipolar pairs of a table as contiguous primitive-column blocks.
+
+    Pair i is pole a = columns [a_start[i], a_start[i] + a_len[i]) and pole b likewise,
+    a being the pole that comes first in the sorted table (it wins exact ties). Built by
+    ``bipolar_pairs``; consumed by ``selection.apply_pole_mask`` and the compiled kernel.
+    """
+
+    a_start: np.ndarray     # int32 (n_pairs,)
+    a_len: np.ndarray
+    b_start: np.ndarray
+    b_len: np.ndarray
+
+    @property
+    def n_pairs(self) -> int:
+        return int(self.a_start.size)
+
+    @classmethod
+    def empty(cls) -> BipolarPairs:
+        e = np.empty(0, dtype=np.int32)
+        return cls(e, e, e, e)
 
 
 @dataclass
@@ -99,6 +124,10 @@ class PrimitiveTable:
     def primitive_to_narrative(self) -> np.ndarray:
         """(n_primitives,) int32: narrative_id of each primitive, in score-column order."""
         return self.frame["narrative_id"].to_numpy().astype(np.int32)
+
+    @property
+    def bipolar_pairs(self) -> BipolarPairs:
+        return bipolar_pairs(self.frame)
 
     @property
     def narrative_nodes(self) -> pl.DataFrame:
@@ -189,7 +218,7 @@ def load_primitive_table(
     narrative_frame = (
         frame.group_by("narrative_key", maintain_order=True)
         .agg(
-            pl.col("reservoir").first(), pl.col("dimension").first(),
+            pl.col("reservoir").first(), pl.col("dimension").first(), pl.col("TYPE").first(),
             pl.col("narrative").first(), pl.col("pole").first(),
             pl.len().alias("n_primitives"),
         )
@@ -215,6 +244,34 @@ def load_primitive_table(
         taxonomy_sha1=file_sha1(csv_path), paraphrase_sha1=file_sha1(jsonl_path),
         has_observability_channel=has_channel,
     )
+
+
+def bipolar_pairs(frame: pl.DataFrame) -> BipolarPairs:
+    """The bipolar pairs of a primitive frame: (reservoir, dimension, TYPE) groups holding
+    exactly two signed poles (SUB_TYPE). One signed pole = monopolar, untouched; more than
+    two raises. Each pole must be ONE contiguous block of primitive_id (the frame is sorted
+    by (narrative_key, primitive)); asserted, since the mask works on column slices."""
+    signed = frame.filter(pl.col("pole").fill_null("") != "")
+    blocks = (
+        signed.group_by(["reservoir", "dimension", "TYPE", "pole"])
+        .agg(pl.col("primitive_id").min().alias("start"),
+             pl.col("primitive_id").max().alias("stop"), pl.len().alias("n"))
+        .sort("start")
+    )
+    gapped = blocks.filter(pl.col("stop") - pl.col("start") + 1 != pl.col("n"))
+    if gapped.height:
+        raise ValueError(f"{gapped.height} pole(s) are not one contiguous primitive block, "
+                         f"e.g. {gapped.head(3).to_dicts()}")
+    per_type = blocks.group_by(["reservoir", "dimension", "TYPE"], maintain_order=True).agg(
+        pl.col("start"), pl.col("n"))
+    many = per_type.filter(pl.col("start").list.len() > 2)
+    if many.height:
+        raise ValueError(f"{many.height} TYPE(s) carry more than two signed poles, "
+                         f"e.g. {many.head(3).to_dicts()}")
+    pairs = per_type.filter(pl.col("start").list.len() == 2)
+    col = [np.asarray([r[i] for r in pairs[c].to_list()], dtype=np.int32)
+           for c, i in (("start", 0), ("n", 0), ("start", 1), ("n", 1))]
+    return BipolarPairs(*col)
 
 
 # ---------------------------------------------------------------------------
