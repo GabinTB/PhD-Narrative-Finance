@@ -33,10 +33,8 @@ logs/
 # Git
 .gitattributes
 
-# Tooling caches
-.mypy_cache/
-.pytest_cache/
-.ruff_cache/
+# Tooling caches (any hidden directory ending in "cache": .mypy_cache, .pytest_cache, .ruff_cache, ...)
+.*cache/
 
 # Notebook-local disk caches (narrative_scoring.adhoc.cache_path/load_or_compute)
 python/development/narrative_scoring/cache_*/
