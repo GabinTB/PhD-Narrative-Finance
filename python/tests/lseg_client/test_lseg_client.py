@@ -203,3 +203,18 @@ def test_enrichment_fills_only_missing_and_counts_unresolved():
     assert "ric" not in out[2] and "ric" not in out[3]
     assert stats["unresolved"] == 1 and stats["no_isin"] == 1 and stats["ric"] == 2
     assert rows[1].get("ric") is None                                 # inputs not mutated
+
+
+def test_enrichment_with_several_identifier_rows_per_ric():
+    """LSEG returns two rows for one RIC (seen live on MSCI World): one ISIN, one fill."""
+    class TwoRows(DataLd):
+        def get_data(self, universe, fields, parameters=None):
+            df = super().get_data(universe, fields, parameters)
+            dup = df.copy()
+            dup.iloc[:, 1:] = None                               # a second, emptier row
+            return pd.concat([dup, df], ignore_index=True)
+
+    rows = [{"snapshot_date": date(2020, 1, 2), "isin": "DE0005810055"}]
+    out, stats = backfill_lseg_ids(rows, LsegClient(TwoRows()))
+    assert out[0]["ric"] == "DB1Gn.DE" and out[0]["lei"] == "DB1Gn.DE|TR.LegalEntityIdentifier"
+    assert stats["ric"] == 1

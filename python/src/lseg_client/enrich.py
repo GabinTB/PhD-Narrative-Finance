@@ -44,8 +44,11 @@ def backfill_lseg_ids(rows: Sequence[dict[str, Any]], client: LsegClient
         return out, dict(stats)
     conv = client.rics_from_isins(sorted({_isin(out[i]) for i in need}))
     ids = client.identifiers(conv["ric"]) if not conv.empty else pd.DataFrame(columns=["ric"])
-    info = conv.merge(ids.drop(columns=["isin"], errors="ignore"), on="ric", how="left",
-                      suffixes=("_conv", ""))
+    # LSEG can return several rows per RIC (e.g. two SEDOL or LEI values): one row per RIC,
+    # the first non-empty value of each field
+    ids = ids.drop(columns=["isin"], errors="ignore").groupby("ric", as_index=False).first()
+    info = conv.drop_duplicates("isin").merge(ids, on="ric", how="left",
+                                              suffixes=("_conv", ""))
     if "org_permid_conv" in info:
         info["org_permid"] = info["org_permid"].fillna(info["org_permid_conv"])
     by_isin = info.set_index("isin").to_dict("index")
