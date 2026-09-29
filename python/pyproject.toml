@@ -32,6 +32,7 @@ dependencies = [
     "duckdb[parquet]>=1.5.5",
     "mfe-toolbox>=0.1.2",
     "wrds>=3.1.6",
+    "lseg-data>=2.1.1",
 ]
 
 [project.scripts]

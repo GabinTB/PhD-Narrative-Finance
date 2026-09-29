@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from lseg_client.client import LsegClient
     from ravenpack.edge_api.client import RavenPackClient
     from wrds_client.client import WRDSClient
 
@@ -31,17 +32,21 @@ def enrich_universe(
     dbga_market_segment_id: int | None = None,
     rp_reference: Path | None = None,
     rp_client: RavenPackClient | None = None,
+    lseg_client: LsegClient | None = None,
 ) -> list[dict[str, Any]]:
     """Backfill missing isin/cusip/cik/gvkey/ticker/ciq_secid/country_*/
     region/gics_*/sedol/rp_entity_id/dbga_secid fields, in order: CapitalIQ, then LSEG
-    (sedol), then RavenPack (rp_entity_id, which can use the cusip/sedol/cik filled
-    before it), then Deutsche Boerse (dbga_secid). Each step only fills
+    (sedol), then the LSEG API (ric/lseg_permid/lei, sedol still missing), then RavenPack
+    (rp_entity_id, which can use the cusip/sedol/cik filled before it), then Deutsche
+    Boerse (dbga_secid). Each step only fills
     genuinely-missing fields (never overwrites a value already present) and
     is skipped entirely if its prerequisites aren't given:
 
     - CapitalIQ (isin/cusip/cik/gvkey/ticker/ciq_secid/country_*/region/
       gics_*): needs `wrds_client`.
     - LSEG (sedol): needs `wrds_client` and `resolve_sedol=True` (the default).
+    - LSEG API (ric, lseg_permid, lei; sedol where WRDS left it empty): needs
+      `lseg_client` (`lseg_client.LsegClient`); current values keyed by ISIN.
     - RavenPack (rp_entity_id, rp_entity_match): needs `rp_reference`, a company entity
       reference file or its identifier extract (`ravenpack.entity_reference`), matched
       point in time; `rp_client` adds the `/entity-mapping` fallback for what is left.
@@ -65,6 +70,11 @@ def enrich_universe(
             from wrds_client.lseg import backfill_sedol
 
             result = backfill_sedol(wrds_client, result)
+
+    if lseg_client is not None:
+        from lseg_client.enrich import backfill_lseg_ids
+
+        result, _ = backfill_lseg_ids(result, lseg_client)
 
     if rp_reference is not None:
         from ravenpack.entity_reference import (

@@ -65,6 +65,9 @@ _OPTIONAL_COLUMNS = (
     "dbga_secid",
     "rp_entity_id",
     "rp_entity_match",
+    "ric",
+    "lseg_permid",
+    "lei",
     "country_name",
     "country_iso",
     "region",
@@ -110,6 +113,9 @@ class UniverseEntry:
     dbga_secid: str | None = None
     rp_entity_id: str | None = None      # RavenPack company id (ravenpack.entity_reference)
     rp_entity_match: str | None = None   # how it was matched: isin|cusip|sedol|cik|isin_undated|api
+    ric: str | None = None               # LSEG RIC (lseg_client.enrich, current mapping)
+    lseg_permid: str | None = None       # LSEG organisation PermID
+    lei: str | None = None               # Legal Entity Identifier (from LSEG)
     country_name: str | None = None
     country_iso: str | None = None
     region: str | None = None

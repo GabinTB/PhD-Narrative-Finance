@@ -33,6 +33,10 @@ still unmatched.
     python scripts/ingest_universe.py --index-dir DIR --index MSCI_WORLD \
         --rp-reference company_<date>_identifiers.parquet --rp-api --allow-incomplete
 
+LSEG (ric, lseg_permid, lei; sedol where WRDS left it empty): `--lseg`, through the LSEG
+Data Library (`lseg_client`: Workspace desktop session first, e.g. an SSH tunnel with
+LSEG_DESKTOP_URL, Data Platform fallback).
+
 `--name` is an optional human-readable tag (e.g. "sp500_2020") for finding
 this registration later by name -- see `universe.load_universe_by_name`.
 Names are not enforced unique; re-registering the same name creates a new
@@ -89,6 +93,9 @@ def main() -> int:
                     help="RavenPack company entity reference CSV or its identifier extract")
     ap.add_argument("--rp-api", action="store_true",
                     help="RavenPack /entity-mapping fallback for rows the file leaves unmatched")
+    ap.add_argument("--lseg", action="store_true",
+                    help="add ric / lseg_permid / lei from the LSEG Data Library (Workspace "
+                         "desktop session first, Data Platform fallback)")
     ap.add_argument("--allow-incomplete", action="store_true")
     ap.add_argument("--pipeline-version", default=PIPELINE_VERSION)
     ap.add_argument("--env", default=".env")
@@ -137,6 +144,12 @@ def main() -> int:
 
         rp_client = RavenPackClient()
 
+    lseg_cm = None
+    if args.lseg:
+        from lseg_client import LsegClient
+
+        lseg_cm = LsegClient.connect()
+
     wrds_client_cm = None
     if args.resolve_wrds:
         from wrds_client import WRDSClient
@@ -145,6 +158,7 @@ def main() -> int:
 
     try:
         client = wrds_client_cm.__enter__() if wrds_client_cm else None
+        lseg = lseg_cm.__enter__() if lseg_cm else None
 
         rows = enrich_universe(
             rows,
@@ -154,6 +168,7 @@ def main() -> int:
             dbga_market_segment_id=args.dbga_market_segment_id,
             rp_reference=args.rp_reference,
             rp_client=rp_client,
+            lseg_client=lseg,
         )
 
         entries = entries_from_rows(rows, source=str(source))
@@ -190,6 +205,8 @@ def main() -> int:
             wrds_client_cm.__exit__(*sys.exc_info())
         if rp_client is not None:
             rp_client.close()
+        if lseg_cm:
+            lseg_cm.__exit__(*sys.exc_info())
 
     print(f"\nuniverse artifact: {artifact.artifact_id}")
     print(f"name:              {args.name or '(unnamed)'}")
