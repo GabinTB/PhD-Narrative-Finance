@@ -19,12 +19,11 @@ run_hft_analytics`'s exact `index.run(..., layer="derived")` pattern.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Literal
 
 import polars as pl
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
 
     import pandas as pd
 
@@ -90,71 +89,6 @@ def enrich_with_universe(
         pl.lit(name).alias("name"),
         pl.lit(flag).alias("enrichment_flag"),
     )
-
-
-def scan_market_segment_isins(mic: str, ccyymmdd: int, market_segment_id: int) -> dict[str, int]:
-    """Every ISIN -> security_id in one market segment on one day, from a
-    single bulk RDI call.
-
-    Deutsche Boerse supports only security_id -> ISIN, never the reverse --
-    there is no way to query "which security_id is ISIN X" directly (confirmed
-    against the installed `a7` SDK source: its ISIN-searchable `sd` resource
-    is for CME markets, not XEUR/XETR). `get_market_segment_details` returns
-    every RDI snapshot for the segment/day in ONE API call, including one
-    `InstrumentSnapshot` per instrument with its `SecurityID` and a
-    `SecurityAlt` list containing the ISIN (`SecurityAltIDSource == '4'`), so
-    this builds the full reverse map from one API call rather than one call
-    per security -- the "full market-day scan" approach, made considerably
-    cheaper than its naive per-instrument form.
-    """
-    from dbg_cdm.a7_utils import get_market_segment_details
-
-    snapshots = get_market_segment_details(mic, ccyymmdd, market_segment_id)
-    isin_to_security_id: dict[str, int] = {}
-    for snapshot in snapshots:
-        if snapshot.get("Template") != "InstrumentSnapshot":
-            continue
-        security_id = snapshot.get("SecurityID")
-        if security_id is None:
-            continue
-        for sec_alt in snapshot.get("SecurityAlt", []):
-            if sec_alt.get("SecurityAltIDSource") == "4":
-                isin_to_security_id[sec_alt["SecurityAltID"].strip().upper()] = int(security_id)
-                break
-    return isin_to_security_id
-
-
-def backfill_dbga_secid(
-    rows: Sequence[dict[str, Any]], mic: str, market_segment_id: int
-) -> list[dict[str, Any]]:
-    """Backfill `dbga_secid` for rows missing it, by scanning `mic`/
-    `market_segment_id` once per distinct `snapshot_date` present in `rows`
-    (not once per row) and matching by ISIN. Rows whose ISIN isn't found in
-    that day's scan (delisted, wrong segment, no ISIN, ...) stay unresolved --
-    surfaced by `universe.schema.find_incomplete`, not guessed. Never
-    overwrites a value already present in a row. Returns new dicts -- does
-    not mutate the input rows.
-    """
-    rows_out = [dict(r) for r in rows]
-    candidates = [
-        i for i, r in enumerate(rows_out) if r.get("dbga_secid") is None and r.get("isin")
-    ]
-    if not candidates:
-        return rows_out
-
-    by_ccyymmdd: dict[int, list[int]] = {}
-    for i in candidates:
-        ccyymmdd = int(rows_out[i]["snapshot_date"].strftime("%Y%m%d"))
-        by_ccyymmdd.setdefault(ccyymmdd, []).append(i)
-
-    for ccyymmdd, indices in by_ccyymmdd.items():
-        isin_to_security_id = scan_market_segment_isins(mic, ccyymmdd, market_segment_id)
-        for i in indices:
-            isin_key = rows_out[i]["isin"].strip().upper()
-            if isin_key in isin_to_security_id:
-                rows_out[i]["dbga_secid"] = str(isin_to_security_id[isin_key])
-
-    return rows_out
 
 
 def run_identifier_enrichment(

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from deutsche_boerse.rdi import RdiClient
     from lseg_client.client import LsegClient
     from ravenpack.edge_api.client import RavenPackClient
     from wrds_client.client import WRDSClient
@@ -28,11 +29,11 @@ def enrich_universe(
     *,
     wrds_client: WRDSClient | None = None,
     resolve_sedol: bool = True,
-    dbga_mic: str | None = None,
-    dbga_market_segment_id: int | None = None,
     rp_reference: Path | None = None,
     rp_client: RavenPackClient | None = None,
     lseg_client: LsegClient | None = None,
+    dbg_client: RdiClient | None = None,
+    dbg_cache_dir: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Backfill missing isin/cusip/cik/gvkey/ticker/ciq_secid/country_*/
     region/gics_*/sedol/rp_entity_id/dbga_secid fields, in order: CapitalIQ, then LSEG
@@ -50,9 +51,10 @@ def enrich_universe(
     - RavenPack (rp_entity_id, rp_entity_match): needs `rp_reference`, a company entity
       reference file or its identifier extract (`ravenpack.entity_reference`), matched
       point in time; `rp_client` adds the `/entity-mapping` fallback for what is left.
-    - Deutsche Boerse (dbga_secid): needs both `dbga_mic` and
-      `dbga_market_segment_id` -- there's no way to derive which market/
-      segment to scan from an ISIN alone (see `deutsche_boerse.identifiers`).
+    - Deutsche Boerse (dbga_secid = Xetra SecurityID, by ISIN as of each snapshot date):
+      needs `dbg_client` (`deutsche_boerse.rdi.RdiClient`); A7 reference tables are cached
+      in `dbg_cache_dir` (default `$RAW_DATA_PATH/Deutsche_Boerse/rdi`). Eurex products are
+      not stored in the universe: `deutsche_boerse.rdi.eurex_derivatives` joins them on need.
 
     Operates on plain row dicts, not `UniverseEntry`, so a row missing even a
     mandatory field (e.g. `ticker`) can still be enriched -- `UniverseEntry`
@@ -89,9 +91,11 @@ def enrich_universe(
         windows = load_identifier_windows(Path(rp_reference), values)
         result, _ = backfill_rp_entity_id(result, windows, client=rp_client)
 
-    if dbga_mic and dbga_market_segment_id is not None:
-        from deutsche_boerse.identifiers import backfill_dbga_secid
+    if dbg_client is not None:
+        from deutsche_boerse import RAW_ROOT
+        from deutsche_boerse.rdi import backfill_dbga_secid
 
-        result = backfill_dbga_secid(result, dbga_mic, dbga_market_segment_id)
+        cache = Path(dbg_cache_dir) if dbg_cache_dir else RAW_ROOT / "rdi"
+        result, _ = backfill_dbga_secid(result, dbg_client, cache)
 
     return result

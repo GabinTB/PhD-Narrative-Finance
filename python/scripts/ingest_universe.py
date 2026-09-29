@@ -3,8 +3,7 @@
 
 Usage:
     python scripts/ingest_universe.py --file your_universe.csv [--name sp500_2020]
-    python scripts/ingest_universe.py --file your_universe.csv --name sp500_2020 \\
-        --dbga-mic XETR --dbga-market-segment-id 688
+    python scripts/ingest_universe.py --file your_universe.csv --name sp500_2020 --dbg
 
 `your_universe.{csv,parquet}` has mandatory columns `snapshot_date,name,ticker`
 plus at least one of `isin`/`cusip`; every other identifier/classification
@@ -14,11 +13,11 @@ country_iso, region, gics_*) is optional and, by default, backfilled here:
 - WRDS CapitalIQ (isin/cusip/cik/gvkey/ciq_secid/country_*/region/gics_*):
   runs whenever WRDS credentials are available (`--resolve-wrds`, default on).
 - WRDS/LSEG (sedol): runs alongside CapitalIQ unless `--no-resolve-sedol`.
-- Deutsche Boerse (dbga_secid): only runs if BOTH `--dbga-mic` and
-  `--dbga-market-segment-id` are given -- there's no way to derive which
-  market/segment to scan from an ISIN alone (see
-  `deutsche_boerse.identifiers`; this does a full market-day scan, one API
-  call per distinct `snapshot_date` in the universe, not one per row).
+- Deutsche Boerse (dbga_secid = Xetra SecurityID): with `--dbg`, by ISIN as of each
+  snapshot date from A7 reference data (`deutsche_boerse.rdi`; Xetra history from
+  2019-04, earlier rows stay empty). The per-date reference tables are cached under
+  $RAW_DATA_PATH/Deutsche_Boerse/rdi. Eurex products are not stored in the universe:
+  `deutsche_boerse.rdi.eurex_derivatives` joins them on the underlying ISIN when needed.
 
 RavenPack (rp_entity_id, rp_entity_match): with `--rp-reference PATH`, a company entity
 reference file (`company_<date>.csv`) or its identifier extract, matched point in time
@@ -87,8 +86,9 @@ def main() -> int:
     ap.add_argument("--name", default=None, help="optional human-readable tag, e.g. sp500_2020")
     ap.add_argument("--resolve-wrds", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--resolve-sedol", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument("--dbga-mic", default=None)
-    ap.add_argument("--dbga-market-segment-id", type=int, default=None)
+    ap.add_argument("--dbg", action="store_true",
+                    help="fill dbga_secid (Xetra SecurityID) from A7 reference data; tables "
+                         "cached under $RAW_DATA_PATH/Deutsche_Boerse/rdi")
     ap.add_argument("--rp-reference", type=Path, default=None,
                     help="RavenPack company entity reference CSV or its identifier extract")
     ap.add_argument("--rp-api", action="store_true",
@@ -144,6 +144,12 @@ def main() -> int:
 
         rp_client = RavenPackClient()
 
+    dbg_client = None
+    if args.dbg:
+        from deutsche_boerse.rdi import RdiClient
+
+        dbg_client = RdiClient.from_env()
+
     lseg_cm = None
     if args.lseg:
         from lseg_client import LsegClient
@@ -164,8 +170,7 @@ def main() -> int:
             rows,
             wrds_client=client,
             resolve_sedol=args.resolve_sedol,
-            dbga_mic=args.dbga_mic,
-            dbga_market_segment_id=args.dbga_market_segment_id,
+            dbg_client=dbg_client,
             rp_reference=args.rp_reference,
             rp_client=rp_client,
             lseg_client=lseg,

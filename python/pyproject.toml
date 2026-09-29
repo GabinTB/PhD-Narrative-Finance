@@ -33,6 +33,8 @@ dependencies = [
     "mfe-toolbox>=0.1.2",
     "wrds>=3.1.6",
     "lseg-data>=2.1.1",
+    "a7>=0.2.3",
+    "dbg-cdm",
 ]
 
 [project.scripts]
@@ -142,11 +144,6 @@ dev = [
 central-bank = [
     "gingado>=0.2.7",  # Central Bank API client
     "fredapi>=0.3.0",  # St Louis Fed FRED API client
-]
-
-deutsche-boerse = [
-    "a7>=0.2.3",  # Deutsche Börse A7 API client
-    "dbg-cdm",
 ]
 
 quoniam = [

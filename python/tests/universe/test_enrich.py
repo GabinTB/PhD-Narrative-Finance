@@ -9,13 +9,10 @@ via a server-side as_of filter.
 """
 from __future__ import annotations
 
-import sys
-import types
 from datetime import date
 from typing import Any
 
 import pandas as pd
-import pytest
 
 from universe.enrich import enrich_universe
 
@@ -153,24 +150,6 @@ class StubWRDSClient:
         raise AssertionError(f"unexpected SQL: {sql}")
 
 
-def _install_fake_dbg_cdm(monkeypatch: pytest.MonkeyPatch, security_id: int = 204934) -> None:
-    def get_market_segment_details(mic: str, ccyymmdd: int, market_segment_id: int) -> list[dict]:
-        return [
-            {
-                "Template": "InstrumentSnapshot",
-                "SecurityID": security_id,
-                "SecurityAlt": [{"SecurityAltIDSource": "4", "SecurityAltID": "US0378331005"}],
-            }
-        ]
-
-    fake_a7_utils = types.ModuleType("dbg_cdm.a7_utils")
-    fake_a7_utils.get_market_segment_details = get_market_segment_details
-    fake_dbg_cdm = types.ModuleType("dbg_cdm")
-    fake_dbg_cdm.a7_utils = fake_a7_utils
-    monkeypatch.setitem(sys.modules, "dbg_cdm", fake_dbg_cdm)
-    monkeypatch.setitem(sys.modules, "dbg_cdm.a7_utils", fake_a7_utils)
-
-
 def test_enrich_universe_no_client_no_dbga_is_noop() -> None:
     rows = [_row()]
     result = enrich_universe(rows)
@@ -204,32 +183,40 @@ def test_enrich_universe_resolve_sedol_false_skips_lseg() -> None:
     assert not any("permisindata" in c for c in client.calls)
 
 
-def test_enrich_universe_dbga_backfill_needs_both_mic_and_segment(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _install_fake_dbg_cdm(monkeypatch)
-    rows = [_row()]
+class _StubRdi:
+    """Stands in for deutsche_boerse.rdi.RdiClient: one XETR day with one security."""
 
-    # Only mic given -> DBGA step skipped, no dbg_cdm call attempted.
-    result = enrich_universe(rows, dbga_mic="XETR")
-    assert result[0]["dbga_secid"] is None
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def dates(self, mic):
+        return [20221230]
+
+    def segments(self, mic, day):
+        return [688]
+
+    def securities(self, mic, day, segment):
+        return ["204934"]
+
+    def snapshots(self, mic, day, segment, security):
+        self.calls.append(security)
+        return [{"Template": "ProductSnapshot", "MarketSegment": "US0378331005"},
+                {"Template": "InstrumentSnapshot", "SecurityID": "204934", "SecurityType": "CS",
+                 "SecurityAlt": [{"SecurityAltIDSource": "4", "SecurityAltID": "US0378331005"}]}]
+
+    def map(self, fn, items):
+        return [fn(i) for i in items]
 
 
-def test_enrich_universe_dbga_backfill_runs_when_both_given(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _install_fake_dbg_cdm(monkeypatch, security_id=204934)
-    result = enrich_universe([_row()], dbga_mic="XETR", dbga_market_segment_id=688)
+def test_enrich_universe_dbg_client_fills_dbga_secid(tmp_path) -> None:
+    result = enrich_universe([_row()], dbg_client=_StubRdi(), dbg_cache_dir=tmp_path)
     assert result[0]["dbga_secid"] == "204934"
 
 
-def test_enrich_universe_full_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_fake_dbg_cdm(monkeypatch, security_id=204934)
+def test_enrich_universe_full_pipeline(tmp_path) -> None:
     client = StubWRDSClient()
-    result = enrich_universe(
-        [_row()], wrds_client=client, dbga_mic="XETR", dbga_market_segment_id=688
-    )
-
+    result = enrich_universe([_row()], wrds_client=client, dbg_client=_StubRdi(),
+                             dbg_cache_dir=tmp_path)
     row = result[0]
     assert row["cik"] == "0000320193"
     assert row["gvkey"] == "001690"
@@ -237,18 +224,16 @@ def test_enrich_universe_full_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
     assert row["dbga_secid"] == "204934"
 
 
-def test_enrich_universe_never_overwrites_existing_values(monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_fake_dbg_cdm(monkeypatch, security_id=204934)
+def test_enrich_universe_never_overwrites_existing_values(tmp_path) -> None:
     client = StubWRDSClient()
     rows = [_row(cik="PRESET", sedol="PRESET", dbga_secid="PRESET")]
-    result = enrich_universe(
-        rows, wrds_client=client, dbga_mic="XETR", dbga_market_segment_id=688
-    )
-
+    stub = _StubRdi()
+    result = enrich_universe(rows, wrds_client=client, dbg_client=stub, dbg_cache_dir=tmp_path)
     row = result[0]
     assert row["cik"] == "PRESET"
     assert row["sedol"] == "PRESET"
     assert row["dbga_secid"] == "PRESET"
+    assert stub.calls == []                     # nothing to fill: A7 never asked
 
 
 def test_enrich_universe_rp_reference_fills_rp_entity_id(tmp_path) -> None:
