@@ -294,3 +294,111 @@ def eurex_derivatives(rows: Sequence[dict[str, Any]], client: RdiClient, cache_d
         products.dropna(subset=["underlying_isin"]), on=["rdi_date", "underlying_isin"])
     return out[cols].sort_values(["snapshot_date", "underlying_isin", "product_symbol"]) \
         .reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Eurex contracts of one product on one day
+# ---------------------------------------------------------------------------
+#
+# A Eurex product (one market segment) holds contracts of a single kind; the kind is read
+# from each contract's InstrumentSnapshot, never from the product symbol. The FIX fields
+# used (T7 RDI):
+#
+#     SecurityType   OPT option | FUT future | TRF total return future
+#     ExerciseStyle  (options, FIX 1194) "0" European | "1" American
+#     SettlMethod    (futures, FIX 1193) "C" cash | "P" physical delivery
+#     PutOrCall      (options, FIX 201)  "0" put | "1" call
+#
+# Symbols follow Eurex conventions but are only examples, not rules. For Deutsche Boerse AG
+# (underlying DE0005810055) on 2026-09-28:
+#
+#     DB1   segment 361      OPT, ExerciseStyle 1   American options      (665 contracts)
+#     DB1E  segment 46225    OPT, ExerciseStyle 0   European options      (631 contracts)
+#     DB1H  segment 363      FUT, SettlMethod C     cash-settled futures  (15, monthly expiries)
+#     DB1P  segment 567612   FUT, SettlMethod P     physically settled futures (16, DAILY
+#                                                   expiries: MaturityFrequencyUnit "D")
+#     TDB1  segment 134594   TRF, SettlMethod C     total return futures  (8)
+#
+# i.e. the "E" suffix marks the European options and the plain symbol the American ones.
+
+OPTION_EUROPEAN = "option_european"
+OPTION_AMERICAN = "option_american"
+FUTURE_CASH = "future_cash"
+FUTURE_PHYSICAL = "future_physical"
+TOTAL_RETURN_FUTURE = "total_return_future"
+OTHER = "other"
+CONTRACT_KINDS = (OPTION_EUROPEAN, OPTION_AMERICAN, FUTURE_CASH, FUTURE_PHYSICAL,
+                  TOTAL_RETURN_FUTURE, OTHER)
+CONTRACT_COLUMNS = ["date", "segment_id", "security_id", "product", "kind", "security_type",
+                    "expiry", "contract_month", "maturity_frequency", "strike", "put_call",
+                    "exercise_style", "settl_method", "multiplier", "display_name", "is_primary",
+                    "description"]
+_SIMPLE_INSTRUMENT = "1"          # ProductComplex: 1 simple; other values are strategies
+
+
+def contract_kind(instrument: dict) -> str:
+    """The kind of one contract from its InstrumentSnapshot (see the table above)."""
+    kind = instrument.get("SecurityType")
+    detail = ((instrument.get("DerivativesDescriptorGroup") or {})
+              .get("SimpleInstrumentDescriptorGroup") or {})
+    if kind == "OPT":
+        style = detail.get("ExerciseStyle")
+        return {"0": OPTION_EUROPEAN, "1": OPTION_AMERICAN}.get(style, OTHER)
+    if kind == "FUT":
+        return {"C": FUTURE_CASH, "P": FUTURE_PHYSICAL}.get(detail.get("SettlMethod"), OTHER)
+    if kind == "TRF":
+        return TOTAL_RETURN_FUTURE
+    return OTHER
+
+
+def _contract_row(day: int, segment: int, snaps: list[dict], security: str) -> dict | None:
+    product = next((s for s in snaps if s.get("Template") == "ProductSnapshot"), {})
+    inst = next((s for s in snaps if s.get("Template") == "InstrumentSnapshot"
+                 and str(s.get("SecurityID")) == security), None)
+    if inst is None or inst.get("ProductComplex", _SIMPLE_INSTRUMENT) != _SIMPLE_INSTRUMENT:
+        return None
+    deriv = inst.get("DerivativesDescriptorGroup") or {}
+    detail = deriv.get("SimpleInstrumentDescriptorGroup") or {}
+    put_call = detail.get("PutOrCall")
+    return {
+        "date": day, "segment_id": segment, "security_id": security,
+        "product": product.get("MarketSegment"), "kind": contract_kind(inst),
+        "security_type": inst.get("SecurityType"), "expiry": detail.get("ContractDate"),
+        "contract_month": detail.get("ContractMonthYear"),
+        "maturity_frequency": detail.get("MaturityFrequencyUnit"),
+        "strike": detail.get("StrikePrice"),
+        "put_call": {"0": "put", "1": "call"}.get(put_call) if put_call is not None else None,
+        "exercise_style": detail.get("ExerciseStyle"), "settl_method": detail.get("SettlMethod"),
+        "multiplier": detail.get("ContractMultiplier"), "display_name": deriv.get("DisplayName"),
+        "is_primary": deriv.get("IsPrimary") == "Y", "description": inst.get("SecurityDesc"),
+    }
+
+
+def eurex_contracts(client: RdiClient, day: int, segment_id: int,
+                    kinds: Sequence[str] | None = None) -> pd.DataFrame:
+    """Every simple contract live on ``day`` in one Eurex product (``segment_id``, e.g. from
+    ``eurex_derivatives``): one row per contract with ``CONTRACT_COLUMNS``. ``kinds`` keeps
+    only those ``CONTRACT_KINDS``; a product has one kind, so its first contract decides and
+    a product of another kind costs a single detail call. One call per contract otherwise
+    (~1,300 for Deutsche Boerse AG's five products on one day, ~25 s with 16 workers): a
+    contract's expiry and strike never change, so cache what you fetch."""
+    unknown = set(kinds or ()) - set(CONTRACT_KINDS)
+    if unknown:
+        raise ValueError(f"unknown kind(s) {sorted(unknown)}; choose from {CONTRACT_KINDS}")
+    securities = client.securities(XEUR, day, segment_id)
+    if not securities:
+        return pd.DataFrame(columns=CONTRACT_COLUMNS)
+
+    def row(security: str) -> dict | None:
+        return _contract_row(day, segment_id, client.snapshots(XEUR, day, segment_id, security),
+                             security)
+
+    first = row(securities[0])
+    if kinds and (first is None or first["kind"] not in kinds):
+        return pd.DataFrame(columns=CONTRACT_COLUMNS)
+    rows = [first, *client.map(row, securities[1:])]
+    out = pd.DataFrame([r for r in rows if r is not None], columns=CONTRACT_COLUMNS)
+    if kinds:
+        out = out[out["kind"].isin(kinds)]
+    return out.sort_values(["kind", "expiry", "strike", "put_call"], na_position="first") \
+        .reset_index(drop=True)

@@ -9,6 +9,8 @@ import pytest
 from deutsche_boerse.rdi import (
     RdiClient,
     backfill_dbga_secid,
+    contract_kind,
+    eurex_contracts,
     eurex_derivatives,
     reference_table,
     reference_tables,
@@ -176,3 +178,67 @@ def test_transient_errors_are_retried(monkeypatch):
     client, _ = _client(fail_first=9)
     with pytest.raises(RuntimeError, match="HTTP 503"):
         client.dates("XETR")
+
+
+# ---------------------------------------------------------------------------
+# eurex_contracts
+# ---------------------------------------------------------------------------
+
+def _contract(symbol: str, security: str, sec_type: str, *, style: str | None = None,
+              settl: str | None = None, put_call: str | None = None,
+              strike: float | None = None, expiry: int = 20261016,
+              complex_: str = "1") -> list[dict]:
+    detail = {"ContractDate": expiry, "ContractMonthYear": expiry // 100,
+              "MaturityFrequencyUnit": "Mo", "ContractMultiplier": 100}
+    for key, value in (("ExerciseStyle", style), ("SettlMethod", settl),
+                       ("PutOrCall", put_call), ("StrikePrice", strike)):
+        if value is not None:
+            detail[key] = value
+    return [{"Template": "ProductSnapshot", "MarketSegment": symbol},
+            {"Template": "InstrumentSnapshot", "SecurityID": security, "SecurityType": sec_type,
+             "ProductComplex": complex_, "SecurityDesc": f"{symbol} {security}",
+             "DerivativesDescriptorGroup": {"DisplayName": f"{symbol} OCT26", "IsPrimary": "Y",
+                                            "SimpleInstrumentDescriptorGroup": detail}}]
+
+
+DAY = 20260928
+CONTRACTS = {"XEUR": {DAY: {
+    361: {"1": _contract("DB1", "1", "OPT", style="1", put_call="1", strike=280.0),
+          "2": _contract("DB1", "2", "OPT", style="1", put_call="0", strike=280.0),
+          "3": _contract("DB1", "3", "OPT", style="1", put_call="1", complex_="5")},  # strategy
+    46225: {"4": _contract("DB1E", "4", "OPT", style="0", put_call="1", strike=300.0)},
+    363: {"5": _contract("DB1H", "5", "FUT", settl="C")},
+    567612: {"6": _contract("DB1P", "6", "FUT", settl="P", expiry=20260928)},
+    134594: {"7": _contract("TDB1", "7", "TRF", settl="C")},
+}}}
+
+
+def test_eurex_contracts_classify_each_product_from_its_fields():
+    client = RdiClient(StubHttp(CONTRACTS), workers=2)
+    kinds = {seg: eurex_contracts(client, DAY, seg)["kind"].unique().tolist()
+             for seg in (361, 46225, 363, 567612, 134594)}
+    assert kinds == {361: ["option_american"], 46225: ["option_european"],
+                     363: ["future_cash"], 567612: ["future_physical"],
+                     134594: ["total_return_future"]}
+    opts = eurex_contracts(client, DAY, 361)
+    assert opts[["security_id", "put_call", "strike", "expiry"]].values.tolist() == [
+        ["1", "call", 280.0, 20261016], ["2", "put", 280.0, 20261016]]    # strategy dropped
+    assert set(opts["product"]) == {"DB1"} and opts["is_primary"].all()
+
+
+def test_eurex_contracts_kind_filter_skips_other_products_after_one_call():
+    http = StubHttp(CONTRACTS)
+    client = RdiClient(http, workers=2)
+    assert eurex_contracts(client, DAY, 361, kinds=["future_cash"]).empty
+    assert sum(1 for c in http.calls if not c.endswith("/")) == 1         # one detail call
+    fut = eurex_contracts(client, DAY, 363, kinds=["future_cash", "future_physical"])
+    assert fut["security_id"].tolist() == ["5"]
+    with pytest.raises(ValueError, match="unknown kind"):
+        eurex_contracts(client, DAY, 363, kinds=["future"])
+    assert eurex_contracts(client, DAY, 999).empty                        # unknown segment
+
+
+def test_contract_kind_unknown_values_are_other():
+    assert contract_kind({"SecurityType": "OPT", "DerivativesDescriptorGroup": {
+        "SimpleInstrumentDescriptorGroup": {"ExerciseStyle": "2"}}}) == "other"   # Bermudan
+    assert contract_kind({"SecurityType": "MLEG"}) == "other"
