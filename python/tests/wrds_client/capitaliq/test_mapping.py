@@ -458,3 +458,14 @@ def test_backfill_from_capitaliq_does_not_mutate_input_rows() -> None:
     row = _row()
     backfill_from_capitaliq(client, [row])
     assert row["cusip"] is None
+
+
+def test_resolve_companyids_falls_back_to_gvkey_without_isin_or_cusip() -> None:
+    gvkey_hit = pd.DataFrame(
+        {"gvkey": ["012384"], "companyid": [4242], "primaryflag": [1],
+         "startdate": [None], "enddate": [None]}
+    )
+    client = ScriptedWRDSClient([("wrds_gvkey", gvkey_hit)])
+    result = resolve_companyids(client, [_row(isin=None, gvkey="012384")])
+    assert result == {0: 4242}
+    assert "wrds_isin" not in " ".join(c["sql"] for c in client.calls)   # nothing to ask

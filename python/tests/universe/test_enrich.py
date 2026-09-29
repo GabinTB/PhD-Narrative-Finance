@@ -249,3 +249,19 @@ def test_enrich_universe_never_overwrites_existing_values(monkeypatch: pytest.Mo
     assert row["cik"] == "PRESET"
     assert row["sedol"] == "PRESET"
     assert row["dbga_secid"] == "PRESET"
+
+
+def test_enrich_universe_rp_reference_fills_rp_entity_id(tmp_path) -> None:
+    import polars as pl
+
+    ref = tmp_path / "company_2026-09-27.csv"
+    pl.DataFrame({"RP_ENTITY_ID": ["D8442A", "AAAAAA"], "ENTITY_TYPE": ["COMP", "COMP"],
+                  "DATA_TYPE": ["ISIN", "CUSIP"],
+                  "DATA_VALUE": ["US0378331005", "594918104"],
+                  "RANGE_START": ["2000-01-01", "2000-01-01"],
+                  "RANGE_END": [None, None]}).write_csv(ref)
+    rows = [_row(), _row(isin="XX0000000000", cusip="594918104"), _row(isin="ZZ0000000000")]
+    out = enrich_universe(rows, rp_reference=ref)
+    assert [(r.get("rp_entity_id"), r.get("rp_entity_match")) for r in out] == [
+        ("D8442A", "isin"), ("AAAAAA", "cusip"), (None, None)]
+    assert rows[0].get("rp_entity_id") is None                  # input rows not mutated

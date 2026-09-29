@@ -16,7 +16,7 @@ right window **locally** (`wrds_client.linking._shared.match_as_of_windows`),
 against its own `snapshot_date`.
 
 Chain confirmed live against WRDS (`describe_table`, not inferred):
-    ciq_common.wrds_isin / wrds_cusip   -> companyid (time-bounded, primaryflag)
+    ciq_common.wrds_isin / wrds_cusip / wrds_gvkey -> companyid (time-bounded, primaryflag)
     companyid -> wrds_cik / wrds_gvkey / wrds_cusip / wrds_isin / wrds_ticker (time-bounded)
     companyid -> ciqsecurity.securityid (ciq_secid, time-bounded)
     companyid -> ciqcompany.countryid -> ciqcountrygeo (country name/ISO/region)
@@ -90,56 +90,50 @@ def build_cusip_companyid_query(cusips: Sequence[str]) -> tuple[str, dict[str, A
     return sql, {"cusips": tuple(c.strip().upper() for c in cusips)}
 
 
+def build_gvkey_companyid_query(gvkeys: Sequence[str]) -> tuple[str, dict[str, Any]]:
+    if not gvkeys:
+        raise ValueError("gvkeys must be non-empty")
+    sql = (
+        "SELECT gvkey, companyid, primaryflag, startdate, enddate FROM ciq_common.wrds_gvkey "
+        "WHERE gvkey IN %(gvkeys)s"
+    )
+    return sql, {"gvkeys": tuple(g.strip() for g in gvkeys)}
+
+
+#: companyid resolution order: row column, query builder, value normaliser
+_COMPANYID_KEYS = (
+    ("isin", build_isin_companyid_query, normalise_isin),
+    ("cusip", build_cusip_companyid_query, lambda c: c.strip().upper()),
+    ("gvkey", build_gvkey_companyid_query, lambda g: g.strip()),
+)
+
+
 def resolve_companyids(client: WRDSClient, rows: Sequence[dict[str, Any]]) -> dict[int, int]:
     """Row index -> CapitalIQ companyid, matched against each row's own
-    snapshot_date. ISIN first, CUSIP fallback (mirrors the ISIN-first/
-    CIK-fallback convention used elsewhere in `wrds_client.linking`). Queries
-    are scoped to the isins/cusips actually present across `rows` -- one
-    query per identifier column for the whole call, not per distinct date.
+    snapshot_date. ISIN first, then CUSIP, then gvkey (rows built from Compustat index
+    constituents carry a gvkey, sometimes without an ISIN), each only for rows still
+    unresolved (mirrors the ISIN-first/CIK-fallback convention used elsewhere in
+    `wrds_client.linking`). Queries are scoped to the values actually present across
+    `rows` -- one query per identifier column for the whole call, not per distinct date.
     """
     result: dict[int, int] = {}
-
-    isins = sorted({normalise_isin(r["isin"]) for r in rows if r.get("isin")})
-    if isins:
-        sql, params = build_isin_companyid_query(isins)
+    for column, build_query, normalise in _COMPANYID_KEYS:
+        remaining = [i for i in range(len(rows)) if i not in result and rows[i].get(column)]
+        if not remaining:
+            continue
+        values = [normalise(rows[i][column]) for i in remaining]
+        sql, params = build_query(sorted(set(values)))
         df = client.raw_sql(sql, params=params, date_cols=["startdate", "enddate"])
         requests = pd.DataFrame(
-            {
-                "isin": [normalise_isin(r["isin"]) if r.get("isin") else None for r in rows],
-                "snapshot_date": [r["snapshot_date"] for r in rows],
-            }
-        )
-        requests = requests[requests["isin"].notna()]
-        matched = match_as_of_windows(
-            df, requests, key_col="isin", start_col="startdate", end_col="enddate",
-            prefer_col="primaryflag",
-        )
-        for i, matched_row in matched.iterrows():
-            result[i] = int(matched_row["companyid"])
-
-    remaining = [i for i in range(len(rows)) if i not in result]
-    cusips = sorted({rows[i]["cusip"].strip().upper() for i in remaining if rows[i].get("cusip")})
-    if cusips:
-        sql, params = build_cusip_companyid_query(cusips)
-        df = client.raw_sql(sql, params=params, date_cols=["startdate", "enddate"])
-        requests = pd.DataFrame(
-            {
-                "cusip": [
-                    rows[i]["cusip"].strip().upper() if rows[i].get("cusip") else None
-                    for i in remaining
-                ],
-                "snapshot_date": [rows[i]["snapshot_date"] for i in remaining],
-            },
+            {column: values, "snapshot_date": [rows[i]["snapshot_date"] for i in remaining]},
             index=remaining,
         )
-        requests = requests[requests["cusip"].notna()]
         matched = match_as_of_windows(
-            df, requests, key_col="cusip", start_col="startdate", end_col="enddate",
+            df, requests, key_col=column, start_col="startdate", end_col="enddate",
             prefer_col="primaryflag",
         )
         for i, matched_row in matched.iterrows():
             result[i] = int(matched_row["companyid"])
-
     return result
 
 

@@ -20,6 +20,19 @@ country_iso, region, gics_*) is optional and, by default, backfilled here:
   `deutsche_boerse.identifiers`; this does a full market-day scan, one API
   call per distinct `snapshot_date` in the universe, not one per row).
 
+RavenPack (rp_entity_id, rp_entity_match): with `--rp-reference PATH`, a company entity
+reference file (`company_<date>.csv`) or its identifier extract, matched point in time
+(`ravenpack.entity_reference`); `--rp-api` adds the `/entity-mapping` fallback for rows
+still unmatched.
+
+`--index-dir DIR --index NAME` builds the rows from an index's snapshot files instead of
+`--file` (`universe.index_universe`: `{NAME}_constituents-*_to_*.parquet`, optional
+`{NAME}_metadata-...`; one row per constituent and snapshot, GICS left to Compustat).
+`--name` defaults to the index name in lower case.
+
+    python scripts/ingest_universe.py --index-dir DIR --index MSCI_WORLD \
+        --rp-reference company_<date>_identifiers.parquet --rp-api --allow-incomplete
+
 `--name` is an optional human-readable tag (e.g. "sp500_2020") for finding
 this registration later by name -- see `universe.load_universe_by_name`.
 Names are not enforced unique; re-registering the same name creates a new
@@ -61,14 +74,21 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument(
-        "--file", required=True, type=Path, help="CSV or parquet with the universe schema"
-    )
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--file", type=Path, help="CSV or parquet with the universe schema")
+    src.add_argument("--index-dir", type=Path,
+                     help="directory of {INDEX}_constituents-*.parquet snapshot files")
+    ap.add_argument("--index", default=None,
+                    help="index universe to load from --index-dir, e.g. MSCI_WORLD")
     ap.add_argument("--name", default=None, help="optional human-readable tag, e.g. sp500_2020")
     ap.add_argument("--resolve-wrds", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--resolve-sedol", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--dbga-mic", default=None)
     ap.add_argument("--dbga-market-segment-id", type=int, default=None)
+    ap.add_argument("--rp-reference", type=Path, default=None,
+                    help="RavenPack company entity reference CSV or its identifier extract")
+    ap.add_argument("--rp-api", action="store_true",
+                    help="RavenPack /entity-mapping fallback for rows the file leaves unmatched")
     ap.add_argument("--allow-incomplete", action="store_true")
     ap.add_argument("--pipeline-version", default=PIPELINE_VERSION)
     ap.add_argument("--env", default=".env")
@@ -90,11 +110,32 @@ def main() -> int:
         log.error("DATALAKE_ROOT must be set (in .env, environment, or --datalake-root)")
         return 1
 
-    rows = load_universe_rows(args.file)
+    source = args.file or args.index_dir
+    if args.index_dir:
+        from universe.index_universe import index_universe_rows, list_index_universes
+
+        if not args.index:
+            log.error("--index-dir needs --index, one of %s",
+                      list_index_universes(args.index_dir))
+            return 1
+        rows = index_universe_rows(args.index_dir, args.index)
+        source = args.index_dir / args.index
+        args.name = args.name or args.index.lower()
+    else:
+        rows = load_universe_rows(args.file)
     if not rows:
-        log.error("%s contains no rows", args.file)
+        log.error("%s contains no rows", source)
         return 1
-    log.info("loaded %d rows from %s", len(rows), args.file)
+    log.info("loaded %d rows from %s", len(rows), source)
+
+    rp_client = None
+    if args.rp_api:
+        if not args.rp_reference:
+            log.error("--rp-api is the fallback of --rp-reference; pass both")
+            return 1
+        from ravenpack.edge_api.client import RavenPackClient
+
+        rp_client = RavenPackClient()
 
     wrds_client_cm = None
     if args.resolve_wrds:
@@ -111,11 +152,13 @@ def main() -> int:
             resolve_sedol=args.resolve_sedol,
             dbga_mic=args.dbga_mic,
             dbga_market_segment_id=args.dbga_market_segment_id,
+            rp_reference=args.rp_reference,
+            rp_client=rp_client,
         )
 
-        entries = entries_from_rows(rows, source=str(args.file))
+        entries = entries_from_rows(rows, source=str(source))
         if not entries:
-            log.error("%s contains no usable universe entries", args.file)
+            log.error("%s contains no usable universe entries", source)
             return 1
         log.info("%d/%d rows passed validation after enrichment", len(entries), len(rows))
 
@@ -135,7 +178,7 @@ def main() -> int:
             artifact = register_universe_entries(
                 index,
                 entries,
-                source_label=str(args.file),
+                source_label=str(source),
                 name=args.name,
                 allow_incomplete=args.allow_incomplete,
                 pipeline=PIPELINE,
@@ -145,6 +188,8 @@ def main() -> int:
     finally:
         if wrds_client_cm:
             wrds_client_cm.__exit__(*sys.exc_info())
+        if rp_client is not None:
+            rp_client.close()
 
     print(f"\nuniverse artifact: {artifact.artifact_id}")
     print(f"name:              {args.name or '(unnamed)'}")

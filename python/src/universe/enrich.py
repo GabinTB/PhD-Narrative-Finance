@@ -14,9 +14,11 @@ into each source's own tables/APIs.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from ravenpack.edge_api.client import RavenPackClient
     from wrds_client.client import WRDSClient
 
 
@@ -27,16 +29,22 @@ def enrich_universe(
     resolve_sedol: bool = True,
     dbga_mic: str | None = None,
     dbga_market_segment_id: int | None = None,
+    rp_reference: Path | None = None,
+    rp_client: RavenPackClient | None = None,
 ) -> list[dict[str, Any]]:
     """Backfill missing isin/cusip/cik/gvkey/ticker/ciq_secid/country_*/
-    region/gics_*/sedol/dbga_secid fields, in order: CapitalIQ, then LSEG
-    (sedol), then Deutsche Boerse (dbga_secid). Each step only fills
+    region/gics_*/sedol/rp_entity_id/dbga_secid fields, in order: CapitalIQ, then LSEG
+    (sedol), then RavenPack (rp_entity_id, which can use the cusip/sedol/cik filled
+    before it), then Deutsche Boerse (dbga_secid). Each step only fills
     genuinely-missing fields (never overwrites a value already present) and
     is skipped entirely if its prerequisites aren't given:
 
     - CapitalIQ (isin/cusip/cik/gvkey/ticker/ciq_secid/country_*/region/
       gics_*): needs `wrds_client`.
     - LSEG (sedol): needs `wrds_client` and `resolve_sedol=True` (the default).
+    - RavenPack (rp_entity_id, rp_entity_match): needs `rp_reference`, a company entity
+      reference file or its identifier extract (`ravenpack.entity_reference`), matched
+      point in time; `rp_client` adds the `/entity-mapping` fallback for what is left.
     - Deutsche Boerse (dbga_secid): needs both `dbga_mic` and
       `dbga_market_segment_id` -- there's no way to derive which market/
       segment to scan from an ISIN alone (see `deutsche_boerse.identifiers`).
@@ -57,6 +65,19 @@ def enrich_universe(
             from wrds_client.lseg import backfill_sedol
 
             result = backfill_sedol(wrds_client, result)
+
+    if rp_reference is not None:
+        from ravenpack.entity_reference import (
+            KEYS,
+            backfill_rp_entity_id,
+            load_identifier_windows,
+            normalise,
+        )
+
+        values = {dtype: {v for r in result if (v := normalise(col, r.get(col)))}
+                  for col, dtype in KEYS}
+        windows = load_identifier_windows(Path(rp_reference), values)
+        result, _ = backfill_rp_entity_id(result, windows, client=rp_client)
 
     if dbga_mic and dbga_market_segment_id is not None:
         from deutsche_boerse.identifiers import backfill_dbga_secid

@@ -63,6 +63,8 @@ _OPTIONAL_COLUMNS = (
     "gvkey",
     "ciq_secid",
     "dbga_secid",
+    "rp_entity_id",
+    "rp_entity_match",
     "country_name",
     "country_iso",
     "region",
@@ -106,6 +108,8 @@ class UniverseEntry:
     gvkey: str | None = None
     ciq_secid: str | None = None
     dbga_secid: str | None = None
+    rp_entity_id: str | None = None      # RavenPack company id (ravenpack.entity_reference)
+    rp_entity_match: str | None = None   # how it was matched: isin|cusip|sedol|cik|isin_undated|api
     country_name: str | None = None
     country_iso: str | None = None
     region: str | None = None
