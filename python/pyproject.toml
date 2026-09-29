@@ -33,8 +33,11 @@ dependencies = [
     "mfe-toolbox>=0.1.2",
     "wrds>=3.1.6",
     "lseg-data>=2.1.1",
+    "gingado>=0.2.7",
+    "fredapi>=0.3.0",
     "a7>=0.2.3",
     "dbg-cdm",
+    "realized-library>=0.1.2",
 ]
 
 [project.scripts]
@@ -116,13 +119,6 @@ nlp = [
 ]
 
 # -------------------------------------------------------------------
-# Volatility - Install: `uv sync --group volatility`
-# -------------------------------------------------------------------
-volatility = [
-    "realized-library>=0.1.2",
-]
-
-# -------------------------------------------------------------------
 # Dev - Install: `uv sync --group dev`
 # -------------------------------------------------------------------
 dev = [
@@ -134,28 +130,6 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.4",
     "mypy>=1.10",
-]
-
-# -------------------------------------------------------------------
-# Project-specific groups -- add deps as each project grows
-# Install e.g.: uv sync --group dev --group nlp --group quoniam
-# -------------------------------------------------------------------
-
-central-bank = [
-    "gingado>=0.2.7",  # Central Bank API client
-    "fredapi>=0.3.0",  # St Louis Fed FRED API client
-]
-
-quoniam = [
-
-]
-
-snsf = [
-
-]
-
-edgar = [
-
 ]
 
 [tool.ruff]
