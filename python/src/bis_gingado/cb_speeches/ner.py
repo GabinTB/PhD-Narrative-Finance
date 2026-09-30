@@ -34,11 +34,11 @@ from typing import TYPE_CHECKING, Any
 import pandas as pd
 import polars as pl
 
-from cb_speeches.schema import NER_SCHEMA
-from cb_speeches.speeches import (
+from bis_gingado.cb_speeches.schema import NER_SCHEMA
+from bis_gingado.cb_speeches.speeches import (
     KIND as SPEECHES_KIND,
 )
-from cb_speeches.speeches import (
+from bis_gingado.cb_speeches.speeches import (
     PLAN_PREFIX,
     UPDATE_PREFIX,
     Clock,

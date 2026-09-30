@@ -13,8 +13,7 @@ from typing import Any
 
 import httpx
 
-BASE_URL = "https://bis.test/pages/download/"
-INDEX_URL = "https://bis.test/cbspeeches/download.htm"
+BULK_URL = "https://bis.test/pages/download/speeches.zip"
 CHAT_URL = "http://llm.test/v1"
 
 
@@ -37,7 +36,7 @@ def every_third_day(start: date, end: date, per_day: int = 2) -> list[dict[str, 
     return out
 
 
-def make_zip(year: int, rows: list[dict[str, str]]) -> bytes:
+def make_zip(rows: list[dict[str, str]], member: str = "speeches.csv") -> bytes:
     """A deterministic BIS-shaped zip (fixed member timestamp)."""
     buf = io.StringIO()
     w = csv.DictWriter(buf, fieldnames=["url", "title", "description", "date", "text",
@@ -46,44 +45,68 @@ def make_zip(year: int, rows: list[dict[str, str]]) -> bytes:
     w.writerows(rows)
     out = io.BytesIO()
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
-        info = zipfile.ZipInfo(f"speeches_{year}.csv", date_time=(2020, 1, 1, 0, 0, 0))
+        info = zipfile.ZipInfo(member, date_time=(2020, 1, 1, 0, 0, 0))
         zf.writestr(info, buf.getvalue())
     return out.getvalue()
 
 
 @dataclass
 class FakeBIS:
-    """``rows[year]`` served as speeches-YYYY.zip; ETag = content hash."""
+    """Serves every year of ``rows`` as one bulk speeches.zip (ETag = content hash).
+
+    Honours ``Range`` / ``If-Range`` like the real server (which does not advertise
+    ranges). ``cut`` cuts that many GETs short, half way through what they would send,
+    like the real server's dropped connections."""
 
     rows: dict[int, list[dict[str, str]]]
+    cut: int = 0
     requests: list[tuple[str, str]] = field(default_factory=list)
 
-    def zip(self, year: int) -> bytes:
-        return make_zip(year, self.rows[year])
+    def zip(self) -> bytes:
+        return make_zip([r for year in sorted(self.rows) for r in self.rows[year]])
+
+    def etag(self) -> str:
+        return f'"{hashlib.md5(self.zip()).hexdigest()}"'
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         self.requests.append((request.method, url))
-        if url == INDEX_URL:
-            links = "".join(f'<a href="/pages/download/speeches-{y}.zip">{y}</a>'
-                            for y in sorted(self.rows))
-            return httpx.Response(200, text=f"<html>{links}</html>")
-        m = re.fullmatch(re.escape(BASE_URL) + r"speeches-(\d{4})\.zip", url)
-        if not m or int(m.group(1)) not in self.rows:
+        if url != BULK_URL:
             return httpx.Response(404, text="not found")
-        content = self.zip(int(m.group(1)))
-        headers = {"etag": f'"{hashlib.md5(content).hexdigest()}"',
-                   "last-modified": "Sun, 23 Aug 2026 14:05:42 GMT",
-                   "content-type": "application/zip"}
+        content = self.zip()
+        headers = {"etag": self.etag(), "last-modified": "Sun, 23 Aug 2026 14:05:42 GMT",
+                   "content-type": "application/zip", "content-length": str(len(content))}
         if request.method == "HEAD":
             return httpx.Response(200, headers=headers)
-        return httpx.Response(200, content=content, headers=headers)
+        status, body = 200, content
+        rng = request.headers.get("range")
+        if rng and request.headers.get("if-range", headers["etag"]) == headers["etag"]:
+            start = int(rng.split("=")[1].rstrip("-"))
+            status, body = 206, content[start:]
+            headers["content-length"] = str(len(body))
+        if self.cut > 0:
+            self.cut -= 1
+            return httpx.Response(status, headers=headers,
+                                  stream=_CutStream(body[:len(body) // 2]))
+        return httpx.Response(status, content=body, headers=headers)
 
     def transport(self) -> httpx.MockTransport:
-        return httpx.MockTransport(self.handler)
+        return httpx.MockTransport(lambda request: self.handler(request))   # patchable
 
     def downloads(self) -> int:
-        return sum(1 for method, url in self.requests if method == "GET" and url != INDEX_URL)
+        return sum(1 for method, _ in self.requests if method == "GET")
+
+
+class _CutStream(httpx.SyncByteStream):
+    """Sends ``data`` then drops the connection."""
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+
+    def __iter__(self):
+        yield self.data
+        raise httpx.RemoteProtocolError("peer closed connection without sending complete "
+                                        "message body")
 
 
 @dataclass

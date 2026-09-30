@@ -5,6 +5,6 @@
     jobs start cb_speech_ner --speeches-id <id> --provider ollama --model <name>
     jobs update <cb_speech_ner id>               NER for speeches not in the table yet
 
-    from cb_speeches.speeches import read_speeches
-    from cb_speeches.ner import speeches_with_ner
+    from bis_gingado.cb_speeches.speeches import read_speeches
+    from bis_gingado.cb_speeches.ner import speeches_with_ner
 """

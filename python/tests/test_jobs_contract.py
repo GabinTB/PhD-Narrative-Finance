@@ -246,17 +246,16 @@ def _frames(art) -> dict[str, pl.DataFrame]:
 
 
 def _bis_case(root: Path, freq: str):
-    from cb_speeches.speeches import SpeechesJob
-    from tests.cb_speeches.fakes import BASE_URL, INDEX_URL, FakeBIS, every_third_day, speech
+    from bis_gingado.cb_speeches.speeches import SpeechesJob
+    from tests.cb_speeches.fakes import BULK_URL, FakeBIS, every_third_day, speech
     from tests.cb_speeches.test_speeches import T0, Clock
 
     fake = FakeBIS({2008: every_third_day(START, END)})
     index = DatalakeIndex(root / "lake")
 
     def new_job() -> Job:
-        return SpeechesJob.new(Layout(freq, START, END), base_url=BASE_URL,
-                               index_url=INDEX_URL, temp=True, transport=fake.transport(),
-                               clock=Clock(T0))
+        return SpeechesJob.new(Layout(freq, START, END), url=BULK_URL, temp=True,
+                               transport=fake.transport(), clock=Clock(T0), retry_wait_s=0)
 
     def mutate() -> None:
         fake.rows[2008][0] = dict(fake.rows[2008][0], title="retitled")
@@ -276,7 +275,7 @@ def case_cb_speeches(root: Path, freq: str) -> Env:
 
 
 def case_cb_speech_ner(root: Path, freq: str) -> Env:
-    from cb_speeches.ner import NerJob
+    from bis_gingado.cb_speeches.ner import NerJob
     from tests.cb_speeches.fakes import CHAT_URL, FakeChat, chat_backend
     from tests.cb_speeches.test_speeches import T0, Clock
 

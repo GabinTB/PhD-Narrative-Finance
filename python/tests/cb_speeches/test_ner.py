@@ -1,4 +1,4 @@
-"""cb_speeches.ner: NER table keyed by speech_id, updates, resume, verifier."""
+"""bis_gingado.cb_speeches.ner: NER table keyed by speech_id, updates, resume, verifier."""
 from __future__ import annotations
 
 from datetime import date, timedelta
@@ -6,9 +6,9 @@ from datetime import date, timedelta
 import polars as pl
 import pytest
 
-from cb_speeches import ner
-from cb_speeches.ner import NerJob, read_ner, speeches_with_ner, verify_artifact
-from cb_speeches.speeches import read_speeches
+from bis_gingado.cb_speeches import ner
+from bis_gingado.cb_speeches.ner import NerJob, read_ner, speeches_with_ner, verify_artifact
+from bis_gingado.cb_speeches.speeches import read_speeches
 from datalake import DatalakeIndex
 from datalake.jobs import JobError, JobRunner
 from tests.cb_speeches.fakes import FakeBIS, FakeChat, chat_backend, every_third_day, speech

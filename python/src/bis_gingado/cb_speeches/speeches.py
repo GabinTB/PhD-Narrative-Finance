@@ -1,26 +1,30 @@
 """BIS central-banker speeches -> ``cb_speeches`` artifact (historical load + updates).
 
+Source: BIS's bulk ``speeches.zip`` (every speech since 1996, one CSV;
+``bis_gingado.cb_speeches.bis``), downloaded once per execution, resumed across the cut
+connections the BIS server is prone to.
+
 Base load (``jobs start cb_speeches``): one parquet per partition of the
 chosen ``partition_freq`` (``datalake.layout``, default Y), rows routed by
-speech date. Unit = partition; a BIS year zip is downloaded once per run and
-kept in memory while its partitions are written. A partition without speeches
+speech date. Unit = partition; the bulk file is downloaded once per run and
+kept in memory while the partitions are written. A partition without speeches
 is an empty file (so every expected partition is present when complete).
+Speeches dated outside [start, end] are not written (counted in the run note).
 
-Update (``jobs update <artifact_id>``): a new execution of the same artifact.
-Every BIS year >= the artifact's start is checked (unit = source year): an
-unchanged ETag or zip sha256 writes an empty delta; otherwise the zip is
-diffed against the artifact's current state and the delta
-``update-<vintage>-YYYY.parquet`` holds ``new`` / ``revised`` / ``removed``
-rows. Existing files are never rewritten; speeches dated after the declared
-``end`` land in deltas too.
+Update (``jobs update <artifact_id>``): a new execution of the same artifact,
+one unit. An unchanged ETag (HEAD only) or zip sha256 writes an empty delta;
+otherwise the bulk file is diffed against the artifact's current state and the
+delta ``update-<vintage>.parquet`` holds ``new`` / ``revised`` / ``removed``
+rows (speeches dated from the declared ``start`` on, including after ``end``).
+Existing files are never rewritten.
 
 Files (all hashed):
     <period key>.parquet              base partitions (change = base)
-    update-<vintage>-YYYY.parquet     update deltas (possibly empty)
-    raw-speeches-YYYY-<sha12>.zip     every raw zip read, content-addressed
-    plan-<vintage>.json               what an execution fetches (mode, years, URLs)
+    update-<vintage>.parquet          update deltas (possibly empty)
+    raw-speeches-<sha12>.zip          every raw zip read, content-addressed
+    plan-<vintage>.json               what an execution fetches (mode, URL)
 
-Every parquet carries the manifest of the zip(s) it was read from (URL, ETag,
+Every parquet carries the manifest of the zip it was read from (URL, ETag,
 Last-Modified, sha256, size, fetch time) in its key-value metadata.
 
 ``read_speeches(artifact, as_of=...)`` resolves the latest version of every
@@ -44,17 +48,20 @@ import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from cb_speeches.bis import (
-    DEFAULT_BASE_URL,
-    DEFAULT_INDEX_URL,
+from bis_gingado.cb_speeches.bis import (
+    DEFAULT_URL,
     BISClient,
     Manifest,
     SpeechDataError,
     normalise,
     read_zip,
-    zip_name,
 )
-from cb_speeches.schema import CHANGES, SOURCES_METADATA_KEY, SPEECH_SCHEMA, STATE_COLUMNS
+from bis_gingado.cb_speeches.schema import (
+    CHANGES,
+    SOURCES_METADATA_KEY,
+    SPEECH_SCHEMA,
+    STATE_COLUMNS,
+)
 from datalake.jobs import TEMP_SUFFIX, Job, JobContext, Unit
 from datalake.layout import Layout, add_layout_args, layout_from_args, layout_from_hyperparams
 from datalake.periods import PeriodError, parse_key, partition_file
@@ -65,7 +72,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 KIND = "cb_speeches"
-PIPELINE_VERSION = "v0.1.0"
+PIPELINE_VERSION = "v0.2.0"      # v0.2.0: bulk speeches.zip (v0.1.0: yearly zips)
 SOURCE = "bis_cbspeeches"
 
 PLAN_PREFIX, UPDATE_PREFIX, RAW_PREFIX = "plan-", "update-", "raw-"
@@ -125,7 +132,8 @@ def file_sources(path: Path) -> dict[str, Any]:
 
 
 def raw_zip_path(out_dir: Path, manifest: Manifest) -> Path:
-    return out_dir / f"{RAW_PREFIX}speeches-{manifest.year}-{manifest.sha256[:12]}.zip"
+    stem = manifest.zip.removesuffix(".zip")
+    return out_dir / f"{RAW_PREFIX}{stem}-{manifest.sha256[:12]}.zip"
 
 
 def plan_files(root: Path) -> list[Path]:
@@ -187,48 +195,37 @@ def read_speeches(artifact: Artifact, as_of: datetime | str | None = None,
 # ---------------------------------------------------------------------------
 
 class SpeechesJob(Job):
-    """BIS central-banker speeches (yearly zips) -> cb_speeches partitions / updates."""
+    """BIS central-banker speeches (bulk zip) -> cb_speeches partitions / updates."""
 
     kind = KIND
     pipeline_version = PIPELINE_VERSION
     hash_pattern = "*"
 
     def __init__(self, layout: Layout, plan: dict[str, Any], *, temp: bool = False,
-                 transport: Any = None, timeout: float = 300.0, clock: Clock = utc_now) -> None:
+                 transport: Any = None, timeout: float = 300.0, clock: Clock = utc_now,
+                 retry_wait_s: float = 2.0) -> None:
         self.layout, self.plan, self.temp = whole_periods(layout), plan, temp
         self.clock = clock
-        self.client = BISClient(plan["base_url"], plan["index_url"], timeout=timeout,
-                                transport=transport)
+        self.client = BISClient(plan["url"], timeout=timeout, transport=transport,
+                                retry_wait_s=retry_wait_s)
         self.vintage = parse_vintage(plan["vintage"])
-        self.years: list[int] = [int(y) for y in plan["years"]]
-        self._loaded: dict[int, tuple[Manifest, pd.DataFrame]] = {}
-        self._outside: dict[int, int] = {}
+        self._loaded: tuple[Manifest, pd.DataFrame] | None = None
+        self._outside = 0
         self._changes: dict[str, int] = {}
 
     # -- construction -------------------------------------------------------
 
     @staticmethod
-    def make_plan(mode: str, client: BISClient, vintage: datetime,
-                  years: list[int]) -> dict[str, Any]:
-        return {"mode": mode, "vintage": vintage_tag(vintage), "years": sorted(years),
-                "base_url": client.base_url, "index_url": client.index_url}
+    def make_plan(mode: str, url: str, vintage: datetime) -> dict[str, Any]:
+        return {"mode": mode, "vintage": vintage_tag(vintage), "url": url}
 
     @classmethod
-    def new(cls, layout: Layout, *, base_url: str = DEFAULT_BASE_URL,
-            index_url: str = DEFAULT_INDEX_URL, temp: bool = False, transport: Any = None,
-            clock: Clock = utc_now) -> SpeechesJob:
-        """A base load of every BIS year intersecting ``layout``."""
-        layout = whole_periods(layout)
-        client = BISClient(base_url, index_url, transport=transport)
-        try:
-            years = [y for y in client.years()
-                     if layout.start.year <= y <= layout.end.year]
-        finally:
-            client.close()
-        if not years:
-            raise SpeechDataError(f"BIS lists no speech year in {layout.start}..{layout.end}")
-        plan = cls.make_plan("base", client, clock(), years)
-        return cls(layout, plan, temp=temp, transport=transport, clock=clock)
+    def new(cls, layout: Layout, *, url: str = DEFAULT_URL, temp: bool = False,
+            transport: Any = None, clock: Clock = utc_now, **kwargs: Any) -> SpeechesJob:
+        """A base load of every speech dated in ``layout``."""
+        plan = cls.make_plan("base", url, clock())
+        return cls(whole_periods(layout), plan, temp=temp, transport=transport, clock=clock,
+                   **kwargs)
 
     @property
     def mode(self) -> str:
@@ -242,26 +239,21 @@ class SpeechesJob(Job):
         return {"source": SOURCE, **self.layout.hyperparams()}
 
     def notes(self) -> str:
-        return (f"{self.mode} vintage={self.plan['vintage']} years={self.years[0]}-"
-                f"{self.years[-1]} base_url={self.plan['base_url']}")
+        return f"{self.mode} vintage={self.plan['vintage']} url={self.plan['url']}"
 
     # -- units ---------------------------------------------------------------
 
-    def _period_years(self, key: str) -> set[int]:
-        p = parse_key(key)
-        return set(range(p.first.year, p.last.year + 1)) & set(self.years)
-
     def units(self) -> list[Unit]:
         if self.mode == "update":
-            return [Unit(str(y), "update") for y in self.years]
-        return [Unit(p.key) for p in self.layout.expected() if self._period_years(p.key)]
+            return [Unit("all", "update")]
+        return [Unit(p.key) for p in self.layout.expected()]
 
-    def _delta_path(self, out_dir: Path, year: int) -> Path:
-        return out_dir / f"{UPDATE_PREFIX}{self.plan['vintage']}-{year}.parquet"
+    def _delta_path(self, out_dir: Path) -> Path:
+        return out_dir / f"{UPDATE_PREFIX}{self.plan['vintage']}.parquet"
 
     def is_done(self, unit: Unit, out_dir: Path) -> bool:
         if self.mode == "update":
-            return self._delta_path(out_dir, int(unit.key)).exists()
+            return self._delta_path(out_dir).exists()
         return (out_dir / partition_file(unit.key)).exists()
 
     @contextmanager
@@ -275,21 +267,21 @@ class SpeechesJob(Job):
         finally:
             self.client.close()
 
-    def _load(self, year: int, out_dir: Path) -> tuple[Manifest, pd.DataFrame]:
-        if year not in self._loaded:
-            manifest, content = self.client.download(year, self.clock())
+    def _load(self, out_dir: Path) -> tuple[Manifest, pd.DataFrame]:
+        """The bulk file, downloaded once per run and kept as a raw file."""
+        if self._loaded is None:
+            manifest, content = self.client.download(self.clock())
             raw = raw_zip_path(out_dir, manifest)
             if not raw.exists():
                 _write_atomic(raw, lambda tmp: tmp.write_bytes(content))
-            df = normalise(read_zip(content, year), year)
+            df = normalise(read_zip(content, manifest.zip), manifest.zip)
             inside = (df["date"] >= self.layout.start) & (df["date"] <= self.layout.end)
-            self._outside[year] = int((~inside).sum())
-            if self._outside[year] and self.mode == "base":
+            self._outside = int((~inside).sum())
+            if self._outside and self.mode == "base":
                 log.warning("%s: %d speech(es) dated outside %s..%s are not written",
-                            zip_name(year), self._outside[year], self.layout.start,
-                            self.layout.end)
-            self._loaded[year] = (manifest, df)
-        return self._loaded[year]
+                            manifest.zip, self._outside, self.layout.start, self.layout.end)
+            self._loaded = (manifest, df)
+        return self._loaded
 
     def _rows(self, df: pd.DataFrame, change: str) -> pd.DataFrame:
         out = df.copy()
@@ -299,71 +291,64 @@ class SpeechesJob(Job):
 
     def run_unit(self, unit: Unit, ctx: JobContext) -> None:
         if self.mode == "update":
-            self._update_year(int(unit.key), ctx)
+            self._update(ctx)
         else:
             self._base_unit(unit, ctx)
 
     # -- base load -----------------------------------------------------------
 
     def _base_unit(self, unit: Unit, ctx: JobContext) -> None:
-        """Write partition ``unit`` from its year zip(s) (downloaded once per run)."""
-        need = self._period_years(unit.key)
-        for year in [y for y in self._loaded if y < min(need)]:
-            del self._loaded[year]                          # units run in period order
-        loaded = [self._load(y, ctx.out_dir) for y in sorted(need)]
+        """Write partition ``unit`` from the bulk file (downloaded once per run)."""
+        manifest, rows = self._load(ctx.out_dir)
         period = parse_key(unit.key)
-        rows = pd.concat([df for _, df in loaded], ignore_index=True)
         part = rows[(rows["date"] >= period.first) & (rows["date"] <= period.last)]
         write_table(ctx.out_dir / partition_file(unit.key), self._rows(part, "base"),
-                    SPEECH_SCHEMA, _sources_metadata([m for m, _ in loaded]))
+                    SPEECH_SCHEMA, _sources_metadata([manifest]))
         ctx.log.info("%s: %d speech(es)", unit.key, len(part))
 
     # -- update --------------------------------------------------------------
 
-    def _latest_manifest(self, out_dir: Path, year: int) -> dict[str, Any] | None:
+    def _latest_manifest(self, out_dir: Path) -> dict[str, Any] | None:
         latest = None
         for path in data_files(out_dir):
             for m in file_sources(path)["sources"]:
-                if m["year"] == year and m.get("sha256") and (
-                        latest is None or m["fetched_at"] >= latest["fetched_at"]):
+                if m.get("sha256") and (latest is None
+                                        or m["fetched_at"] >= latest["fetched_at"]):
                     latest = m
         return latest
 
-    def _update_year(self, year: int, ctx: JobContext) -> None:
-        out = self._delta_path(ctx.out_dir, year)
-        recorded = self._latest_manifest(ctx.out_dir, year)
-        head = self.client.head(year)
+    def _update(self, ctx: JobContext) -> None:
+        out = self._delta_path(ctx.out_dir)
+        recorded = self._latest_manifest(ctx.out_dir)
+        head = self.client.head()
         empty = pd.DataFrame({c: pd.Series(dtype=object) for c in SPEECH_SCHEMA.names})
         if recorded and head.etag and head.etag == recorded.get("etag"):
             write_table(out, empty, SPEECH_SCHEMA,
                         _sources_metadata([], unchanged=recorded, checked=head.to_dict()))
-            ctx.log.info("%s unchanged (ETag)", zip_name(year))
+            ctx.log.info("%s unchanged (ETag)", head.zip)
             return
-        manifest, fresh = self._load(year, ctx.out_dir)
+        manifest, fresh = self._load(ctx.out_dir)
         if recorded and recorded.get("sha256") == manifest.sha256:
             write_table(out, empty, SPEECH_SCHEMA, _sources_metadata([manifest], unchanged=True))
-            ctx.log.info("%s unchanged (sha256)", zip_name(year))
+            ctx.log.info("%s unchanged (sha256)", manifest.zip)
             return
-        state = read_state(ctx.out_dir, columns=("speech_id", "content_sha256", "source_zip",
-                                                 "date"))
+        state = read_state(ctx.out_dir, columns=("speech_id", "content_sha256", "date"))
         known = dict(zip(state["speech_id"].to_list(), state["content_sha256"].to_list()))
         fresh = fresh[(fresh["date"] >= self.layout.start)]
         is_new = ~fresh["speech_id"].isin(known.keys())
         is_rev = ~is_new & (fresh["content_sha256"] != fresh["speech_id"].map(known))
-        gone = state.filter((pl.col("source_zip") == zip_name(year))
-                            & ~pl.col("speech_id").is_in(fresh["speech_id"].tolist()))
+        gone = state.filter(~pl.col("speech_id").is_in(fresh["speech_id"].tolist()))
         removed = pd.DataFrame({
             "speech_id": gone["speech_id"].to_list(), "date": gone["date"].to_list(),
             **{c: None for c in ("url", "title", "description", "author", "text",
                                  "content_sha256")},
-            "source_zip": zip_name(year)})
+            "source_zip": manifest.zip})
         delta = pd.concat([self._rows(fresh[is_new], "new"), self._rows(fresh[is_rev], "revised"),
                            self._rows(removed, "removed")], ignore_index=True)
         write_table(out, delta, SPEECH_SCHEMA, _sources_metadata([manifest]))
-        counts = {"new": int(is_new.sum()), "revised": int(is_rev.sum()), "removed": len(removed)}
-        for k, v in counts.items():
-            self._changes[k] = self._changes.get(k, 0) + v
-        ctx.log.info("%s: %s", zip_name(year), counts)
+        self._changes = {"new": int(is_new.sum()), "revised": int(is_rev.sum()),
+                         "removed": len(removed)}
+        ctx.log.info("%s: %s", manifest.zip, self._changes)
 
     # -- end -----------------------------------------------------------------
 
@@ -378,7 +363,7 @@ class SpeechesJob(Job):
         if dup:
             raise SpeechDataError(f"speech ids in several partitions: {sorted(dup)[:10]}")
         ctx.note(f"base {self.plan['vintage']}: {ids.height} speeches; outside the range "
-                 f"(not written): {sum(self._outside.values())}")
+                 f"(not written): {self._outside}")
 
     # -- rebuild -------------------------------------------------------------
 
@@ -396,38 +381,29 @@ class SpeechesJob(Job):
 
     @classmethod
     def for_update(cls, artifact: Artifact, index: DatalakeIndex, *, transport: Any = None,
-                   base_url: str | None = None, index_url: str | None = None,
-                   clock: Clock = utc_now, **kwargs: Any) -> SpeechesJob:
-        """Check every BIS year >= the artifact's start for new or revised speeches."""
+                   url: str | None = None, clock: Clock = utc_now,
+                   **kwargs: Any) -> SpeechesJob:
+        """Check the bulk file for new, revised or removed speeches."""
         layout = layout_from_hyperparams(artifact.meta.hyperparams)
-        first = json.loads(plan_files(artifact.path)[0].read_text())
-        client = BISClient(base_url or first["base_url"], index_url or first["index_url"],
-                           transport=transport)
-        try:
-            years = [y for y in client.years() if y >= layout.start.year]
-        finally:
-            client.close()
+        plans = plan_files(artifact.path)
+        first = json.loads(plans[0].read_text())
         vintage = clock()
-        if plan_files(artifact.path) and vintage_tag(vintage) <= \
-                json.loads(plan_files(artifact.path)[-1].read_text())["vintage"]:
+        if vintage_tag(vintage) <= json.loads(plans[-1].read_text())["vintage"]:
             raise SpeechDataError("the update vintage must be later than the latest one")
-        plan = cls.make_plan("update", client, vintage, years)
+        plan = cls.make_plan("update", url or first["url"], vintage)
         return cls(layout, plan, temp=artifact.meta.pipeline_version.endswith(TEMP_SUFFIX),
                    transport=transport, clock=clock, **kwargs)
 
     @classmethod
     def add_cli_args(cls, parser: Any) -> None:
         add_layout_args(parser, default_freq="Y")
-        parser.add_argument("--base-url", default=DEFAULT_BASE_URL,
-                            help="directory of the speeches-YYYY.zip files")
-        parser.add_argument("--index-url", default=DEFAULT_INDEX_URL,
-                            help="page listing the yearly zips")
+        parser.add_argument("--url", default=DEFAULT_URL,
+                            help="BIS bulk speeches.zip (every speech since 1996)")
         parser.add_argument("--temp", action="store_true", help="agent-created (__TEMP)")
 
     @classmethod
     def from_args(cls, args: Any, index: DatalakeIndex) -> SpeechesJob:
-        return cls.new(layout_from_args(args), base_url=args.base_url,
-                       index_url=args.index_url, temp=args.temp)
+        return cls.new(layout_from_args(args), url=args.url, temp=args.temp)
 
 
 # ---------------------------------------------------------------------------
@@ -460,7 +436,7 @@ def verify_artifact(artifact: Artifact) -> list:
         if not set(df["change"].unique().to_list()) <= set(CHANGES):
             err(f"{path.name}: unknown change values")
         if path.name.startswith(UPDATE_PREFIX):
-            tag = path.name[len(UPDATE_PREFIX):].rsplit("-", 1)[0]
+            tag = path.stem[len(UPDATE_PREFIX):]
             if plans.get(tag, {}).get("mode") != "update":
                 err(f"{path.name}: no update plan for vintage {tag}")
             if df["speech_id"].is_duplicated().any():

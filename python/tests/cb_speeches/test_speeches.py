@@ -1,4 +1,4 @@
-"""cb_speeches.speeches: base load, updates, point-in-time reader, verifier."""
+"""bis_gingado.cb_speeches.speeches: base load, updates, point-in-time reader, verifier."""
 from __future__ import annotations
 
 import json
@@ -8,8 +8,8 @@ import polars as pl
 import pyarrow.parquet as pq
 import pytest
 
-from cb_speeches.bis import SpeechDataError
-from cb_speeches.speeches import (
+from bis_gingado.cb_speeches.bis import SpeechDataError
+from bis_gingado.cb_speeches.speeches import (
     SpeechesJob,
     data_files,
     file_sources,
@@ -20,7 +20,7 @@ from cb_speeches.speeches import (
 from datalake import DatalakeIndex
 from datalake.jobs import JobError, JobRunner
 from datalake.layout import Layout
-from tests.cb_speeches.fakes import BASE_URL, INDEX_URL, FakeBIS, every_third_day, speech
+from tests.cb_speeches.fakes import BULK_URL, FakeBIS, every_third_day, speech
 
 T0 = datetime(2026, 9, 1, tzinfo=timezone.utc)
 
@@ -46,8 +46,8 @@ def _runner(index):
 
 
 def _job(fake, freq="M", start=date(2008, 1, 1), end=date(2008, 6, 30), clock=None):
-    return SpeechesJob.new(Layout(freq, start, end), base_url=BASE_URL, index_url=INDEX_URL,
-                           temp=True, transport=fake.transport(), clock=clock or Clock())
+    return SpeechesJob.new(Layout(freq, start, end), url=BULK_URL, temp=True,
+                           transport=fake.transport(), clock=clock or Clock(), retry_wait_s=0)
 
 
 @pytest.fixture
@@ -68,7 +68,7 @@ def test_base_load_partitions_by_speech_date(lake):
     df = read_speeches(art)
     assert df.height == len(fake.rows[2008])
     assert df["change"].unique().to_list() == ["base"]
-    assert fake.downloads() == 1                       # one zip for six partitions
+    assert fake.downloads() == 1                       # one bulk zip for six partitions
     assert art.meta.hyperparams == {"source": "bis_cbspeeches", "partition_freq": "M",
                                     "start": "2008-01-01", "end": "2008-06-30"}
     assert verify_artifact(art) == []
@@ -77,12 +77,12 @@ def test_base_load_partitions_by_speech_date(lake):
 def test_raw_zip_plan_and_manifest_are_recorded(lake):
     fake = _fake()
     art = _load(lake, fake)
-    raws = list(art.path.glob("raw-speeches-2008-*.zip"))
-    assert len(raws) == 1 and raws[0].read_bytes() == fake.zip(2008)
+    raws = list(art.path.glob("raw-speeches-*.zip"))
+    assert len(raws) == 1 and raws[0].read_bytes() == fake.zip()
     plan = json.loads(plan_files(art.path)[0].read_text())
-    assert plan["mode"] == "base" and plan["years"] == [2008]
+    assert plan["mode"] == "base" and plan["url"] == BULK_URL
     src = file_sources(art.path / "2008-01.parquet")["sources"][0]
-    assert src["year"] == 2008 and src["url"].endswith("speeches-2008.zip") and src["etag"]
+    assert src["url"] == BULK_URL and src["etag"] and src["sha256"]
     assert raws[0].name in art.file_hashes and plan_files(art.path)[0].name in art.file_hashes
 
 
@@ -109,7 +109,7 @@ def test_update_with_nothing_new_writes_empty_deltas_without_downloading(lake):
     assert done.artifact_id == art.artifact_id and not done.partial
     assert len(done.meta.runs) == 2
     deltas = sorted(p.name for p in done.path.glob("update-*.parquet"))
-    assert [d.rsplit("-", 1)[1] for d in deltas] == ["2008.parquet"]
+    assert len(deltas) == 1                            # one delta per update
     assert pq.read_metadata(done.path / deltas[0]).num_rows == 0
     assert fake.downloads() == before                  # ETag unchanged: HEAD only
     assert read_speeches(done).equals(read_speeches(art))
@@ -157,9 +157,9 @@ def test_killed_update_resumes_to_the_uninterrupted_result(tmp_path):
             if kill:
                 real, calls = job.run_unit, [0]
 
-                def run_unit(unit, ctx):
+                def run_unit(unit, ctx):             # killed inside the update's unit
                     calls[0] += 1
-                    if calls[0] == 2:
+                    if calls[0] == 1:
                         raise RuntimeError("killed")
                     real(unit, ctx)
                 job.run_unit = run_unit
@@ -186,11 +186,18 @@ def test_update_vintage_must_move_forward(lake):
         SpeechesJob.for_update(art, lake, transport=fake.transport(), clock=Clock(T0))
 
 
-def test_id_in_two_partitions_fails_the_base_load(lake):
+def test_one_id_with_two_contents_fails_the_base_load(lake):
     row = speech(date(2008, 1, 2), 0)
     fake = FakeBIS({2008: [row], 2009: [dict(row, date="2009-01-02 00:00:00")]})
-    with pytest.raises(SpeechDataError, match="several partitions"):
+    with pytest.raises(SpeechDataError, match="different content"):
         _load(lake, fake, freq="Y", end=date(2009, 12, 31))
+
+
+def test_base_load_survives_cut_downloads(lake):
+    fake = _fake()
+    fake.cut = 2
+    art = _load(lake, fake)
+    assert read_speeches(art).height == len(fake.rows[2008]) and not art.partial
 
 
 def test_verifier_flags_a_tampered_raw_zip(lake):

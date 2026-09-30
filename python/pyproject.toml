@@ -55,8 +55,8 @@ tau_asof = "narrative_scoring.artifacts:verify_tau_asof"
 narrative_daily = "narrative_scoring.artifacts:verify_narrative_daily"
 day_diagnostics = "narrative_scoring.artifacts:verify_day_diagnostics"
 headline_sentiment = "ravenpack.headlines.sentiment:verify_artifact"
-cb_speeches = "cb_speeches.speeches:verify_artifact"
-cb_speech_ner = "cb_speeches.ner:verify_artifact"
+cb_speeches = "bis_gingado.cb_speeches.speeches:verify_artifact"
+cb_speech_ner = "bis_gingado.cb_speeches.ner:verify_artifact"
 
 [project.entry-points."narrative_finance.jobs"]
 ravenpack_headlines = "ravenpack.headlines.ingest:IngestJob"
@@ -64,8 +64,8 @@ headline_sentiment = "ravenpack.headlines.sentiment:HeadlineSentimentJob"
 headline_embeddings = "ravenpack.headlines.embed:EmbedJob"
 mu_asof = "ravenpack.headlines.mu_asof:MuAsofJob"
 narrative_daily = "narrative_scoring.artifacts:ScoringJob"
-cb_speeches = "cb_speeches.speeches:SpeechesJob"
-cb_speech_ner = "cb_speeches.ner:NerJob"
+cb_speeches = "bis_gingado.cb_speeches.speeches:SpeechesJob"
+cb_speech_ner = "bis_gingado.cb_speeches.ner:NerJob"
 
 [build-system]
 requires      = ["hatchling"]
@@ -80,7 +80,7 @@ packages = [
     "src/edgar_tools",
     "src/wrds_client",
     "src/universe",
-    "src/cb_speeches",
+    "src/bis_gingado",
 ]
 
 [tool.uv]

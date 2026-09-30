@@ -20,7 +20,7 @@ SPEECH_SCHEMA = pa.schema([
     ("author", pa.string()),
     ("text", pa.string()),
     ("content_sha256", pa.string()),
-    ("source_zip", pa.string()),           # speeches-YYYY.zip the row was read from
+    ("source_zip", pa.string()),           # the zip the row was read from (speeches.zip)
     ("vintage", pa.timestamp("us", tz="UTC")),   # the execution (fetch) that recorded it
     ("change", pa.string()),               # base | new | revised | removed
 ])
