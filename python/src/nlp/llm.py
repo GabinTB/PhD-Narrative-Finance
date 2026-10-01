@@ -18,6 +18,9 @@ The model name is always the caller's (no default model).
   is ALWAYS parsed and validated locally (``validate``), retried up to
   ``max_attempts`` times, then returned as an explicit error -- never a silent
   partial record.
+* Temperature: a model that rejects a non-default temperature (Claude 5 models)
+  is retried without it, with a warning; ``identity()`` then records
+  ``temperature=None`` and ``temperature_dropped=True``.
 * API failures (auth, unknown model, bad request, connection after the SDK's
   own 429/5xx retries) raise: a job stops with the reason instead of writing
   thousands of error rows.
@@ -118,6 +121,21 @@ def validate(value: Any, schema: dict[str, Any]) -> list[str]:
     return problems
 
 
+# Models that refuse a non-default temperature answer with a 400, matched on the error (not on
+# a model list) so the request is retried without it:
+#   Claude 5 / Opus 4.7+:    "`temperature` is deprecated for this model."
+#   OpenAI reasoning models: "Unsupported value: 'temperature' does not support 0 with this
+#                             model. Only the default (1) value is supported."
+TEMPERATURE_REJECTED = re.compile(
+    r"temperature[`'\"]? (is deprecated|does not support)", re.I)
+
+
+def warn_temperature_dropped(provider_name: str, model: str, temperature: float) -> None:
+    log.warning("%s %s rejects temperature=%s: falling back to "
+                "the provider default, recorded as temperature=None", provider_name, model,
+                temperature)
+
+
 _FENCE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.S)
 
 
@@ -127,6 +145,25 @@ def parse_json(text: str | None) -> Any:
         raise ValueError("empty reply")
     m = _FENCE.match(text)
     return json.loads(m.group(1) if m else text)
+
+
+def check_reply(text: str | None, schema: dict[str, Any]) -> tuple[dict[str, Any] | None,
+                                                                  str | None]:
+    """(data, None) for a reply that parses and validates, else (None, error)."""
+    try:
+        data = parse_json(text)
+    except ValueError as exc:
+        return None, f"unparseable reply: {exc}"
+    problems = validate(data, schema)
+    if problems:
+        return None, "schema: " + "; ".join(problems)
+    return data, None
+
+
+def schema_system(system: str, schema: dict[str, Any]) -> str:
+    """The system prompt carrying the schema, for providers without structured output."""
+    return (f"{system}\n\nReply with one JSON object only, no prose, matching this "
+            f"JSON schema:\n{json.dumps(schema, sort_keys=True)}")
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +194,9 @@ class ChatBackend:
         provider:     one of ``PROVIDERS``.
         model:        the served model name (required, no default).
         base_url / api_key: override the provider's environment variables.
-        temperature:  sampling temperature (default 0).
+        temperature:  sampling temperature (default 0; None = not sent). A model that rejects
+                      it (Claude 5: "deprecated") falls back to the provider default with a
+                      warning, recorded as ``temperature=None, temperature_dropped=True``.
         seed:         sampling seed, sent where the provider accepts one.
         max_attempts: tries per request when the reply fails parsing/validation.
         max_retries:  the SDK's own retries on 429 / 5xx / connection errors.
@@ -170,7 +209,8 @@ class ChatBackend:
     name = "llm"
 
     def __init__(self, provider_name: str, model: str, *, base_url: str | None = None,
-                 api_key: str | None = None, temperature: float = 0.0, seed: int | None = 0,
+                 api_key: str | None = None, temperature: float | None = 0.0,
+                 seed: int | None = 0,
                  max_attempts: int = 3, max_retries: int = 6, timeout: float = 120.0,
                  workers: int = 8, http_client: Any = None) -> None:
         from openai import OpenAI
@@ -188,7 +228,8 @@ class ChatBackend:
             raise RuntimeError(f"{self.provider.api_key_env} must be set to use the "
                                f"{self.provider.name} provider")
         self.base_url = base_url.rstrip("/")
-        self.temperature = float(temperature)
+        self.temperature = None if temperature is None else float(temperature)
+        self.temperature_dropped = False          # set when the model rejected it
         self.seed = seed if self.provider.seed else None
         self.max_attempts, self.workers = max_attempts, workers
         self._client = OpenAI(base_url=self.base_url, api_key=api_key or "ollama",
@@ -259,19 +300,36 @@ class ChatBackend:
     def _request(self, system: str, user: str, schema: dict[str, Any],
                  name: str) -> dict[str, Any]:
         if not self.provider.json_schema:
-            system = (f"{system}\n\nReply with one JSON object only, no prose, matching this "
-                      f"JSON schema:\n{json.dumps(schema, sort_keys=True)}")
+            system = schema_system(system, schema)
         kwargs: dict[str, Any] = {
-            "model": self.model, "temperature": self.temperature,
+            "model": self.model,
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": user}],
         }
         if self.provider.json_schema:
             kwargs["response_format"] = {"type": "json_schema", "json_schema": {
                 "name": name, "schema": schema, "strict": True}}
+        if self.temperature is not None:
+            kwargs["temperature"] = self.temperature
         if self.seed is not None:
             kwargs["seed"] = self.seed
         return kwargs
+
+    def _create(self, kwargs: dict[str, Any]) -> Any:
+        """One API call; a model that rejects ``temperature`` is retried without it, once
+        for the backend (warning, ``temperature`` becomes None in info / identity)."""
+        from openai import BadRequestError
+
+        try:
+            return self._client.chat.completions.create(**kwargs)
+        except BadRequestError as exc:
+            if "temperature" not in kwargs or not TEMPERATURE_REJECTED.search(str(exc)):
+                raise
+        if self.temperature is not None:
+            warn_temperature_dropped(self.provider.name, self.model, self.temperature)
+            self.temperature, self.temperature_dropped = None, True
+        kwargs.pop("temperature")
+        return self._client.chat.completions.create(**kwargs)
 
     def complete_json(self, system: str, user: str, schema: dict[str, Any], *,
                       name: str = "extraction") -> ChatResult:
@@ -279,7 +337,7 @@ class ChatBackend:
         kwargs = self._request(system, user, schema, name)
         result = ChatResult(None)
         for attempt in range(1, self.max_attempts + 1):
-            resp = self._client.chat.completions.create(**kwargs)
+            resp = self._create(kwargs)
             self._observe(resp.model)
             choice = resp.choices[0]
             usage = resp.usage
@@ -290,17 +348,9 @@ class ChatBackend:
                 prompt_tokens=usage.prompt_tokens if usage else None,
                 completion_tokens=usage.completion_tokens if usage else None,
                 attempts=attempt)
-            try:
-                data = parse_json(choice.message.content)
-            except ValueError as exc:
-                result.error = f"unparseable reply: {exc}"
-                continue
-            problems = validate(data, schema)
-            if problems:
-                result.error = "schema: " + "; ".join(problems)
-                continue
-            result.data, result.error = data, None
-            return result
+            result.data, result.error = check_reply(choice.message.content, schema)
+            if result.error is None:
+                return result
         return result
 
     def complete_many(self, requests: Sequence[tuple[str, str]], schema: dict[str, Any], *,
@@ -325,6 +375,8 @@ class ChatBackend:
         out = {"backend": self.name, "provider": self.provider.name, "model": self.model,
                "temperature": self.temperature, "seed": self.seed,
                "json_schema": self.provider.json_schema}
+        if self.temperature_dropped:
+            out["temperature_dropped"] = True
         if self.provider.name == "ollama":
             out["digest"] = self._served
         return out
@@ -333,5 +385,5 @@ class ChatBackend:
         self._client.close()
 
 
-__all__ = ["PROVIDERS", "ChatBackend", "ChatResult", "Provider", "parse_json", "provider",
-           "validate"]
+__all__ = ["PROVIDERS", "ChatBackend", "ChatResult", "Provider", "check_reply", "parse_json",
+           "provider", "schema_system", "validate"]

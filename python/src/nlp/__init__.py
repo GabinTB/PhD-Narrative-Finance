@@ -7,6 +7,9 @@ Two layers:
   - llm.py           Generative models behind OpenAI-compatible endpoints
                      (Ollama, OpenAI, Anthropic, Perplexity, Google, Mistral):
                      schema-validated JSON completions, served-model checks.
+  - batched_job/     The same completions through vendor batch APIs (OpenAI,
+                     Anthropic, Google, Mistral; 50% off): one BatchChatJob
+                     contract, one child per vendor, live fallback via llm.py.
   - NLP objects      Pre/post-processing on top of a backend:
       corrections.py     RAW / R1 / R2 embedding corrections.
 

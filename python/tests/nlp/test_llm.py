@@ -119,3 +119,52 @@ def test_validate_and_parse():
     assert parse_json('```json\n{"a": 1}\n```') == {"a": 1}
     with pytest.raises(ValueError):
         parse_json("no")
+
+
+def test_rejected_temperature_falls_back_to_the_provider_default(caplog):
+    import json as _json
+
+    import httpx
+
+    fake = FakeChat()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "temperature" in _json.loads(request.content):
+            return httpx.Response(400, json={"error": {
+                "type": "invalid_request_error",
+                "message": "`temperature` is deprecated for this model."}})
+        return fake.handler(request)
+
+    backend = ChatBackend("anthropic", fake.model, base_url=CHAT_URL, api_key="k",
+                          http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+                          max_retries=0, temperature=0.0)
+    assert backend.complete_json("s", "Author: 'A'", NER).data["author"] == "A"
+    assert backend.complete_json("s", "Author: 'B'", NER).data["author"] == "B"
+    assert backend.temperature is None and fake.calls == 2    # dropped once, then never sent
+    assert backend.identity()["temperature_dropped"] is True
+    assert "rejects temperature=0.0" in caplog.text
+
+
+def test_other_bad_requests_still_raise():
+    import httpx
+    from openai import BadRequestError
+
+    client = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(
+        400, json={"error": {"message": "unknown model"}})))
+    backend = ChatBackend("openai", "m", base_url=CHAT_URL, api_key="k", http_client=client,
+                          max_retries=0)
+    with pytest.raises(BadRequestError):
+        backend.complete_json("s", "u", NER)
+    assert backend.temperature == 0.0
+
+
+@pytest.mark.parametrize("message, rejected", [
+    ("`temperature` is deprecated for this model.", True),
+    ("Unsupported value: 'temperature' does not support 0 with this model. Only the default "
+     "(1) value is supported.", True),
+    ("Unsupported value: 'top_p' does not support 0.5 with this model.", False),
+    ("unknown model", False)])
+def test_temperature_rejection_messages(message, rejected):
+    from nlp.llm import TEMPERATURE_REJECTED
+
+    assert bool(TEMPERATURE_REJECTED.search(message)) is rejected
