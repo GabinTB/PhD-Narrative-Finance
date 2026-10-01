@@ -17,6 +17,10 @@ SUM_ESS, and SUM_P_00..SUM_P_40 (the day's summed predicted distribution).
 
 Each month is cached as ``{cache_dir}/{artifact id}/{thresholds}/{YYYY-MM}.parquet`` and read
 back on later runs; the datalake is only read.
+
+For the bucket-threshold study (sentiment_threshold.ipynb):
+``load_cut_counts`` counts SENT <= cut for several negative cuts in one pass per month, and
+``load_sample`` draws a deterministic uniform headline sample (per-headline SENT / CONF).
 """
 from __future__ import annotations
 
@@ -98,12 +102,9 @@ def month_daily(src: Sources, month: str, *, neg_max: float = NEG_MAX,
         con.close()
 
 
-def load_daily(src: Sources, start: date, end: date, cache_dir: Path, *,
-               neg_max: float = NEG_MAX, pos_min: float = POS_MIN, threads: int = 8,
-               verbose: bool = True) -> pl.DataFrame:
-    """(DATE, NEWS_TYPE) sums for every month overlapping [start, end], cached per month,
-    cut to [start, end]."""
-    folder = Path(cache_dir) / src.sentiment_id / f"neg{neg_max:+.4f}_pos{pos_min:+.4f}"
+def _cached_months(folder: Path, start: date, end: date, build, verbose: bool) -> pl.DataFrame:
+    """Concatenate ``{folder}/{YYYY-MM}.parquet`` for every month overlapping [start, end],
+    building a missing month with ``build(month)`` (written atomically)."""
     folder.mkdir(parents=True, exist_ok=True)
     months = pl.date_range(start.replace(day=1), end, "1mo", eager=True).dt.strftime("%Y-%m")
     frames = []
@@ -111,13 +112,111 @@ def load_daily(src: Sources, start: date, end: date, cache_dir: Path, *,
         path = folder / f"{m}.parquet"
         if not path.exists():
             if verbose:
-                print(f"aggregating {m} ...", flush=True)
+                print(f"aggregating {folder.name} {m} ...", flush=True)
             tmp = path.with_suffix(f".{os.getpid()}.tmp")
-            month_daily(src, m, neg_max=neg_max, pos_min=pos_min, threads=threads) \
-                .write_parquet(tmp)
+            build(m).write_parquet(tmp)
             tmp.replace(path)
         frames.append(pl.read_parquet(path))
-    return pl.concat(frames).filter(pl.col("DATE").is_between(start, end)).sort("DATE", "NEWS_TYPE")
+    return pl.concat(frames).filter(pl.col("DATE").is_between(start, end))
+
+
+def load_daily(src: Sources, start: date, end: date, cache_dir: Path, *,
+               neg_max: float = NEG_MAX, pos_min: float = POS_MIN, threads: int = 8,
+               verbose: bool = True) -> pl.DataFrame:
+    """(DATE, NEWS_TYPE) sums for every month overlapping [start, end], cached per month,
+    cut to [start, end]."""
+    folder = Path(cache_dir) / src.sentiment_id / f"neg{neg_max:+.4f}_pos{pos_min:+.4f}"
+    build = lambda m: month_daily(src, m, neg_max=neg_max, pos_min=pos_min, threads=threads)
+    return _cached_months(folder, start, end, build, verbose).sort("DATE", "NEWS_TYPE")
+
+
+# ---- several negative cuts in one pass (bucket-threshold study) --------------------------
+
+def neg_col(cut: float) -> str:
+    """Column of ``load_cut_counts`` counting SENT <= cut, e.g. ``N_NEG-0.3333``."""
+    return f"N_NEG{cut:+.4f}"
+
+
+def _lit(x: float) -> str:
+    return f"CAST({float(x)!r} AS DOUBLE)"
+
+
+def month_cut_counts(src: Sources, month: str, cuts: tuple[float, ...], *,
+                     rule: str = "mean", threads: int = 8) -> pl.DataFrame:
+    """One month of (DATE, NEWS_TYPE) counts: N, N_SCORED and, per cut, the headlines with
+    SENT <= cut under ``rule`` (the scoring's negative-bucket predicate, min_conf 0)."""
+    hl_file, sent_file = src.headlines_dir / f"{month}.parquet", src.sentiment_dir / f"{month}.parquet"
+    negs = ", ".join(f'count(*) FILTER (WHERE m.SENT <= {_lit(c)}) AS "{neg_col(c)}"' for c in cuts)
+    sql = f"""
+    WITH h AS (
+        SELECT RP_STORY_ID, CAST(CAST(TIMESTAMP_UTC AS TIMESTAMP) AS DATE) AS DATE, NEWS_TYPE
+        FROM read_parquet('{hl_file}')),
+    m AS ({grid_select_sql(f"read_parquet('{sent_file}')", rule)})
+    SELECT h.DATE, coalesce(h.NEWS_TYPE, '') AS NEWS_TYPE,
+           count(*) AS N, count(m.SENT) AS N_SCORED, {negs}
+    FROM h LEFT JOIN m USING (RP_STORY_ID)
+    GROUP BY ALL ORDER BY 1, 2"""
+    con = duckdb.connect()
+    try:
+        con.execute(f"SET threads={int(threads)}")
+        con.execute("SET enable_progress_bar=false")
+        return con.sql(sql).pl()
+    finally:
+        con.close()
+
+
+def load_cut_counts(src: Sources, start: date, end: date, cache_dir: Path,
+                    cuts: tuple[float, ...], *, rule: str = "mean", threads: int = 8,
+                    verbose: bool = True) -> pl.DataFrame:
+    """``month_cut_counts`` for every month overlapping [start, end], cached per month
+    (one folder per rule and cut set), cut to [start, end]."""
+    tag = "_".join(f"{c:+.4f}" for c in sorted(cuts))
+    folder = Path(cache_dir) / src.sentiment_id / f"cuts_{rule}_{tag}"
+    build = lambda m: month_cut_counts(src, m, tuple(sorted(cuts)), rule=rule, threads=threads)
+    return _cached_months(folder, start, end, build, verbose).sort("DATE", "NEWS_TYPE")
+
+
+def month_sample(src: Sources, month: str, *, rate: float = 0.01, seed: int = 0,
+                 threads: int = 8) -> pl.DataFrame:
+    """Uniform headline sample of one month: a headline is kept iff
+    hash(RP_STORY_ID, seed) mod 10^6 < rate * 10^6 (deterministic, independent of file order
+    and threads). Columns DATE, NEWS_TYPE, RP_STORY_ID, SENT, CONF (rule mean), SENT_ARGMAX,
+    CONF_ARGMAX and P_ZERO (the normalised predicted mass on the grid point s = 0); null for a
+    headline without a model output."""
+    hl_file, sent_file = src.headlines_dir / f"{month}.parquet", src.sentiment_dir / f"{month}.parquet"
+    keep = int(round(rate * 1_000_000))
+    zero = GRID_COLUMNS[len(GRID_COLUMNS) // 2]                   # P_20, s = 0
+    total = " + ".join(f"CAST({c} AS DOUBLE)" for c in GRID_COLUMNS)
+    rel = (f"(SELECT s0.* FROM read_parquet('{sent_file}') s0 "
+           f"WHERE s0.RP_STORY_ID IN (SELECT RP_STORY_ID FROM h))")
+    sql = f"""
+    WITH h AS (
+        SELECT RP_STORY_ID, CAST(CAST(TIMESTAMP_UTC AS TIMESTAMP) AS DATE) AS DATE, NEWS_TYPE
+        FROM read_parquet('{hl_file}')
+        WHERE hash(RP_STORY_ID, {int(seed)}) % 1000000 < {keep}),
+    m AS ({grid_select_sql(rel, "mean")}),
+    a AS ({grid_select_sql(rel, "argmax")}),
+    z AS (SELECT RP_STORY_ID, CAST({zero} AS DOUBLE) / ({total}) AS P_ZERO FROM {rel})
+    SELECT h.DATE, coalesce(h.NEWS_TYPE, '') AS NEWS_TYPE, h.RP_STORY_ID, m.SENT, m.CONF,
+           a.SENT AS SENT_ARGMAX, a.CONF AS CONF_ARGMAX, z.P_ZERO
+    FROM h LEFT JOIN m USING (RP_STORY_ID) LEFT JOIN a USING (RP_STORY_ID)
+    LEFT JOIN z USING (RP_STORY_ID)
+    ORDER BY 1, 2, 3"""
+    con = duckdb.connect()
+    try:
+        con.execute(f"SET threads={int(threads)}")
+        con.execute("SET enable_progress_bar=false")
+        return con.sql(sql).pl()
+    finally:
+        con.close()
+
+
+def load_sample(src: Sources, start: date, end: date, cache_dir: Path, *, rate: float = 0.01,
+                seed: int = 0, threads: int = 8, verbose: bool = True) -> pl.DataFrame:
+    """``month_sample`` for every month overlapping [start, end], cached per month."""
+    folder = Path(cache_dir) / src.sentiment_id / f"sample_r{rate:.4f}_s{int(seed)}"
+    build = lambda m: month_sample(src, m, rate=rate, seed=seed, threads=threads)
+    return _cached_months(folder, start, end, build, verbose).sort("DATE", "NEWS_TYPE")
 
 
 def summarise(sums: pl.DataFrame, by: list[str]) -> pl.DataFrame:
