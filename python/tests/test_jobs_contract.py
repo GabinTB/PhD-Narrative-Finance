@@ -338,8 +338,6 @@ def case_rp_headlines(root: Path, freq: str) -> Env:
 
 def case_ciq_keydev(root: Path, freq: str) -> Env:
     """Capital IQ Key Developments (monthly by construction, like rp_headlines)."""
-    import pandas as pd
-
     from tests.wrds_client.capitaliq.fakes import FakeWRDS, make_events
     from tests.wrds_client.capitaliq.test_keydev import T0, Clock
     from wrds_client.capitaliq.keydev import KeyDevJob
@@ -347,12 +345,11 @@ def case_ciq_keydev(root: Path, freq: str) -> Env:
     wrds = FakeWRDS(*make_events(START, END))
     index = DatalakeIndex(root / "lake")
 
-    def mutate() -> None:                          # July events arrive; one May event is edited
-        links, events = make_events(date(2008, 7, 1), date(2008, 7, 31), first_id=5000)
-        wrds.links = pd.concat([wrds.links, links], ignore_index=True)
-        wrds.events = pd.concat([wrds.events, events], ignore_index=True)
-        may = wrds.events["announceddate"].dt.month == 5
-        wrds.events.loc[may.idxmax(), "situation"] = "Revised paragraph."
+    def mutate() -> None:                    # July events enter CIQ; one May event is edited
+        at = datetime(2026, 1, 3, 8, 0)
+        may = wrds.events.loc[wrds.events["announceddate"].dt.month == 5, "keydevid"]
+        wrds.revise(int(may.iloc[0]), at, situation="Revised paragraph.")
+        wrds.add(*make_events(date(2008, 7, 1), date(2008, 7, 31), first_id=5000), at=at)
 
     return Env(index,
                lambda: KeyDevJob.new(Layout("M", START, END), temp=True, source=wrds.source(),
@@ -360,9 +357,8 @@ def case_ciq_keydev(root: Path, freq: str) -> Env:
                lambda runner, aid: runner.resume(aid, source=wrds.source()), _frames,
                mutate=mutate,
                update_job=lambda aid: KeyDevJob.for_update(
-                   index.get(aid), index, source=wrds.source(), end=date(2008, 7, 31),
+                   index.get(aid), index, source=wrds.source(),
                    clock=Clock(T0 + timedelta(days=1))))
-
 
 CASES: dict[str, Callable[[Path, str], Env]] = {
     "ravenpack_headlines": case_ravenpack_headlines,
