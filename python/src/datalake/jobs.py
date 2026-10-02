@@ -6,7 +6,9 @@ A ``Job`` declares WHAT it computes; ``JobRunner`` owns HOW it runs:
     group                                  optional folder group of NEW artifacts
                                            ({layer}/{group}/{kind}/{id}); siblings
                                            opened in ``session`` follow it
-    params()                               the artifact's hyperparams (its identity)
+    layer                                  optional layer of NEW artifacts (default: the
+                                           index's layer for the kind, i.e. derived)
+    params()                             the artifact's hyperparams (its identity)
     sources() / model_card() / backends()  lineage, model provenance, live model checks
     units()                                ordered work units (the partitions of its range)
     is_done(unit, out_dir)                 skip test (resume, idempotence)
@@ -118,6 +120,7 @@ class Job(ABC):
     pipeline_version: ClassVar[str]
     hash_pattern: ClassVar[str] = "*.parquet"
     group: ClassVar[str | None] = None
+    layer: ClassVar[str | None] = None       # None: the index default for the kind
     temp: bool = False
 
     @property
@@ -543,7 +546,8 @@ class JobRunner:
                           hyperparams=hyperparams if hyperparams is not None else job.params(),
                           sources=job.sources(),
                           model_card=job.model_card(), verifier=job.verifier,
-                          repo_dir=self.repo_dir, notes=notes, hash_pattern=job.hash_pattern)
+                          repo_dir=self.repo_dir, notes=notes, hash_pattern=job.hash_pattern,
+                          layer=job.layer)
         artifact_id: str | None = resume or extend
         previous = self._install_signals()
         try:
