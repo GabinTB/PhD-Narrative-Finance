@@ -23,7 +23,8 @@ Processing per month:
     1. Stream-read the CSV in chunks (raw_chunk_rows at a time) to bound RAM.
     2. Dedup to one row per RP_STORY_ID: entity-level columns collapse to
        aligned lists (RP_ENTITY_ID, ENTITY_TYPE, ENTITY_NAME,
-       EVENT_SENTIMENT_SCORE); scalar columns keep first-occurrence values.
+       EVENT_SENTIMENT_SCORE, RELEVANCE); scalar columns keep first-occurrence
+       values.
     3. Write with zstd compression, atomically (tmp + rename).
 
 Resumable: existing output files are skipped unless overwrite=True.
@@ -236,14 +237,21 @@ def _to_arrow_table(df: pd.DataFrame) -> pa.Table:
     for col in ENTITY_LIST_COLS:
         inner_type = RAW_SCHEMA[col]
         list_type = pa.list_(inner_type)
+        # pandas reads integer columns (RELEVANCE) as float; Arrow refuses floats
+        # for an integer type, so whole values are converted explicitly.
+        as_int = pa.types.is_integer(inner_type)
 
-        def _cast_row(row: object) -> list:
+        def _cast_row(row: object, as_int: bool = as_int) -> list:
             if not isinstance(row, list):
                 return []
             result = []
             for v in row:
                 if v is None or (isinstance(v, float) and pd.isna(v)):
                     result.append(None)
+                elif as_int:
+                    if float(v) != int(v):
+                        raise ValueError(f"{col}: non-integer value {v!r}")
+                    result.append(int(v))
                 else:
                     result.append(v)
             return result
@@ -421,7 +429,8 @@ def ingest_range(
 # The Job (datalake.jobs) and the datalake-aware entry point
 # ---------------------------------------------------------------------------
 
-PIPELINE_VERSION = "v0.2.0"   # v0.2.0: partition layout (partition_freq/start/end) in the id
+PIPELINE_VERSION = "v0.3.0"   # v0.3.0: RELEVANCE + RP_SOURCE_ID columns (enrich.py adds
+                              # them to an earlier artifact); v0.2.0: partition layout in the id
 RAW_SUBDIR = ("RavenPack", "headlines_edge_v1.0")
 
 

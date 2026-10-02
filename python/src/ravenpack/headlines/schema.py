@@ -18,10 +18,16 @@ Three layers:
 
 Column-level notes
 ------------------
-- RP_ENTITY_ID / ENTITY_TYPE / ENTITY_NAME / COUNTRY_CODE / EVENT_SENTIMENT_SCORE
+- RP_ENTITY_ID / ENTITY_TYPE / ENTITY_NAME / EVENT_SENTIMENT_SCORE / RELEVANCE
   are entity-event level in the raw CSV (one row per detection).  After
   deduplication these become aligned lists -- index i in each list refers to
-  the same entity detection.  Never aggregate or reorder them independently.
+  the same entity detection, in raw file order.  Never aggregate or reorder
+  them independently.  An entity detected in several events of one story
+  appears several times: anything counting entities per story must first
+  collapse to (story, entity), e.g. RELEVANCE = max.
+
+- RELEVANCE is the vendor's entity relevance (0-100, integer); it is constant
+  across a story's rows for one entity (checked on 2003-06 and 2014-06).
 
 - EVENT_SENTIMENT_SCORE is kept as a list for losslessness.  Downstream code
   that needs a scalar story-level score should collapse explicitly (mean, max,
@@ -30,7 +36,8 @@ Column-level notes
 - COUNTRY_CODE is kept as a scalar (first-occurrence value) because it refers
   to the story's primary market geography, not to each entity separately.
 
-- NEWS_TYPE and SOURCE_NAME are story-level in the raw; kept as scalars.
+- NEWS_TYPE, SOURCE_NAME and RP_SOURCE_ID are story-level in the raw; kept as
+  scalars.
 """
 from __future__ import annotations
 
@@ -64,8 +71,10 @@ RAW_SCHEMA: dict[str, pa.DataType] = {
     "COUNTRY_CODE":           pa.string(),
     "NEWS_TYPE":              pa.string(),
     "SOURCE_NAME":            pa.string(),
+    "RP_SOURCE_ID":           pa.string(),
     "HEADLINE":               pa.string(),
     "EVENT_SENTIMENT_SCORE":  pa.float32(),
+    "RELEVANCE":              pa.uint8(),
 }
 
 # Derived helpers -- use these instead of hardcoding column names elsewhere.
@@ -78,6 +87,7 @@ ENTITY_LIST_COLS: list[str] = [
     "ENTITY_TYPE",
     "ENTITY_NAME",
     "EVENT_SENTIMENT_SCORE",
+    "RELEVANCE",
 ]
 
 # Columns handled explicitly at the top of STRUCTURED_SCHEMA (not repeated
@@ -115,6 +125,7 @@ _PA_TO_PL: dict[pa.DataType, pl.DataType] = {
     pa.string():  pl.String,
     pa.float32(): pl.Float32,
     pa.float64(): pl.Float64,
+    pa.uint8():   pl.UInt8,
     pa.int32():   pl.Int32,
     pa.int64():   pl.Int64,
     pa.bool_():   pl.Boolean,

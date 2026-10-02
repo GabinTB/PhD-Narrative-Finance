@@ -68,8 +68,11 @@ BLOCK_BYTES = 64 << 20                                           # CSV bytes per
 
 
 def raw_month_batches(raw_dir: Path, year: int, month: int,
-                      block_bytes: int = BLOCK_BYTES) -> Iterator[pa.RecordBatch]:
-    """Stream the four needed columns of one raw month CSV, straight out of the zip."""
+                      block_bytes: int = BLOCK_BYTES,
+                      fields: dict[str, pa.DataType] | None = None) -> Iterator[pa.RecordBatch]:
+    """Stream ``fields`` (default: the four sentiment columns) of one raw month CSV,
+    straight out of the zip, in file order."""
+    fields = RAW_FIELDS if fields is None else fields
     zip_path = Path(raw_dir) / ZIP_NAME.format(year=year)
     if not zip_path.exists():
         raise FileNotFoundError(f"raw zip missing: {zip_path}")
@@ -80,8 +83,8 @@ def raw_month_batches(raw_dir: Path, year: int, month: int,
         with zf.open(member) as fh:
             reader = pacsv.open_csv(
                 fh, read_options=pacsv.ReadOptions(block_size=block_bytes),
-                convert_options=pacsv.ConvertOptions(include_columns=list(RAW_FIELDS),
-                                                     column_types=RAW_FIELDS))
+                convert_options=pacsv.ConvertOptions(include_columns=list(fields),
+                                                     column_types=fields))
             yield from reader
 
 

@@ -54,8 +54,10 @@ def _make_raw_df(**overrides) -> pd.DataFrame:
         "COUNTRY_CODE":          ["US", "US"],
         "NEWS_TYPE":             ["FULL-ARTICLE", "FULL-ARTICLE"],
         "SOURCE_NAME":           ["Reuters", "Reuters"],
+        "RP_SOURCE_ID":          ["SRC1", "SRC1"],
         "HEADLINE":              ["Acme raises rates", "Acme raises rates"],
         "EVENT_SENTIMENT_SCORE": [0.5, -0.3],
+        "RELEVANCE":             [100, 50],
     }
     base.update(overrides)
     return pd.DataFrame(base)
@@ -73,8 +75,10 @@ def _make_two_story_df() -> pd.DataFrame:
         "COUNTRY_CODE":          ["US", "US", "GB", "GB"],
         "NEWS_TYPE":             ["FULL-ARTICLE"] * 4,
         "SOURCE_NAME":           ["Reuters"] * 4,
+        "RP_SOURCE_ID":          ["SRCA"] * 2 + ["SRCB"] * 2,
         "HEADLINE":              ["Headline A"] * 2 + ["Headline B"] * 2,
         "EVENT_SENTIMENT_SCORE": [0.5, -0.3, 0.1, 0.2],
+        "RELEVANCE":             [100, 20, 90, 75],
     })
 
 
@@ -151,6 +155,12 @@ class TestDedupStories:
         row = out.iloc[0]
         assert len(row["RP_ENTITY_ID"]) == len(row["ENTITY_TYPE"])
         assert len(row["RP_ENTITY_ID"]) == len(row["EVENT_SENTIMENT_SCORE"])
+
+    def test_relevance_is_an_aligned_integer_list(self):
+        table = _to_arrow_table(_dedup_stories(_make_two_story_df()))
+        assert table.schema.field("RELEVANCE").type == pa.list_(pa.uint8())
+        assert table.column("RELEVANCE").to_pylist() == [[100, 20], [90, 75]]
+        assert table.column("RP_SOURCE_ID").to_pylist() == ["SRCA", "SRCB"]
 
     def test_scalar_cols_keep_first_occurrence(self):
         # Two detections: same COUNTRY_CODE (they always are for same story).
@@ -515,7 +525,8 @@ def _month_df(year: int, month: int, n: int = 6) -> pd.DataFrame:
                          "RP_ENTITY_ID": f"E{e}", "ENTITY_TYPE": "COMP",
                          "ENTITY_NAME": f"N{e}", "COUNTRY_CODE": "US",
                          "NEWS_TYPE": "FULL-ARTICLE", "SOURCE_NAME": "Reuters",
-                         "HEADLINE": f"H{i}", "EVENT_SENTIMENT_SCORE": 0.1 * e})
+                         "RP_SOURCE_ID": "SRC", "HEADLINE": f"H{i}",
+                         "EVENT_SENTIMENT_SCORE": 0.1 * e, "RELEVANCE": 100 if e == 1 else 40})
     return pd.DataFrame(rows)
 
 
