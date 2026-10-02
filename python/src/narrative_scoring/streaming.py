@@ -40,6 +40,7 @@ from typing import Any, Iterator, Protocol
 
 import duckdb
 import numpy as np
+import polars as pl
 import pyarrow as pa
 
 from datalake.layout import Layout
@@ -190,6 +191,115 @@ class ParquetHeadlineSource:
             raise FileNotFoundError(f"{day}: sentiment partition file missing: {path} "
                                     f"({self.sentiment.describe()})")
         return path
+
+
+ID_COL = "RP_STORY_ID"
+
+
+def day_expr(dtype: pl.DataType) -> pl.Expr:
+    """The calendar day of TIMESTAMP_UTC, stored as an ISO string (the ingest) or a
+    datetime; the string form compares exactly as the day query's string bounds do."""
+    ts = pl.col("TIMESTAMP_UTC")
+    if dtype == pl.String:
+        return ts.str.slice(0, 10).str.to_date("%Y-%m-%d")
+    return ts.dt.date()
+
+
+@dataclass
+class PartitionHeadlineSource:
+    """Headlines + embeddings read ONCE per storage partition, served day by day.
+
+    ``ParquetHeadlineSource`` joins a day's headlines against the whole partition's
+    embeddings file for every day (2022-03: a 4.76 GB file read 31 times). Here a
+    partition's needed columns are read once and joined once on RP_STORY_ID, with
+    strict coverage: every headline has exactly one embedding row and every embedding
+    row a headline (a mismatch raises, naming the partition). The rows are sorted by
+    (day, RP_STORY_ID), the day query's order, and kept with the embeddings in float16
+    until a day of another partition is asked for; a day is then a contiguous slice,
+    converted to float32 (exactly) chunk by chunk. Same rows, same order, same float32
+    values as ``ParquetHeadlineSource``, hence the same scores and null draws.
+
+    One partition is held at a time (2022-03: ~9.5M rows x 384 x 2 B = 7.3 GB); the
+    pipeline's ``prefetch`` thread loads the next one while the last chunks of the
+    previous are scored.
+    """
+
+    headlines_dir: Path
+    embeddings_dir: Path
+    chunk_size: int = 8_192
+    source_id: str = ""
+    layout: Layout = field(default_factory=Layout)
+    _path: Path | None = field(default=None, init=False, repr=False)
+    _emb: np.ndarray | None = field(default=None, init=False, repr=False)
+    _days: dict[date, tuple[int, int]] = field(default_factory=dict, init=False, repr=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.headlines_dir = Path(self.headlines_dir)
+        self.embeddings_dir = Path(self.embeddings_dir)
+        if self.chunk_size < 1:
+            raise ValueError("chunk_size must be >= 1")
+
+    def describe(self) -> str:
+        return self.source_id or f"partition:{self.headlines_dir.name}+{self.embeddings_dir.name}"
+
+    def has_day(self, day: date) -> bool:
+        return (self.layout.file_for(self.headlines_dir, day).exists()
+                and self.layout.file_for(self.embeddings_dir, day).exists())
+
+    def _load(self, day: date) -> bool:
+        """Hold the partition of ``day`` (reading it if another one is held). False when
+        the partition does not exist."""
+        hl_path = self.layout.file_for(self.headlines_dir, day)
+        if hl_path == self._path:
+            return True
+        self._path, self._emb, self._days = None, None, {}       # release before reading
+        if not self.has_day(day):
+            return False
+        em_path = self.layout.file_for(self.embeddings_dir, day)
+        hl = pl.read_parquet(hl_path, columns=[ID_COL, "TIMESTAMP_UTC"])
+        em = pl.read_parquet(em_path, columns=[ID_COL, "EMBEDDING"])
+        name = hl_path.name
+        for what, frame in (("headlines", hl), ("embeddings", em)):
+            if frame[ID_COL].is_duplicated().any():
+                raise ValueError(f"{name}: duplicate {ID_COL} in the {what} partition")
+        joined = hl.select(ID_COL, day_expr(hl.schema["TIMESTAMP_UTC"]).alias("_day")).join(
+            em, on=ID_COL, how="inner")
+        if joined.height != hl.height or joined.height != em.height:
+            raise ValueError(f"{name}: {hl.height} headlines, {em.height} embeddings, "
+                             f"{joined.height} matched (strict coverage)")
+        if joined["EMBEDDING"].null_count():
+            raise ValueError(f"{name}: {joined['EMBEDDING'].null_count()} null embedding(s)")
+        joined = joined.sort(["_day", ID_COL])
+        bounds = (joined.with_row_index("_i").group_by("_day")
+                  .agg(pl.col("_i").min().alias("lo"), pl.col("_i").max().alias("hi")))
+        self._days = {d: (int(lo), int(hi) + 1) for d, lo, hi in bounds.iter_rows()}
+        self._emb = joined["EMBEDDING"].to_numpy()
+        if self._emb.shape != (joined.height, EMBEDDING_DIM):
+            raise ValueError(f"{name}: embeddings of shape {self._emb.shape}")
+        self._path = hl_path
+        log.info("partition %s: %d headlines over %d day(s) held", name, joined.height,
+                 len(self._days))
+        return True
+
+    def day_total(self, day: date) -> int:
+        with self._lock:
+            if not self._load(day):
+                return 0
+            lo, hi = self._days.get(day, (0, 0))
+            return hi - lo
+
+    def iter_day(self, day: date) -> Iterator[Chunk]:
+        with self._lock:
+            if not self._load(day) or day not in self._days:
+                return
+            lo, hi = self._days[day]
+            emb = self._emb
+        for i in range(lo, hi, self.chunk_size):
+            block = emb[i:min(i + self.chunk_size, hi)]
+            if not np.isfinite(block).all():
+                raise ValueError(f"{day}: non-finite embedding value(s)")
+            yield Chunk(np.ascontiguousarray(block, dtype=np.float32))
 
 
 def arrow_embeddings_to_numpy(column: pa.Array) -> np.ndarray:

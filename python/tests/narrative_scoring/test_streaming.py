@@ -225,3 +225,69 @@ def test_prefetch_preserves_order_and_propagates_errors():
 
 def test_rss_is_reported():
     assert rss_gb() > 0.0
+
+
+# ---------------------------------------------------------------------------
+# PartitionHeadlineSource: one read per partition, the same chunks as the day query
+# ---------------------------------------------------------------------------
+
+def _partition_source(src: ParquetHeadlineSource, chunk_size: int = 16):
+    from narrative_scoring.streaming import PartitionHeadlineSource
+
+    return PartitionHeadlineSource(src.headlines_dir, src.embeddings_dir, chunk_size=chunk_size)
+
+
+@pytest.mark.parametrize("chunk_size", [1, 7, 16, 1000])
+def test_partition_source_yields_the_day_query_chunks(month, chunk_size):
+    days, sql = month
+    sql.chunk_size = chunk_size
+    part = _partition_source(sql, chunk_size)
+    for d in (date(2008, 9, 15), date(2008, 9, 16), date(2008, 9, 17), date(2008, 10, 1)):
+        want = [c.embeddings for c in sql.iter_day(d)]
+        got = [c.embeddings for c in part.iter_day(d)]
+        assert len(got) == len(want)
+        for g, w in zip(got, want):
+            assert g.dtype == np.float32 and g.flags.c_contiguous
+            np.testing.assert_array_equal(g, w)                    # bit for bit
+        assert part.day_total(d) == sql.day_total(d)
+
+
+def test_partition_source_reads_a_partition_once(month, monkeypatch):
+    _, sql = month
+    part = _partition_source(sql)
+    reads = []
+    real = pl.read_parquet
+    monkeypatch.setattr(pl, "read_parquet", lambda *a, **k: reads.append(a[0]) or real(*a, **k))
+    for d in (date(2008, 9, 15), date(2008, 9, 16), date(2008, 9, 15)):
+        list(part.iter_day(d))
+        part.day_total(d)
+    assert len(reads) == 2                                        # headlines + embeddings
+
+
+def _rewrite(path: Path, fn) -> None:
+    fn(pl.read_parquet(path)).write_parquet(path)
+
+
+@pytest.mark.parametrize("what", ["missing", "extra", "duplicate"])
+def test_partition_source_strict_coverage(month, what):
+    _, sql = month
+    name = _file(date(2008, 9, 15))
+    if what == "missing":
+        _rewrite(sql.embeddings_dir / name, lambda df: df.slice(1))
+    elif what == "extra":
+        _rewrite(sql.headlines_dir / name, lambda df: df.slice(1))
+    else:
+        _rewrite(sql.embeddings_dir / name, lambda df: pl.concat([df, df.slice(0, 1)]))
+    with pytest.raises(ValueError, match="strict coverage|duplicate"):
+        list(_partition_source(sql).iter_day(date(2008, 9, 15)))
+
+
+def test_partition_source_accepts_datetime_timestamps(month):
+    _, sql = month
+    want = [c.embeddings for c in sql.iter_day(date(2008, 9, 16))]
+    _rewrite(sql.headlines_dir / _file(date(2008, 9, 16)),
+             lambda df: df.with_columns(pl.col("TIMESTAMP_UTC").str.to_datetime()))
+    got = [c.embeddings for c in _partition_source(sql).iter_day(date(2008, 9, 16))]
+    assert len(got) == len(want)
+    for g, w in zip(got, want):
+        np.testing.assert_array_equal(g, w)

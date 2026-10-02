@@ -83,6 +83,7 @@ from narrative_scoring.sentiment_filter import VENDOR_COLUMN, SentimentBucket
 from narrative_scoring.streaming import (
     HeadlineSource,
     ParquetHeadlineSource,
+    PartitionHeadlineSource,
 )
 from narrative_scoring.tau_asof import (
     CALIBRATION_DELAY_DEFAULT,
@@ -398,10 +399,11 @@ def load_tau_series(art: Artifact | None) -> pl.DataFrame:
 def headline_source(upstream: DatalakeIndex, chunk_size: int = 8_192, threads: int = 8,
                     sentiment: Artifact | None = None, config: ScoringConfig | None = None, *,
                     headlines: Artifact | None = None,
-                    embeddings: Artifact | None = None) -> ParquetHeadlineSource:
-    """Headlines + embeddings (the latest, or the given ones); with ``sentiment`` (a
-    ``headline_sentiment`` artifact) and a filtered ``config``, only the headlines of
-    ``config.sentiment``'s bucket are read."""
+                    embeddings: Artifact | None = None) -> HeadlineSource:
+    """Headlines + embeddings (the latest, or the given ones), each partition read once
+    (``PartitionHeadlineSource``); with ``sentiment`` (a ``headline_sentiment`` artifact)
+    and a filtered ``config``, only the headlines of ``config.sentiment``'s bucket are read
+    (``ParquetHeadlineSource``'s per-day query)."""
     hl = headlines or upstream.latest(KIND_HEADLINES)
     em = embeddings or upstream.latest(KIND_EMBEDDINGS)
     layout = shared_layout(hl, em, *([sentiment] if sentiment is not None else []))
@@ -411,9 +413,11 @@ def headline_source(upstream: DatalakeIndex, chunk_size: int = 8_192, threads: i
             raise ValueError("a sentiment artifact needs a config with a sentiment filter")
         check_sentiment(sentiment, headlines_id=hl.artifact_id, config=config)
         bucket = SentimentBucket(config, sentiment.path, sentiment.artifact_id)
-    return ParquetHeadlineSource(hl.path, em.path, chunk_size=chunk_size, threads=threads,
-                                 source_id=f"{hl.artifact_id}+{em.artifact_id}",
-                                 sentiment=bucket, layout=layout)
+        return ParquetHeadlineSource(hl.path, em.path, chunk_size=chunk_size, threads=threads,
+                                     source_id=f"{hl.artifact_id}+{em.artifact_id}",
+                                     sentiment=bucket, layout=layout)
+    return PartitionHeadlineSource(hl.path, em.path, chunk_size=chunk_size,
+                                   source_id=f"{hl.artifact_id}+{em.artifact_id}", layout=layout)
 
 
 def shared_layout(*artifacts: Artifact) -> Layout:
