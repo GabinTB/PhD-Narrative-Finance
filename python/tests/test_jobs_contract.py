@@ -315,6 +315,27 @@ def case_cb_speech_ner(root: Path, freq: str) -> Env:
                switch_model=switch, mutate=mutate, update_job=update_job)
 
 
+def case_rp_headlines(root: Path, freq: str) -> Env:
+    """RavenPack Annotations (monthly by construction: the raw is one CSV per month,
+    so every ``freq`` runs the monthly layout)."""
+    from ravenpack.annotations.ingest import RPA1IngestJob
+    from tests.ravenpack.annotations.test_ingest import raw_month, write_zip
+
+    raw = root / "raw"
+    if not raw.exists():
+        for m in range(START.month, END.month + 1):
+            write_zip(raw, 2008, m, raw_month(2008, m, n_stories=6))
+    index = DatalakeIndex(root / "lake")
+
+    def mutate() -> None:                          # the vendor delivers the next month
+        write_zip(raw, 2008, END.month + 1, raw_month(2008, END.month + 1, n_stories=6))
+
+    return Env(index, lambda: RPA1IngestJob(raw, Layout("M", START, END), temp=True),
+               lambda runner, aid: runner.resume(aid, raw_dir=raw), _frames, mutate=mutate,
+               update_job=lambda aid: RPA1IngestJob.for_update(index.get(aid), index,
+                                                               raw_dir=raw))
+
+
 CASES: dict[str, Callable[[Path, str], Env]] = {
     "ravenpack_headlines": case_ravenpack_headlines,
     "headline_sentiment": case_headline_sentiment,
@@ -323,9 +344,10 @@ CASES: dict[str, Callable[[Path, str], Env]] = {
     "narrative_daily": case_narrative_daily,
     "cb_speeches": case_cb_speeches,
     "cb_speech_ner": case_cb_speech_ner,
+    "rp_headlines": case_rp_headlines,
 }
 WITH_MODEL = [k for k in CASES if k in ("headline_embeddings", "cb_speech_ner")]
-UPDATABLE = ["cb_speeches", "cb_speech_ner"]
+UPDATABLE = ["cb_speeches", "cb_speech_ner", "rp_headlines"]
 
 
 def test_every_registered_job_has_a_case():

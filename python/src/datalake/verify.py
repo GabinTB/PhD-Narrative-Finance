@@ -20,7 +20,7 @@ from importlib.metadata import entry_points
 
 from datalake.artifact import Artifact
 from datalake.index import DatalakeIndex
-from datalake.meta import META_FILENAME, hash_file, read_meta
+from datalake.meta import JOB_CONTROL_FILES, META_FILENAME, hash_file, read_meta
 
 log = logging.getLogger(__name__)
 
@@ -161,7 +161,7 @@ def verify_hashes(
 
         on_disk = {
             p.name for p in artifact.path.iterdir()
-            if p.is_file() and p.name not in {META_FILENAME, "README.md"}
+            if p.is_file() and p.name not in {META_FILENAME, "README.md", *JOB_CONTROL_FILES}
             and not p.name.endswith(".tmp")
         }
         unrecorded = on_disk - set(recorded)
