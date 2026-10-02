@@ -4,26 +4,18 @@
 transcription of the selection and aggregation rules; the vectorised numpy
 path and the compiled kernel are asserted against them in the test suite.
 ``attention`` is the downstream Sadka-style measure, derived here and never
-stored by the scorer; ``sum_sentiment_runs`` adds the four sentiment-bucket runs of
-one setup back into the all-headlines panel, without rescoring; ``merge_poles`` adds the
-two pole rows of every bipolar pair into one narrative row (exact on a mask_bipolar run).
+stored by the scorer; ``sum_tags`` adds the sentiment labels of one run into its
+all-tagged-headlines panel, without rescoring; ``merge_poles`` adds the two pole rows of
+every bipolar pair into one narrative row (exact on a mask_bipolar run).
 """
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import numpy as np
 import polars as pl
 
-from narrative_scoring.config import (
-    SENTIMENT_ALL,
-    SENTIMENT_BUCKETS,
-    AggRule,
-    ScoringConfig,
-)
+from narrative_scoring.config import SENTIMENT_ALL, AggRule
 
 
 def reference_select(
@@ -77,122 +69,56 @@ def reference_day(N: np.ndarray) -> dict[str, np.ndarray]:
     return stats
 
 
-@dataclass
-class SentimentRun:
-    """One sentiment-bucket run, as ``sum_sentiment_runs`` needs it: its rows and the
-    identity of what produced them (from its run metadata)."""
-
-    frame: pl.DataFrame               # narrative_daily (or primitive_daily) rows
-    config: ScoringConfig
-    sentiment_artifact_id: str | None
-    tau_asof_id: str | None
-    mu_asof_id: str | None
-    name: str = ""
-
-    @classmethod
-    def from_result(cls, result: Any, *, primitive: bool = False) -> SentimentRun:
-        """From a ``pipeline.ScoringResult`` (its ``metadata`` must be set)."""
-        m = result.metadata
-        frame = result.primitive_daily if primitive else result.narrative_daily
-        return cls(frame, ScoringConfig.from_dict(m.config), m.sentiment_artifact_id,
-                   m.tau_source_id, m.mu_asof_id, name=str(m.config.get("sentiment")))
-
-    @classmethod
-    def from_artifact(cls, artifact: Any, *, primitive: bool = False) -> SentimentRun:
-        """From a narrative_daily artifact: its partition files (or primitive_daily/) and
-        its ``run_metadata.json``."""
-        path = Path(artifact.path)
-        m = json.loads((path / "run_metadata.json").read_text())
-        files = sorted((path / "primitive_daily" if primitive else path).glob("*.parquet"))
-        frame = pl.concat([pl.read_parquet(f) for f in files]) if files else pl.DataFrame()
-        return cls(frame, ScoringConfig.from_dict(m["config"]), m.get("sentiment_artifact_id"),
-                   m.get("tau_source_id"), m.get("mu_asof_id"), name=artifact.artifact_id)
-
-
-def check_sentiment_runs(runs: Sequence[SentimentRun]) -> None:
-    """Raise unless ``runs`` are the four buckets of ONE setup: each bucket exactly once,
-    the same sentiment artifact / source / rule / thresholds, the same config apart from
-    the bucket, and the same tau_asof and mu_asof. (A FinBERT negative run and a RavenBERT
-    positive run must not add up silently.)"""
-    buckets = [r.config.sentiment for r in runs]
-    if sorted(b.value for b in buckets) != sorted(b.value for b in SENTIMENT_BUCKETS):
-        raise ValueError(f"need each of {[b.value for b in SENTIMENT_BUCKETS]} exactly once, "
-                         f"got {[b.value for b in buckets]}")
-
-    def same(what: str, values: list[Any]) -> None:
-        if len({json.dumps(v, sort_keys=True, default=str) for v in values}) != 1:
-            raise ValueError(f"the runs differ in {what}: "
-                             + ", ".join(f"{r.name or r.config.sentiment.value}={v!r}"
-                                         for r, v in zip(runs, values)))
-
-    same("sentiment artifact", [r.sentiment_artifact_id for r in runs])
-    same("mask_bipolar", [r.config.mask_bipolar for r in runs])
-    for field_name in ("sentiment_source", "sentiment_rule", "neg_max", "pos_min", "min_conf"):
-        same(field_name, [getattr(r.config, field_name) for r in runs])
-    same("config (bucket removed)", [r.config.digest_without_filter() for r in runs])
-    same("tau_asof", [r.tau_asof_id for r in runs])
-    same("mu_asof", [r.mu_asof_id for r in runs])
-    days = [frozenset(r.frame["DATE"].unique().to_list()) for r in runs]
-    if len(set(days)) != 1:
-        raise ValueError("the runs cover different day sets: "
-                         + ", ".join(f"{r.config.sentiment.value}: {len(d)} day(s)"
-                                     for r, d in zip(runs, days)))
-    totals = (pl.concat([r.frame.select("DATE", "N_HEADLINES").unique()
-                         .with_columns(pl.lit(i).alias("_run")) for i, r in enumerate(runs)])
-              .group_by("DATE").agg(pl.col("N_HEADLINES").n_unique().alias("n"),
-                                    pl.col("N_HEADLINES").unique().alias("values")))
-    bad = totals.filter(pl.col("n") > 1)
-    if bad.height:
-        raise ValueError(f"N_HEADLINES differs across the runs on {bad.height} day(s), e.g. "
-                         f"{bad.sort('DATE').head(3).to_dicts()}")
-
-
-def sum_sentiment_runs(runs: Sequence[SentimentRun]) -> pl.DataFrame:
-    """The all-headlines panel rebuilt from its four sentiment-bucket runs. Pure; never
-    rescores. ``check_sentiment_runs`` first; then an OUTER combination on the key columns
-    (DATE, node): a row missing from a run, or with null statistics, counts as SUPPORT 0,
-    TOTAL 0. Per key, with n_i = SUPPORT_i, T_i = TOTAL_SCORE_i and
-    Q_i = n_i (STD_i^2 + INTENSITY_i^2) (recovered from the stored ddof=0 statistics)::
+def sum_tags(frame: pl.DataFrame, diagnostics: pl.DataFrame | None = None) -> pl.DataFrame:
+    """One run's sentiment labels added into one panel (SENTIMENT = "all"). Pure; never
+    rescores. ``frame`` holds the narrative_daily (or primitive_daily) rows of ONE run, every
+    label of a day sharing N_HEADLINES (checked). Per key (DATE, node), with n_i = SUPPORT_i,
+    T_i = TOTAL_SCORE_i and Q_i = n_i (STD_i^2 + INTENSITY_i^2) (the stored ddof=0
+    statistics)::
 
         SUPPORT     = sum n_i
         TOTAL_SCORE = sum T_i
         INTENSITY   = sum T_i / sum n_i
         STD_SCORE   = sqrt((sum Q_i - (sum T_i)^2 / sum n_i) / sum n_i)      (ddof=0)
         PEAK        = max PEAK_i
-        N_LABELLED  = sum over runs of the run's headlines that day (a per-day count, taken
-                      from any of the run's rows that day, so a missing row loses nothing)
-        N_HEADLINES = the day's total (checked equal across runs)
+        N_LABELLED  = sum over labels of the label's headlines that day
+        N_HEADLINES = the day's total (every label and untagged)
 
-    The result carries SENTIMENT = "all". It is NOT compared against the all-headlines
-    run: a headline's float32 scores depend slightly (~1e-7) on the rows batched with it,
-    so a score at the tau / top-k boundary can be retained in one run and not in the
-    other (accepted drift, owner decision). Exact equality holds on the toy lakes of the
-    test suite, where it is asserted.
-    """
-    runs = list(runs)
-    check_sentiment_runs(runs)
-    frames = [r.frame for r in runs]
-    cols = frames[0].columns
+    The labels are disjoint, so the result is the panel of the TAGGED headlines: it equals
+    an untagged run's exactly when no headline was untagged. With ``diagnostics`` (the
+    run's day_diagnostics) the check N_LABELLED + N_UNTAGGED = N_HEADLINES is enforced, so
+    the gap is always explicit."""
+    if frame.is_empty():
+        return frame
+    cols = frame.columns
+    heads = frame.group_by("DATE").agg(pl.col("N_HEADLINES").n_unique().alias("n"))
+    if (heads["n"] > 1).any():
+        raise ValueError("N_HEADLINES differs across the labels of a day: not one run")
     key_cols = [c for c in cols if c not in _STAT_COLUMNS and c != "SENTIMENT"]
-    labelled = (pl.concat([f.select("DATE", "N_LABELLED").with_columns(pl.lit(i).alias("_run"))
-                           for i, f in enumerate(frames)])
-                .group_by("_run", "DATE").agg(pl.col("N_LABELLED").max())
+    labelled = (frame.group_by("DATE", "SENTIMENT").agg(pl.col("N_LABELLED").max())
                 .group_by("DATE").agg(pl.col("N_LABELLED").sum()))
+    if diagnostics is not None:
+        untagged = diagnostics.group_by("DATE").agg(pl.col("N_UNTAGGED").first(),
+                                                    pl.col("N_HEADLINES").first())
+        chk = labelled.join(untagged, on="DATE", how="inner")
+        bad = chk.filter(pl.col("N_LABELLED") + pl.col("N_UNTAGGED") != pl.col("N_HEADLINES"))
+        if bad.height:
+            raise ValueError(f"N_LABELLED + N_UNTAGGED != N_HEADLINES on {bad.height} day(s), "
+                             f"e.g. {bad.sort('DATE').head(3).to_dicts()}")
     agg = (
-        pl.concat([f.select(cols) for f in frames])
-        .with_columns(*_moment_columns())
+        frame.with_columns(*_moment_columns())
         .group_by(key_cols, maintain_order=True)
         .agg(
             pl.col("SUPPORT").sum().alias("SUPPORT"),
             pl.col("_total").sum().alias("_total"),
             pl.col("_sumsq").sum().alias("_sumsq"),
             pl.col("PEAK").max().alias("PEAK"),
-            pl.col("N_HEADLINES").drop_nulls().first().alias("N_HEADLINES"),
+            pl.col("N_HEADLINES").first().alias("N_HEADLINES"),
         )
         .join(labelled, on="DATE", how="left")
     )
     out = _recombined(agg).with_columns(pl.lit(SENTIMENT_ALL).alias("SENTIMENT"))
-    schema = frames[0].schema
+    schema = frame.schema
     return out.select([pl.col(c).cast(schema[c]) for c in cols])
 
 
@@ -230,7 +156,7 @@ def merge_poles(narrative_daily: pl.DataFrame) -> pl.DataFrame:
     Pure; never rescores. A pair is a (reservoir, dimension, TYPE) group holding exactly two
     distinct signed poles; monopolar (one signed pole) and unsigned rows pass through
     unchanged. Per (DATE, SENTIMENT, reservoir, dimension, TYPE), with the recovered sums of
-    squares, the same arithmetic as ``sum_sentiment_runs``::
+    squares, the same arithmetic as ``sum_tags``::
 
         SUPPORT, TOTAL_SCORE    summed
         INTENSITY, STD_SCORE    recombined (ddof=0)
@@ -294,8 +220,9 @@ def summarize(result: Any, extra: dict[str, Any] | None = None) -> dict[str, Any
     row: dict[str, Any] = result.metadata.flat()
     diag = result.day_diagnostics
     nd = result.narrative_daily
-    row["n_days"] = diag.height
-    row["n_headlines"] = int(diag["N_HEADLINES"].sum())
+    per_day = diag.unique("DATE", keep="first")          # one row per label: count days once
+    row["n_days"] = per_day.height
+    row["n_headlines"] = int(per_day["N_HEADLINES"].sum())
     row["n_scored"] = int(diag["N_SCORED"].sum())
     n_head = max(row["n_scored"], 1)            # funnel rates are per scored headline
     row["unassigned_share"] = float(diag["N_UNASSIGNED"].sum()) / n_head

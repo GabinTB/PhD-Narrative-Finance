@@ -4,9 +4,14 @@
     uv run python -m narrative_scoring.jobs score    --from 2004-01-01 --to 2004-12-31 \
                                                      --taxonomy Evergreen_v5
     uv run python -m narrative_scoring.jobs score    --from 2004-01-01 --to 2004-12-31 \
-                                                     --sentiment negative \
+                                                     --mask-bipolar \
                                                      --sentiment-source ravenbert \
-                                                     --sentiment-rule mean
+                                                     --sentiment-rule mean \
+                                                     --tag "neg=x <= -1/3" \
+                                                     --tag "neu=-1/3 < x < 1/3" \
+                                                     --tag "pos=x >= 1/3" \
+                                                     --assets-universe msci_world \
+                                                     --min-relevance 0.6
     uv run python -m narrative_scoring.jobs tau-asof [--window 5Y | expanding] [--today ...]
     uv run python -m narrative_scoring.jobs resume <partial narrative_daily artifact id>
     uv run jobs start narrative_daily --from ... --to ... [same flags]   (same as score)
@@ -20,16 +25,23 @@ $RAW_DATA_PATH/Narrative_Taxonomy and registers them as a ``narrative_taxonomy``
 Scoring against several taxonomies = one run per taxonomy; their outputs never mix (every
 family is resolved by the taxonomy hash).
 
-``--sentiment positive | neutral | negative | unscored`` scores only that bucket's headlines
-(default ``none``: all), selected at load time from a ``headline_sentiment`` artifact:
-``--sentiment-source`` ravenbert | finbert (grid tables) | ravenpack (SENT_CSS), latest of
-that producer built on the scored headlines, or ``--sentiment-artifact ID`` (an exact one);
-``--sentiment-rule`` argmax | mean | median (models, default mean) or css (vendor, default);
-``--neg-max`` / ``--pos-min`` (default -1/3, 1/3) and ``--min-conf`` (models only, default 0).
-See narrative_scoring/sentiment_filter.py for the buckets. A bucket run reuses the tau_asof
-and mu of the all-headlines run (it refuses to start without one covering its dates), so
-the four bucket runs add up exactly to it (validation.sum_sentiment_runs). The settings
-enter config_id; the artifact is cited in the lineage.
+One pass writes every output. ``--tag NAME=CONDITION`` (repeatable) adds a sentiment
+label: CONDITION is an interval of the headline score x (tags.py: ``x <= -1/3``,
+``-1/3 < x < 1/3``, ``(x > a) & (x < b)``; disjoint, checked at load), the score being
+``--sentiment-rule`` argmax | mean | median (default mean) on the grid of a
+``headline_sentiment`` artifact: ``--sentiment-source`` ravenbert | finbert (latest of that
+producer built on the scored headlines) or ``--sentiment-artifact ID`` (an exact one).
+Without ``--tag`` the run has one label, "all". The tags enter config_id (never the null
+model's digests); the sentiment artifact is cited in the lineage.
+
+``--assets-universe ID_OR_NAME`` adds the asset layer (assets.py): asset_attention_daily and
+narrative_asset_daily, over every RavenPack entity ever in that registered universe; every
+headline tagging an entity counts, and ``--min-relevance`` (a fraction, default 0.6 =
+RELEVANCE >= 60) adds the *_REL columns restricted to the headlines at or above it. The
+universe and the threshold enter the identity of the asset outputs only.
+
+``--chunk-size`` (default artifacts.CHUNK_SIZE) is fixed for a run: recorded, and a resume
+refuses another value (a block's scores can move by ~1e-7 with its row count).
 
 Primitive texts are embedded through ``nlp`` (``--embedding-backend`` tei | local | embedx,
 ``--embedding-dtype`` float16 | float32; default TEI fp16), cached locally by texts +
@@ -38,7 +50,7 @@ the primitive-embedding digest is part of every lookup key.
 
 ``--mask-bipolar`` keeps, per headline, one pole of every bipolar pair (selection.py); it
 changes config_id and the f0 / warmup digests, so the masked run builds its own null
-partitions and tau_asof, and its bucket runs must carry the flag too. ``primitive_daily``
+partitions and tau_asof. ``primitive_daily``
 (day x primitive diagnostics) is written by default; ``--no-primitive-daily`` skips it.
 
 ``score`` is the one scoring path: it replays the live loop over the dates
@@ -62,14 +74,12 @@ from datetime import date
 from pathlib import Path
 
 from narrative_scoring.config import (
-    SENTIMENT_NONE,
-    VENDOR_SOURCES,
     ParaphraseStyle,
     PoolRule,
     ScoringConfig,
-    SentimentFilter,
     default_pooling,
 )
+from narrative_scoring.tags import SentimentTags
 from nlp.corrections import Correction
 
 log = logging.getLogger("narrative_scoring.jobs")
@@ -82,25 +92,40 @@ def _env(name: str) -> Path:
     return Path(v)
 
 
+def _tags(args: argparse.Namespace) -> SentimentTags | None:
+    """The sentiment layer of the command line: --tag NAME=CONDITION (repeatable)."""
+    if not args.tag:
+        if args.sentiment_source or args.sentiment_artifact:
+            raise SystemExit("--sentiment-source / --sentiment-artifact without any --tag")
+        return None
+    pairs = []
+    for spec in args.tag:
+        name, sep, cond = spec.partition("=")
+        if not sep or not name.strip() or not cond.strip():
+            raise SystemExit(f"--tag expects NAME=CONDITION, got {spec!r}")
+        pairs.append((name.strip(), cond.strip()))
+    source = _sentiment_source_name(args)
+    if not source:
+        raise SystemExit("--tag needs --sentiment-source or --sentiment-artifact")
+    try:
+        return SentimentTags.build(source, args.sentiment_rule, pairs)
+    except ValueError as exc:
+        raise SystemExit(f"--tag: {exc}") from None
+
+
 def _config(args: argparse.Namespace) -> ScoringConfig:
     style = ParaphraseStyle(args.style)
     pooling = PoolRule(args.pooling) if args.pooling else default_pooling(style)
-    bucket = SentimentFilter(args.sentiment)
-    source = _sentiment_source_name(args) if bucket is not SentimentFilter.NONE \
-        else SENTIMENT_NONE
-    rule = args.sentiment_rule or ("css" if source in VENDOR_SOURCES else "mean")
     return ScoringConfig(
         mode=Correction(args.mode), paraphrase_style=style, paraphrase_pooling=pooling,
-        q=args.q, jump_cut=args.jump_cut, sentiment=bucket, sentiment_source=source,
-        sentiment_rule=rule, neg_max=args.neg_max, pos_min=args.pos_min,
-        min_conf=args.min_conf, mask_bipolar=args.mask_bipolar,
+        q=args.q, jump_cut=args.jump_cut, tags=_tags(args), mask_bipolar=args.mask_bipolar,
         min_month_draws=args.min_month_draws, gap_alert_threshold=args.gap_alert_threshold,
         label=args.label,
     )
 
 
-def _sentiment_source_name(args: argparse.Namespace) -> str:
-    """The producer name for the config: --sentiment-source, or the pinned artifact's."""
+def _sentiment_source_name(args: argparse.Namespace) -> str | None:
+    """The producer name for the tags: --sentiment-source, or the pinned artifact's."""
     if args.sentiment_artifact:
         from datalake import DatalakeIndex
 
@@ -111,23 +136,50 @@ def _sentiment_source_name(args: argparse.Namespace) -> str:
                 if dl.exists(args.sentiment_artifact):
                     return str(dl.get(args.sentiment_artifact).meta.hyperparams["source"])
         raise SystemExit(f"sentiment artifact {args.sentiment_artifact} not found")
-    return args.sentiment_source or SENTIMENT_NONE
+    return args.sentiment_source
 
 
 def _sentiment(args: argparse.Namespace, config: ScoringConfig, dl, upstream):
-    """The headline_sentiment artifact of a filtered run (None for sentiment=none)."""
-    if not config.filtered:
+    """The headline_sentiment artifact behind the tags (None without tags)."""
+    if config.tags is None:
         return None
     from narrative_scoring.artifacts import KIND_HEADLINES, resolve_sentiment
 
     art = resolve_sentiment(
         [dl, upstream], headlines_id=upstream.latest(KIND_HEADLINES).artifact_id,
-        config=config,
-        source=None if args.sentiment_artifact else config.sentiment_source,
+        config=config, source=None if args.sentiment_artifact else config.tags.source,
         artifact_id=args.sentiment_artifact)
-    log.info("sentiment: %s (%s, rule %s, bucket %s)", art.artifact_id,
-             config.sentiment_source, config.sentiment_rule, config.sentiment.value)
+    log.info("sentiment: %s (%s, rule %s, tags %s)", art.artifact_id, config.tags.source,
+             config.tags.rule, config.labels)
     return art
+
+
+def _assets(args: argparse.Namespace, dl, upstream):
+    """(AssetUniverse, universe artifact) of --assets-universe ID_OR_NAME, or (None, None)."""
+    if not args.assets_universe:
+        return None, None
+    from narrative_scoring.assets import AssetUniverse
+    from universe.ingest import find_universe_by_name
+
+    ref = args.assets_universe
+    art = None
+    for ix in (dl, upstream):
+        if ix.exists(ref):
+            art = ix.get(ref)
+            break
+    if art is None:
+        for ix in (dl, upstream):
+            try:
+                art = find_universe_by_name(ix, ref)
+                break
+            except ValueError:
+                continue
+    if art is None:
+        raise SystemExit(f"no universe artifact with id or name {ref!r}")
+    assets = AssetUniverse.from_artifact(art, min_relevance=args.min_relevance)
+    log.info("assets: %s (%d entities, %d snapshots, min_relevance %g)", art.artifact_id,
+             assets.n_assets, len(assets.snapshots), assets.min_relevance)
+    return assets, art
 
 
 def _indexes(args: argparse.Namespace):
@@ -180,16 +232,18 @@ def scoring_job_from_args(args: argparse.Namespace, dl, upstream):
 
     config = _config(args)
     sentiment = _sentiment(args, config, dl, upstream)
+    assets, universe = _assets(args, dl, upstream)
     tax_art, table, P, p_meta = _table_and_embeddings(args, dl, upstream)
-    source = headline_source(upstream, chunk_size=args.chunk_size, threads=args.threads,
-                             sentiment=sentiment, config=config)
+    source = headline_source(upstream, chunk_size=args.chunk_size, sentiment=sentiment,
+                             config=config, assets=assets)
     return ScoringJob(
         dl, date.fromisoformat(args.start), date.fromisoformat(args.end), config,
         table=table, P=P, upstream=upstream, source=source, window=args.window,
         seed=args.seed, threads=args.threads, rss_budget_gb=args.rss_budget_gb,
         keep_primitive_daily=not args.no_primitive_daily,
         temp=args.temp, label=args.label, taxonomy_id=tax_art.artifact_id,
-        sentiment=sentiment, primitive_meta=p_meta, calendar=_calendar(args))
+        sentiment=sentiment, primitive_meta=p_meta, calendar=_calendar(args),
+        chunk_size=args.chunk_size, assets=assets, universe=universe)
 
 
 def cmd_score(args: argparse.Namespace) -> int:
@@ -201,7 +255,7 @@ def cmd_score(args: argparse.Namespace) -> int:
     summary = job.final_summary()
     for k in ("start", "end", "n_days_scored", "n_days_null_only", "peak_rss_gb",
               "months_finalised", "narrative_daily_id", "day_diagnostics_id",
-              "partitions_id", "tau_asof_id"):
+              "partitions_id", "tau_asof_id", "asset_attention_id", "narrative_asset_id"):
         print(f"{k}={summary.get(k)}")
     return 0
 
@@ -233,8 +287,8 @@ def cmd_resume(args: argparse.Namespace) -> int:
                              threads=args.threads, chunk_size=args.chunk_size,
                              rss_budget_gb=args.rss_budget_gb)
     for k in ("start", "end", "n_days_scored", "n_days_null_only", "narrative_daily_id",
-              "partitions_id", "tau_asof_id"):
-        print(f"{k}={summary[k]}")
+              "partitions_id", "tau_asof_id", "asset_attention_id", "narrative_asset_id"):
+        print(f"{k}={summary.get(k)}")
     return 0
 
 
@@ -247,6 +301,12 @@ def cmd_mark_temp(args: argparse.Namespace) -> int:
         print(f"{art.artifact_id}: deprecated={art.deprecated} "
               f"agent_created={art.meta.hyperparams.get('agent_created')}")
     return 0
+
+
+def _default(name: str):
+    from narrative_scoring import artifacts
+
+    return getattr(artifacts, name)
 
 
 def add_scoring_args(parser: argparse.ArgumentParser) -> None:
@@ -267,21 +327,20 @@ def add_scoring_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-primitive-daily", action="store_true",
                         help="do not write the day x primitive diagnostics (written by default, "
                              "~300 MB per run)")
-    parser.add_argument("--sentiment", default="none",
-                        choices=[b.value for b in SentimentFilter],
-                        help="score only this bucket's headlines (default none: all)")
+    parser.add_argument("--tag", action="append", default=[], metavar="NAME=CONDITION",
+                        help="a sentiment label: NAME=interval of the score x, e.g. "
+                             "'neg=x <= -1/3' (repeatable; tags.py)")
     parser.add_argument("--sentiment-source", default=None,
-                        help="headline_sentiment producer: ravenbert | finbert | ravenpack")
+                        help="headline_sentiment grid producer: ravenbert | finbert")
     parser.add_argument("--sentiment-artifact", default=None,
                         help="exact headline_sentiment artifact id (overrides the source)")
-    parser.add_argument("--sentiment-rule", default=None,
-                        help="argmax | mean | median (models, default mean); css (vendor)")
-    parser.add_argument("--neg-max", type=float, default=-1.0 / 3.0,
-                        help="negative = SENT <= neg-max (default -1/3)")
-    parser.add_argument("--pos-min", type=float, default=1.0 / 3.0,
-                        help="positive = SENT >= pos-min (default 1/3)")
-    parser.add_argument("--min-conf", type=float, default=0.0,
-                        help="unscored = SENT null or CONF < min-conf (models only; default 0)")
+    parser.add_argument("--sentiment-rule", default="mean", choices=["argmax", "mean", "median"],
+                        help="ordinal rule giving the score from the grid (default mean)")
+    parser.add_argument("--assets-universe", default=None, metavar="ID_OR_NAME",
+                        help="registered universe (with RavenPack ids): adds the asset outputs")
+    parser.add_argument("--min-relevance", type=float, default=0.6,
+                        help="relevance threshold of the *_REL asset columns, a fraction of "
+                             "the vendor's 0-100 RELEVANCE (default 0.6 = RELEVANCE >= 60)")
     parser.add_argument("--min-month-draws", type=int, default=20_000_000)
     parser.add_argument("--gap-alert-threshold", type=float, default=0.05)
     parser.add_argument("--label", default="")
@@ -296,8 +355,9 @@ def add_scoring_args(parser: argparse.ArgumentParser) -> None:
                         help="compute dtype of the primitive-text embeddings (default: float16)")
     parser.add_argument("--embedding-cache", default=None)
     parser.add_argument("--threads", type=int, default=8)
-    parser.add_argument("--chunk-size", type=int, default=8_192)
-    parser.add_argument("--rss-budget-gb", type=float, default=30.0)
+    parser.add_argument("--chunk-size", type=int, default=_default("CHUNK_SIZE"),
+                        help="rows per scoring block, fixed for the run (recorded)")
+    parser.add_argument("--rss-budget-gb", type=float, default=_default("RSS_BUDGET_GB"))
     parser.add_argument("--window", default="5Y")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--temp", action="store_true",
@@ -331,8 +391,9 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("resume", help="continue an interrupted score run from the run alone")
     p.add_argument("artifact_id", help="the partial narrative_daily artifact of the run")
     p.add_argument("--threads", type=int, default=8)
-    p.add_argument("--chunk-size", type=int, default=8_192)
-    p.add_argument("--rss-budget-gb", type=float, default=30.0)
+    p.add_argument("--chunk-size", type=int, default=None,
+                   help="must equal the recorded one (default: the recorded one)")
+    p.add_argument("--rss-budget-gb", type=float, default=_default("RSS_BUDGET_GB"))
     p.add_argument("--embedding-cache", default=None)
     p.set_defaults(fn=cmd_resume)
     p = sub.add_parser("mark-temp")

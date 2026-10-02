@@ -64,8 +64,14 @@ PRIMITIVE_DAILY_SCHEMA: pl.Schema = pl.Schema(
     }
 )
 
-# day_diagnostics: one row per scored day (its own artifact family). Selection
-# funnel counts, the point-in-time inputs actually used, and memory telemetry.
+# day_diagnostics: one row per (scored day, sentiment label) (its own artifact family).
+# Selection funnel counts of the label's headlines, the point-in-time inputs actually
+# used, and memory telemetry.
+#   N_HEADLINES               the day's headlines, every label and untagged (the attention
+#                             denominator); N_SCORED the label's headlines (= N_HEADLINES on
+#                             an "all" row); N_UNTAGGED the day's headlines in no tag (scored
+#                             for the null model only; 0 without tags). Every funnel count
+#                             and share refers to the N_SCORED headlines.
 #   N_F0_SURVIVORS_PRE_Q      scores >= tau over the FULL row (before the q budget)
 #   N_Q_CANDIDATES            scores in the per-row top-q candidate set
 #   N_RETAINED_PRE_JUMP       candidates that also clear tau (before the jump cut)
@@ -73,15 +79,54 @@ PRIMITIVE_DAILY_SCHEMA: pl.Schema = pl.Schema(
 #   PCT_TAU_PRUNED_WITHIN_Q   1 - N_RETAINED_PRE_JUMP / N_Q_CANDIDATES
 #   PCT_JUMP_APPLIED          share of headlines whose retained set the jump cut shortened
 #   MEAN_JUMP_GAP             mean cutting gap over those headlines (null when none)
-#   N_HEADLINES               the day's headlines before any sentiment filter (the attention
-#                             denominator); N_SCORED the headlines actually scored (= N_HEADLINES
-#                             in an all-headlines run, the bucket's count in a filtered run).
-#                             Every funnel count and share refers to the N_SCORED headlines.
-#   N_POLE_MASKED             primitive scores the bipolar pole mask set to -inf that day
+#   N_POLE_MASKED             primitive scores the bipolar pole mask set to -inf
 #   N_MASK_CHANGED_RETENTION  (headline, narrative) pairs whose retained primitive set differs
 #                             from the unmasked selection of the same row
 #                             (both null when the run has mask_bipolar off)
+#   N_UNMAPPED                universe rows without a RavenPack entity id as of the day
+#                             (null without an asset layer, or before the first snapshot)
+#   SENTIMENT_SOURCE_ID       headline_sentiment artifact:rule behind the tags (null without)
 DAY_DIAGNOSTICS_SCHEMA: pl.Schema = pl.Schema(
+    {
+        "DATE":                      pl.Date,
+        "SENTIMENT":                 pl.String,
+        "N_HEADLINES":               pl.Int64,
+        "N_SCORED":                  pl.Int64,
+        "N_UNTAGGED":                pl.Int64,
+        "N_UNASSIGNED":              pl.Int64,
+        "N_F0_SURVIVORS_PRE_Q":      pl.Int64,
+        "N_Q_CANDIDATES":            pl.Int64,
+        "N_RETAINED_PRE_JUMP":       pl.Int64,
+        "N_RETAINED_POST_Q_TAU":     pl.Int64,
+        "MEAN_RETAINED_PER_HEADLINE": pl.Float64,
+        "PCT_TAU_PRUNED_WITHIN_Q":   pl.Float64,
+        "PCT_JUMP_APPLIED":          pl.Float64,
+        "MEAN_JUMP_GAP":             pl.Float64,
+        "NARRATIVES_TOUCHED":        pl.Int32,
+        "N_POLE_MASKED":             pl.Int64,
+        "N_MASK_CHANGED_RETENTION":  pl.Int64,
+        "N_UNMAPPED":                pl.Int64,
+        "MU_DATE":                   pl.Date,
+        "MU_NORM":                   pl.Float64,
+        "TAU":                       pl.Float64,
+        "TAU_MONTH_END":             pl.Date,
+        "N_EFF":                     pl.Float64,
+        "CONFIG_ID":                 pl.String,
+        "F0_CONFIG_ID":              pl.String,
+        "TAU_SOURCE_ID":             pl.String,
+        "MU_ASOF_ID":                pl.String,
+        "SENTIMENT_SOURCE_ID":       pl.String,
+        "RSS_GB_BEFORE":             pl.Float64,
+        "RSS_GB_AFTER":              pl.Float64,
+        "SECONDS":                   pl.Float64,
+    }
+)
+
+# Older day_diagnostics layouts, still valid (the verifier accepts them; load_day_diagnostics
+# reads them back): V4 one row per day before the tags (no SENTIMENT / N_UNTAGGED /
+# N_UNMAPPED, a N_WITH_SENTIMENT count), V3 before the pole mask columns (read back as
+# null), V2 also before N_SCORED (absence = N_HEADLINES), V1 also before SENTIMENT_SOURCE_ID
+DAY_DIAGNOSTICS_SCHEMA_V4: pl.Schema = pl.Schema(
     {
         "DATE":                      pl.Date,
         "N_HEADLINES":               pl.Int64,
@@ -108,18 +153,14 @@ DAY_DIAGNOSTICS_SCHEMA: pl.Schema = pl.Schema(
         "F0_CONFIG_ID":              pl.String,
         "TAU_SOURCE_ID":             pl.String,
         "MU_ASOF_ID":                pl.String,
-        "SENTIMENT_SOURCE_ID":       pl.String,     # sentiment artifact:rule:bucket
+        "SENTIMENT_SOURCE_ID":       pl.String,
         "RSS_GB_BEFORE":             pl.Float64,
         "RSS_GB_AFTER":              pl.Float64,
         "SECONDS":                   pl.Float64,
     }
 )
-
-# Older day_diagnostics layouts, still valid (the verifier accepts them): V3 before the pole
-# mask columns (read back as null), V2 also before N_SCORED (a reader treats its absence as
-# N_SCORED = N_HEADLINES), V1 also before SENTIMENT_SOURCE_ID
 DAY_DIAGNOSTICS_SCHEMA_V3: pl.Schema = pl.Schema(
-    {k: v for k, v in DAY_DIAGNOSTICS_SCHEMA.items()
+    {k: v for k, v in DAY_DIAGNOSTICS_SCHEMA_V4.items()
      if k not in ("N_POLE_MASKED", "N_MASK_CHANGED_RETENTION")})
 DAY_DIAGNOSTICS_SCHEMA_V2: pl.Schema = pl.Schema(
     {k: v for k, v in DAY_DIAGNOSTICS_SCHEMA_V3.items() if k != "N_SCORED"})

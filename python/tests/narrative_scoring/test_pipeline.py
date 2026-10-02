@@ -1,5 +1,5 @@
 """End-to-end: streaming vs dense reference, live == historical, point-in-time guards,
-metadata, sentiment-bucket runs, day diagnostics, null-partition feed."""
+metadata, sentiment tags, asset layer, day diagnostics, null-partition feed."""
 from __future__ import annotations
 
 from datetime import date, timedelta
@@ -10,13 +10,12 @@ import polars as pl
 import pytest
 
 from narrative_scoring._kernels import HAVE_SELECT
+from narrative_scoring.assets import AssetDay, AssetUniverse
 from narrative_scoring.calibration import LookaheadError, TauRecord
 from narrative_scoring.config import (
-    SENTIMENT_BUCKETS,
     AggRule,
     PoolRule,
     ScoringConfig,
-    SentimentFilter,
     n_candidates_for,
 )
 from narrative_scoring.partitions import MonthlyNullPartitionWriter, load_partitions
@@ -24,13 +23,13 @@ from narrative_scoring.pipeline import ParquetMonthWriter, date_range, score_dat
 from narrative_scoring.primitives import primitive_scores, scoring_matrix
 from narrative_scoring.schema import DAY_DIAGNOSTICS_SCHEMA, EMBEDDING_DIM, NARRATIVE_DAILY_SCHEMA
 from narrative_scoring.streaming import InMemoryHeadlineSource, MemoryBudgetExceeded
+from narrative_scoring.tags import SentimentTags
 from narrative_scoring.validation import (
-    SentimentRun,
     attention,
     reference_day,
     reference_headline_narrative,
     reference_select,
-    sum_sentiment_runs,
+    sum_tags,
     summarize,
 )
 from nlp.corrections import Correction, apply_mode
@@ -299,7 +298,7 @@ def test_day_diagnostics_funnel(world):
     assert d["TAU_SOURCE_ID"].unique().to_list() == [_tau(0.02).digest()]
     assert d["MU_ASOF_ID"].unique().to_list() == ["mu-x"]
     assert d["TAU_MONTH_END"].null_count() == 3           # static tau has no month_end
-    assert d["N_WITH_SENTIMENT"].sum() == 0
+    assert d["N_UNTAGGED"].sum() == 0 and d["SENTIMENT"].unique().to_list() == ["all"]
 
 
 def test_metadata_is_complete(world):
@@ -310,8 +309,8 @@ def test_metadata_is_complete(world):
                       use_kernel=False, seed=7, code_version="deadbeef")
     m = res.metadata.to_dict()
     for key in ("mode", "paraphrase_style", "paraphrase_pooling", "q", "narrative_agg",
-                "jump_cut", "jump_min_candidates", "alpha", "trim_frac", "sentiment",
-                "sentiment_rule", "neg_max", "pos_min", "min_conf", "null_draws_per_headline"):
+                "jump_cut", "jump_min_candidates", "alpha", "trim_frac", "tags",
+                "mask_bipolar", "null_draws_per_headline"):
         assert key in m["config"]
     assert m["percentile_axis"] == "row_wise"
     assert m["n_candidates"] == n_candidates_for(0.75, world["table"].n_primitives)
@@ -370,210 +369,347 @@ def test_date_range_helper():
 
 
 # ---------------------------------------------------------------------------
-# Sentiment-bucket runs (in memory: a keep mask per day plays the bucket filter)
+# Sentiment tags: one pass, one label per tag (in memory: codes per day play the source)
 # ---------------------------------------------------------------------------
 
-def _bucket_labels(world, seed=5) -> dict[date, np.ndarray]:
-    """One bucket per headline; the second day has no negative headline at all."""
+TERNARY = [("neg", "x <= -1/3"), ("neu", "-1/3 < x < 1/3"), ("pos", "x >= 1/3")]
+
+
+def _tag_cfg(tags=TERNARY, **kw) -> ScoringConfig:
+    return ScoringConfig(q=0.75, tags=SentimentTags.build("ravenbert", "mean", tags), **kw)
+
+
+def _codes(world, seed=5, n_tags=3, untagged=True) -> dict[date, np.ndarray]:
+    """A tag code per headline (-1 sometimes); the second day has no tag-0 headline."""
     rng = np.random.default_rng(seed)
-    names = np.array([b.value for b in SENTIMENT_BUCKETS])
     out = {}
     for i, (d, X) in enumerate(sorted(world["X"].items())):
-        lab = names[rng.integers(0, 4, X.shape[0])]
+        c = rng.integers(-1 if untagged else 0, n_tags, X.shape[0]).astype(np.int8)
         if i == 1:
-            lab[lab == "negative"] = "neutral"
-        out[d] = lab
+            c[c == 0] = 1
+        out[d] = c
     return out
 
 
-def _bucket_cfg(bucket, **kw) -> ScoringConfig:
-    return ScoringConfig(q=0.75, sentiment=bucket, sentiment_source="ravenbert", **kw)
-
-
-def _bucket_runs(world, cal, *, use_kernel=False, keep_primitive_daily=False, labels=None,
-                 tau_missing="raise"):
-    labels = labels or _bucket_labels(world)
-    runs = {}
-    for b in SENTIMENT_BUCKETS:
-        keep = {d: lab == b.value for d, lab in labels.items()}
-        runs[b] = score_dates(world["days"], _bucket_cfg(b), table=world["table"],
-                              primitive_embeddings=world["P"],
-                              source=InMemoryHeadlineSource(world["X"], chunk_size=11, keep=keep),
-                              calibration=cal, use_kernel=use_kernel,
-                              keep_primitive_daily=keep_primitive_daily,
-                              sentiment_artifact_id="hs-1", tau_missing=tau_missing)
-    return runs, labels
+def _run(world, cfg, cal, codes=None, **kw):
+    kw.setdefault("use_kernel", False)
+    return score_dates(world["days"], cfg, table=world["table"], primitive_embeddings=world["P"],
+                       source=InMemoryHeadlineSource(world["X"], chunk_size=11, tags=codes),
+                       calibration=cal, **kw)
 
 
 @pytest.mark.parametrize("use_kernel", [False, KERNEL])
-def test_bucket_runs_add_up_to_the_all_headlines_run(world, use_kernel):
+def test_one_tag_covering_every_headline_is_the_untagged_run(world, use_kernel):
     cal = FixedTauProvider(_tau(0.2), world["mu_df"])
-    full = score_dates(world["days"], ScoringConfig(q=0.75), table=world["table"],
-                       primitive_embeddings=world["P"],
-                       source=InMemoryHeadlineSource(world["X"], chunk_size=11), calibration=cal,
-                       use_kernel=use_kernel, keep_primitive_daily=True)
-    runs, labels = _bucket_runs(world, cal, use_kernel=use_kernel, keep_primitive_daily=True)
+    plain = _run(world, ScoringConfig(q=0.75), cal, use_kernel=use_kernel,
+                 keep_primitive_daily=True)
+    zeros = {d: np.zeros(X.shape[0], dtype=np.int8) for d, X in world["X"].items()}
+    one = _run(world, _tag_cfg([("every", "x >= -2")]), cal, zeros, use_kernel=use_kernel,
+               keep_primitive_daily=True)
+    for a, b in ((plain.narrative_daily, one.narrative_daily),
+                 (plain.primitive_daily, one.primitive_daily)):
+        assert b["SENTIMENT"].unique().to_list() == ["every"]
+        assert a.drop("SENTIMENT").equals(b.drop("SENTIMENT"))           # bit for bit
+    keep = [c for c in plain.day_diagnostics.columns
+            if c not in ("SENTIMENT", "CONFIG_ID", "SENTIMENT_SOURCE_ID", "RSS_GB_BEFORE",
+                         "RSS_GB_AFTER", "SECONDS")]
+    assert plain.day_diagnostics.select(keep).equals(one.day_diagnostics.select(keep))
+
+
+@pytest.mark.parametrize("use_kernel", [False, KERNEL])
+def test_labels_add_up_to_the_untagged_run(world, use_kernel):
+    cal = FixedTauProvider(_tau(0.2), world["mu_df"])
+    full = _run(world, ScoringConfig(q=0.75), cal, use_kernel=use_kernel,
+                keep_primitive_daily=True)
+    codes = _codes(world, untagged=False)
+    tagged = _run(world, _tag_cfg(), cal, codes, use_kernel=use_kernel,
+                  keep_primitive_daily=True)
     for primitive in (False, True):
         key = "primitive" if primitive else "narrative_key"
-        total = sum_sentiment_runs([SentimentRun.from_result(r, primitive=primitive)
-                                    for r in runs.values()]).sort(["DATE", key])
+        frame = tagged.primitive_daily if primitive else tagged.narrative_daily
+        total = sum_tags(frame, tagged.day_diagnostics).sort(["DATE", key])
         ref = (full.primitive_daily if primitive else full.narrative_daily).sort(["DATE", key])
         assert total.columns == ref.columns and total.height == ref.height
         np.testing.assert_array_equal(total["SUPPORT"].to_numpy(), ref["SUPPORT"].to_numpy())
-        # a headline's float32 scores depend slightly (~1e-7) on the rows batched with it
-        # (BLAS blocking): the statistics agree to float rounding; SUPPORT is exact here
-        for col, tol in (("TOTAL_SCORE", 1e-6), ("INTENSITY", 1e-5), ("STD_SCORE", 2e-4),
-                         ("PEAK", 1e-6)):
+        # same S rows in both runs: only the summation order differs
+        for col, tol in (("TOTAL_SCORE", 1e-12), ("INTENSITY", 1e-6), ("STD_SCORE", 1e-4),
+                         ("PEAK", 0.0)):
             np.testing.assert_allclose(total[col].to_numpy(), ref[col].to_numpy(), rtol=tol,
                                        atol=tol, equal_nan=True)
         assert (total["N_HEADLINES"] == ref["N_HEADLINES"]).all()
         assert (total["N_LABELLED"] == ref["N_LABELLED"]).all()
-        assert total["SENTIMENT"].unique().to_list() == ["all"]
-    # attention adds up: each bucket run shares the day's total as denominator
-    att = sum(attention(r.narrative_daily).sort(["DATE", "narrative_key"])["ATTENTION"]
-              .fill_null(0.0).to_numpy() for r in runs.values())
-    np.testing.assert_allclose(att, attention(full.narrative_daily).sort(
-        ["DATE", "narrative_key"])["ATTENTION"].fill_null(0.0).to_numpy(), rtol=1e-6, atol=1e-12)
-    # the same day set, every day with the day's total; the empty bucket day is written
     days = sorted(world["days"])
-    for b, r in runs.items():
-        d = r.day_diagnostics.sort("DATE")
-        assert d["DATE"].to_list() == full.day_diagnostics["DATE"].sort().to_list()
-        assert d["N_HEADLINES"].to_list() == [world["X"][x].shape[0] for x in days]
-        assert d["N_SCORED"].to_list() == [int((labels[x] == b.value).sum()) for x in days]
-        assert (d["N_WITH_SENTIMENT"] == d["N_SCORED"]).all()
-        assert r.narrative_daily["SENTIMENT"].unique().to_list() == [b.value]
-    neg = runs[SentimentFilter.NEGATIVE].narrative_daily.filter(pl.col("DATE") == days[1])
+    d = tagged.day_diagnostics.sort("DATE", "SENTIMENT")
+    assert d.height == 3 * len(days) and set(d["SENTIMENT"]) == {"neg", "neu", "pos"}
+    for x in days:
+        rows = d.filter(pl.col("DATE") == x)
+        assert (rows["N_HEADLINES"] == world["X"][x].shape[0]).all()
+        assert dict(zip(rows["SENTIMENT"], rows["N_SCORED"])) == {
+            name: int((codes[x] == t).sum()) for t, (name, _) in enumerate(TERNARY)}
+        assert (rows["N_UNTAGGED"] == 0).all()
+    # a label with no headline that day is still written (SUPPORT 0, null statistics)
+    neg = tagged.narrative_daily.filter((pl.col("DATE") == days[1])
+                                        & (pl.col("SENTIMENT") == "neg"))
     assert neg.height == world["table"].n_narratives and (neg["SUPPORT"] == 0).all()
     assert neg["TOTAL_SCORE"].null_count() == neg.height and (neg["N_LABELLED"] == 0).all()
 
 
-def test_a_day_without_mu_is_skipped_by_every_run(world):
-    days = sorted(world["days"])
-    late_mu = world["mu_df"].filter(pl.col("DATE") >= days[1])       # day 0 cannot be corrected
-    cal = FixedTauProvider(_tau(0.2), late_mu)
-    full = score_dates(days, ScoringConfig(q=0.75), table=world["table"],
-                       primitive_embeddings=world["P"], source=InMemoryHeadlineSource(world["X"]),
-                       calibration=cal, use_kernel=False, tau_missing="null_only")
-    runs, _ = _bucket_runs(world, cal, tau_missing="null_only")
-    want = full.day_diagnostics["DATE"].to_list()
-    assert days[0] not in want and len(want) == len(days) - 1
-    for r in runs.values():
-        assert r.day_diagnostics["DATE"].to_list() == want
-
-
-def test_a_bucket_run_never_feeds_null_partitions(world, tmp_path):
+@pytest.mark.skipif(not HAVE_SELECT, reason="kernel not built")
+@pytest.mark.parametrize("mask", [False, True])
+def test_kernel_and_numpy_route_tags_alike(world, mask):
     cal = FixedTauProvider(_tau(0.2), world["mu_df"])
-    sink = MonthlyNullPartitionWriter(tmp_path, config=_bucket_cfg(SentimentFilter.POSITIVE),
-                                      table=world["table"], seed=0)
-    with pytest.raises(ValueError, match="never feeds the null partitions"):
-        score_dates(world["days"], _bucket_cfg(SentimentFilter.POSITIVE), table=world["table"],
-                    primitive_embeddings=world["P"], source=InMemoryHeadlineSource(world["X"]),
-                    calibration=cal, null_sink=sink, use_kernel=False)
+    cfg = _tag_cfg(mask_bipolar=mask, jump_cut=True, jump_min_candidates=1)
+    codes = _codes(world)
+    a = _run(world, cfg, cal, codes, use_kernel=False, keep_primitive_daily=True)
+    b = _run(world, cfg, cal, codes, use_kernel=True, keep_primitive_daily=True)
+    for fa, fb in ((a.narrative_daily, b.narrative_daily), (a.primitive_daily, b.primitive_daily)):
+        np.testing.assert_array_equal(fa["SUPPORT"].to_numpy(), fb["SUPPORT"].to_numpy())
+        for col in ("TOTAL_SCORE", "INTENSITY", "STD_SCORE", "PEAK"):
+            np.testing.assert_allclose(fa[col].to_numpy(), fb[col].to_numpy(), rtol=1e-6,
+                                       equal_nan=True)
+    for col in ("N_SCORED", "N_UNTAGGED", "N_UNASSIGNED", "N_Q_CANDIDATES",
+                "N_F0_SURVIVORS_PRE_Q", "N_RETAINED_PRE_JUMP", "N_RETAINED_POST_Q_TAU",
+                "N_POLE_MASKED", "N_MASK_CHANGED_RETENTION"):
+        assert a.day_diagnostics[col].to_list() == b.day_diagnostics[col].to_list(), col
 
 
-def test_sentiment_config_validation_and_identity():
-    with pytest.raises(ValueError, match="only meaningful"):
-        ScoringConfig(sentiment_source="finbert")
-    with pytest.raises(ValueError, match="sentiment_source must be one of"):
-        ScoringConfig(sentiment="positive")
-    with pytest.raises(ValueError, match="neg_max < pos_min"):
-        _bucket_cfg("positive", neg_max=0.2, pos_min=0.2)
-    with pytest.raises(ValueError, match="neg_max < pos_min"):
-        _bucket_cfg("positive", neg_max=-1.5)
-    with pytest.raises(ValueError, match="model sources only"):
-        ScoringConfig(sentiment="positive", sentiment_source="ravenpack", sentiment_rule="css",
-                      min_conf=0.2)
-    with pytest.raises(ValueError, match="sentiment_rule"):
-        ScoringConfig(sentiment="positive", sentiment_source="ravenpack")      # rule mean
-    with pytest.raises(ValueError, match="sentiment_rule"):
-        _bucket_cfg("positive", sentiment_rule="css")
-    # a no-filter config hashes exactly as before the filter existed
-    import hashlib
-    import json
-
-    legacy = {**ScoringConfig().to_dict(), "sentiment_split": "none", "neutral_eps": 0.0,
-              "sentiment_source": "none", "sentiment_column": ""}
-    for k in ("sentiment", "sentiment_rule", "neg_max", "pos_min", "min_conf", "label",
-              "mask_bipolar"):
-        legacy.pop(k)
-    want = hashlib.sha1(json.dumps(legacy, sort_keys=True).encode()).hexdigest()[:16]
-    assert ScoringConfig().digest() == want
-    old_form = {**ScoringConfig().to_dict(), "sentiment_split": "none", "neutral_eps": 0.0,
-                "sentiment_column": ""}
-    for k in ("sentiment", "sentiment_rule", "neg_max", "pos_min", "min_conf", "mask_bipolar"):
-        old_form.pop(k)
-    assert ScoringConfig.from_dict(old_form).digest() == want
-    with pytest.raises(ValueError, match="removed in-run sentiment split"):
-        ScoringConfig.from_dict({**old_form, "sentiment_split": "sign"})
-    # buckets differ in config_id, not in the filter-free digest nor in the null model
-    cfgs = [_bucket_cfg(b) for b in SENTIMENT_BUCKETS]
-    assert len({c.digest() for c in cfgs}) == 4
-    assert len({c.digest_without_filter() for c in cfgs}) == 1
-    assert {c.f0_digest() for c in cfgs} == {ScoringConfig().f0_digest()}
-    assert _bucket_cfg("positive", min_conf=0.1).digest_without_filter() != \
-        cfgs[0].digest_without_filter()
-
-
-def test_bucket_identity_in_metadata_and_diagnostics(world):
+@pytest.mark.parametrize("use_kernel", [False, KERNEL])
+def test_untagged_headlines_feed_the_null_model_only(world, tmp_path, use_kernel):
     cal = FixedTauProvider(_tau(0.2), world["mu_df"])
-    runs, _ = _bucket_runs(world, cal)
-    r = runs[SentimentFilter.NEGATIVE]
+    codes = _codes(world)
+    sinks = {}
+    for name, cfg, c in (("plain", ScoringConfig(q=0.75), None), ("tagged", _tag_cfg(), codes)):
+        sinks[name] = MonthlyNullPartitionWriter(tmp_path / name, config=cfg,
+                                                 table=world["table"], seed=3)
+        r = _run(world, cfg, cal, c, use_kernel=use_kernel, null_sink=sinks[name])
+        sinks[name].finalise_before(date(2008, 10, 1))
+        if name == "tagged":
+            tagged = r
+    # the same draws from the same rows, whatever the tags (RSS is telemetry)
+    assert load_partitions(tmp_path / "plain").drop("RSS_PEAK_GB").equals(
+        load_partitions(tmp_path / "tagged").drop("RSS_PEAK_GB"))
+    d = tagged.day_diagnostics
+    for x in world["days"]:
+        rows = d.filter(pl.col("DATE") == x)
+        n_untagged = int((codes[x] < 0).sum())
+        assert n_untagged > 0 and (rows["N_UNTAGGED"] == n_untagged).all()
+        assert rows["N_SCORED"].sum() + n_untagged == world["X"][x].shape[0]
+    total = sum_tags(tagged.narrative_daily, d)            # explicit, checked gap
+    assert (total["N_LABELLED"] < total["N_HEADLINES"]).all()
+
+
+def test_tags_in_metadata_and_diagnostics(world):
+    cal = FixedTauProvider(_tau(0.2), world["mu_df"])
+    r = _run(world, _tag_cfg(), cal, _codes(world), sentiment_artifact_id="hs-1")
     assert r.metadata.sentiment_artifact_id == "hs-1"
-    assert r.metadata.config["sentiment"] == "negative"
-    assert r.day_diagnostics["SENTIMENT_SOURCE_ID"].unique().to_list() == ["hs-1:mean:negative"]
-    off = score_dates(world["days"], ScoringConfig(q=0.75), table=world["table"],
-                      primitive_embeddings=world["P"],
-                      source=InMemoryHeadlineSource(world["X"]), calibration=cal,
-                      use_kernel=False)
+    assert r.metadata.config["tags"]["rule"] == "mean"
+    assert r.day_diagnostics["SENTIMENT_SOURCE_ID"].unique().to_list() == ["hs-1:mean"]
+    off = _run(world, ScoringConfig(q=0.75), cal)
     assert off.day_diagnostics["SENTIMENT_SOURCE_ID"].null_count() == off.n_days
     assert (off.day_diagnostics["N_SCORED"] == off.day_diagnostics["N_HEADLINES"]).all()
+    assert off.day_diagnostics["SENTIMENT"].unique().to_list() == ["all"]
     assert off.metadata.sentiment_artifact_id is None
 
 
-def test_sum_sentiment_runs_checks_that_the_runs_belong_together(world):
+def test_a_tagged_config_needs_tag_codes(world):
     cal = FixedTauProvider(_tau(0.2), world["mu_df"])
-    runs, _ = _bucket_runs(world, cal)
-    good = [SentimentRun.from_result(r) for r in runs.values()]
-    sum_sentiment_runs(good)
+    with pytest.raises(ValueError, match="gives none"):
+        _run(world, _tag_cfg(), cal, None)
 
-    def swap(i, **kw):
-        out = list(good)
-        out[i] = SentimentRun(**{**good[i].__dict__, **kw})
-        return out
 
-    with pytest.raises(ValueError, match="exactly once"):
-        sum_sentiment_runs(good[:3])
-    with pytest.raises(ValueError, match="exactly once"):
-        sum_sentiment_runs(good[:3] + [good[0]])
-    with pytest.raises(ValueError, match="sentiment artifact"):
-        sum_sentiment_runs(swap(1, sentiment_artifact_id="hs-other"))
-    other_rule = ScoringConfig(**{**good[2].config.to_dict(), "sentiment_rule": "median"})
-    with pytest.raises(ValueError, match="sentiment_rule"):
-        sum_sentiment_runs(swap(2, config=other_rule))
-    other_q = ScoringConfig(**{**good[2].config.to_dict(), "q": 0.9})
-    with pytest.raises(ValueError, match="bucket removed"):
-        sum_sentiment_runs(swap(2, config=other_q))
-    masked = ScoringConfig(**{**good[1].config.to_dict(), "mask_bipolar": True})
-    with pytest.raises(ValueError, match="mask_bipolar"):
-        sum_sentiment_runs(swap(1, config=masked))
-    with pytest.raises(ValueError, match="tau_asof"):
-        sum_sentiment_runs(swap(0, tau_asof_id="tau_other"))
-    with pytest.raises(ValueError, match="mu_asof"):
-        sum_sentiment_runs(swap(3, mu_asof_id="mu_other"))
-    bumped = good[1].frame.with_columns(
-        pl.when(pl.col("DATE") == D0).then(pl.col("N_HEADLINES") + 1)
-        .otherwise(pl.col("N_HEADLINES")).alias("N_HEADLINES"))
-    with pytest.raises(ValueError, match="N_HEADLINES differs"):
-        sum_sentiment_runs(swap(1, frame=bumped))
-    with pytest.raises(ValueError, match="day sets"):
-        sum_sentiment_runs(swap(1, frame=good[1].frame.filter(pl.col("DATE") != D0)))
-    # a missing (zero-support) row in one run is treated as zero: the sum is unchanged
-    sparse = good[0].frame.filter(pl.col("SUPPORT") > 0)
-    assert sparse.height < good[0].frame.height
-    a = sum_sentiment_runs(good).sort(["DATE", "narrative_key"])
-    b = sum_sentiment_runs(swap(0, frame=sparse)).sort(["DATE", "narrative_key"])
-    assert a.equals(b)
+def test_tag_config_identity():
+    import hashlib
+    import json
+
+    # a config without tags hashes exactly as before any sentiment layer existed
+    legacy = {**ScoringConfig().to_dict(), "sentiment_split": "none", "neutral_eps": 0.0,
+              "sentiment_source": "none", "sentiment_column": ""}
+    for k in ("tags", "label", "mask_bipolar"):
+        legacy.pop(k)
+    want = hashlib.sha1(json.dumps(legacy, sort_keys=True).encode()).hexdigest()[:16]
+    assert ScoringConfig().digest() == want
+    split_form = {**{k: v for k, v in ScoringConfig().to_dict().items() if k != "tags"},
+                  "sentiment_split": "none", "neutral_eps": 0.0, "sentiment_column": ""}
+    split_form.pop("mask_bipolar")
+    assert ScoringConfig.from_dict(split_form).digest() == want
+    bucket_form = {**{k: v for k, v in ScoringConfig().to_dict().items() if k != "tags"},
+                   "sentiment": "none", "sentiment_source": "none", "sentiment_rule": "mean",
+                   "neg_max": -1 / 3, "pos_min": 1 / 3, "min_conf": 0.0}
+    assert ScoringConfig.from_dict(bucket_form).digest() == want
+    with pytest.raises(ValueError, match="removed in-run sentiment split"):
+        ScoringConfig.from_dict({**split_form, "sentiment_split": "sign"})
+    with pytest.raises(ValueError, match="single-bucket"):
+        ScoringConfig.from_dict({**bucket_form, "sentiment": "negative"})
+    # the tags enter config_id, never the null model
+    tagged = _tag_cfg()
+    assert tagged.digest() != ScoringConfig(q=0.75).digest()
+    assert tagged.f0_digest() == ScoringConfig().f0_digest()
+    assert tagged.warmup_digest() == ScoringConfig().warmup_digest()
+    assert ScoringConfig.from_dict(tagged.to_dict()) == tagged
+    assert _tag_cfg([("a", "x < 0"), ("b", "x >= 0")]).digest() != tagged.digest()
+    with pytest.raises(ValueError, match="grid table"):
+        ScoringConfig(tags=SentimentTags.build("ravenpack", "mean", TERNARY))
+
+
+# ---------------------------------------------------------------------------
+# Asset layer
+# ---------------------------------------------------------------------------
+
+def _universe(n_assets=4) -> AssetUniverse:
+    frame = pl.DataFrame({
+        "snapshot_date": ([date(2008, 9, 1)] * n_assets + [date(2008, 9, 16)] * 2
+                          + [date(2008, 9, 1)]),
+        "rp_entity_id": [f"E{i}" for i in range(n_assets)] + ["E0", "E2", None]})
+    return AssetUniverse.from_frame(frame, artifact_id="u-1", min_relevance=0.75)
+
+
+def _assets(world, n_assets=4, seed=7):
+    rng = np.random.default_rng(seed)
+    out = {}
+    for d, X in world["X"].items():
+        rows = []
+        for _ in range(X.shape[0]):
+            k = rng.integers(0, 3)
+            a = sorted(rng.choice(n_assets, size=k, replace=False).tolist())
+            rows.append([(int(i), int(rng.integers(0, 101))) for i in a])
+        out[d] = rows
+    return out
+
+
+def _run_assets(world, cfg, cal, codes, assets, use_kernel=False):
+    return score_dates(world["days"], cfg, table=world["table"], primitive_embeddings=world["P"],
+                       source=InMemoryHeadlineSource(world["X"], chunk_size=11, tags=codes,
+                                                     assets=assets),
+                       calibration=cal, use_kernel=use_kernel, assets=_universe())
+
+
+@pytest.mark.parametrize("use_kernel", [False, KERNEL])
+def test_asset_attention_counts(world, use_kernel):
+    cal = FixedTauProvider(_tau(0.2), world["mu_df"])
+    codes, assets = _codes(world), _assets(world)
+    r = _run_assets(world, _tag_cfg(), cal, codes, assets, use_kernel)
+    att = r.asset_attention
+    assert att is not None and att.height > 0
+    for x in world["days"]:
+        for t, (name, _) in enumerate(TERNARY):
+            for a in range(4):
+                rels = [w for row, c in zip(assets[x], codes[x]) if c == t
+                        for i, w in row if i == a]
+                got = att.filter((pl.col("DATE") == x) & (pl.col("SENTIMENT") == name)
+                                 & (pl.col("RP_ENTITY_ID") == f"E{a}"))
+                if not rels:
+                    assert got.height == 0                      # sparse: no row
+                    continue
+                row = got.row(0, named=True)
+                assert row["N_STORIES"] == len(rels)
+                assert row["N_STORIES_REL"] == sum(w >= 75 for w in rels)   # 0.75
+                assert row["REL_SUM"] == pytest.approx(sum(rels) / 100)
+                assert row["N_HEADLINES"] == world["X"][x].shape[0]
+    # membership as of the day: E1, E3 leave at the 2008-09-16 snapshot
+    first, later = sorted(world["days"])[0], sorted(world["days"])[1]
+    inu = att.filter(pl.col("RP_ENTITY_ID") == "E1").select("DATE", "IN_UNIVERSE").unique()
+    assert dict(inu.iter_rows()).get(first) is True
+    assert dict(inu.iter_rows()).get(later, False) is False
+    unmapped = dict(r.day_diagnostics.select("DATE", "N_UNMAPPED").unique().iter_rows())
+    assert unmapped[first] == 1 and unmapped[later] == 0      # the null row is in snapshot 1
+
+
+@pytest.mark.parametrize("use_kernel", [False, KERNEL])
+def test_an_asset_on_every_headline_reproduces_narrative_daily(world, use_kernel):
+    """Relevance 100 on every headline: narrative x asset is narrative_daily, in all three
+    column groups (plain, >= min_relevance, relevance-weighted with w = 1)."""
+    cal = FixedTauProvider(_tau(0.2), world["mu_df"])
+    every = {d: [[(0, 100)] for _ in range(X.shape[0])] for d, X in world["X"].items()}
+    r = _run_assets(world, _tag_cfg(), cal, _codes(world), every, use_kernel)
+    nd = r.narrative_daily.filter(pl.col("SUPPORT") > 0).rename(
+        {c: f"nd_{c}" for c in ("SUPPORT", "TOTAL_SCORE", "INTENSITY", "STD_SCORE", "PEAK")})
+    cross = r.narrative_asset.filter(pl.col("RP_ENTITY_ID") == "E0")
+    j = nd.join(cross, on=["DATE", "SENTIMENT", "narrative_key"], how="full", coalesce=True)
+    assert j.height == nd.height == cross.height
+    for col in ("SUPPORT", "SUPPORT_REL"):
+        np.testing.assert_array_equal(j[col].to_numpy(), j["nd_SUPPORT"].to_numpy())
+    for col in ("TOTAL_SCORE", "TOTAL_SCORE_REL", "TOTAL_SCORE_RELW"):
+        np.testing.assert_allclose(j[col].to_numpy(), j["nd_TOTAL_SCORE"].to_numpy(), rtol=1e-12)
+    for col in ("PEAK", "PEAK_REL"):
+        np.testing.assert_array_equal(j[col].to_numpy(), j["nd_PEAK"].to_numpy())
+    n = j["SUPPORT"].to_numpy().astype(np.float64)
+    sumsq = n * (j["nd_STD_SCORE"].cast(pl.Float64).to_numpy() ** 2
+                 + j["nd_INTENSITY"].cast(pl.Float64).to_numpy() ** 2)
+    for col in ("SUMSQ", "SUMSQ_REL", "SUMSQ_RELW"):
+        np.testing.assert_allclose(j[col].to_numpy(), sumsq, rtol=1e-5)
+
+
+def test_relevance_columns_follow_the_threshold(world):
+    """*_REL columns keep only headlines with RELEVANCE >= min_relevance; *_RELW weight
+    by RELEVANCE / 100; plain columns keep every headline."""
+    cal = FixedTauProvider(_tau(0.2), world["mu_df"])
+    rels = {d: [[(0, 60 if i % 2 else 59)] for i in range(X.shape[0])]
+            for d, X in world["X"].items()}
+    cfg = _tag_cfg([("every", "x >= -2")])
+    zeros = {d: np.zeros(X.shape[0], dtype=np.int8) for d, X in world["X"].items()}
+    frame = pl.DataFrame({"snapshot_date": [date(2008, 9, 1)], "rp_entity_id": ["E0"]})
+    r = score_dates(world["days"], cfg, table=world["table"], primitive_embeddings=world["P"],
+                    source=InMemoryHeadlineSource(world["X"], chunk_size=11, tags=zeros,
+                                                  assets=rels),
+                    calibration=cal, use_kernel=False,
+                    assets=AssetUniverse.from_frame(frame, artifact_id="u", min_relevance=0.6))
+    att = r.asset_attention
+    for x in world["days"]:
+        row = att.filter(pl.col("DATE") == x).row(0, named=True)
+        n = world["X"][x].shape[0]
+        assert row["N_STORIES"] == n and row["N_STORIES_REL"] == n // 2
+        assert row["REL_SUM"] == pytest.approx((n // 2) * 0.60 + (n - n // 2) * 0.59)
+    c = r.narrative_asset
+    assert (c["SUPPORT_REL"] <= c["SUPPORT"]).all()
+    assert (c["TOTAL_SCORE_REL"] <= c["TOTAL_SCORE"] + 1e-12).all()
+    assert (c.filter(pl.col("SUPPORT_REL") == 0)["PEAK_REL"].null_count()
+            == c.filter(pl.col("SUPPORT_REL") == 0).height)
+    np.testing.assert_allclose(c["TOTAL_SCORE_RELW"].to_numpy(),
+                               0.59 * c["TOTAL_SCORE"].to_numpy()
+                               + 0.01 * c["TOTAL_SCORE_REL"].to_numpy(), rtol=1e-9)
+
+
+@pytest.mark.skipif(not HAVE_SELECT, reason="kernel not built")
+def test_kernel_and_numpy_asset_tables_agree(world):
+    cal = FixedTauProvider(_tau(0.2), world["mu_df"])
+    codes, assets = _codes(world), _assets(world)
+    a = _run_assets(world, _tag_cfg(mask_bipolar=True), cal, codes, assets, False)
+    b = _run_assets(world, _tag_cfg(mask_bipolar=True), cal, codes, assets, True)
+    assert a.asset_attention.equals(b.asset_attention)
+    ka, kb = a.narrative_asset, b.narrative_asset
+    assert ka.select("DATE", "SENTIMENT", "narrative_key", "RP_ENTITY_ID", "SUPPORT",
+                     "SUPPORT_REL").equals(kb.select("DATE", "SENTIMENT", "narrative_key",
+                                                     "RP_ENTITY_ID", "SUPPORT", "SUPPORT_REL"))
+    for col in ("TOTAL_SCORE", "SUMSQ", "PEAK", "TOTAL_SCORE_REL", "SUMSQ_REL", "PEAK_REL",
+                "TOTAL_SCORE_RELW", "SUMSQ_RELW"):
+        np.testing.assert_allclose(ka[col].to_numpy(), kb[col].to_numpy(), rtol=1e-6)
+
+
+def test_a_story_counts_once_per_asset_at_its_max_relevance():
+    """Three AAPL events in one story: one (story, asset) entry, relevance = max."""
+    from narrative_scoring.assets import headline_assets
+
+    u = AssetUniverse.from_frame(pl.DataFrame({"snapshot_date": [date(2008, 1, 1)] * 2,
+                                               "rp_entity_id": ["AAPL", "MSFT"]}),
+                                 artifact_id="u")
+    rows = pl.DataFrame({
+        "_r": [0, 1],
+        "RP_ENTITY_ID": [["AAPL", "AAPL", "USPL", "AAPL"], ["MSFT", "XXXX"]],
+        "RELEVANCE": [[40, 100, 20, 70], [55, 100]],
+    }, schema={"_r": pl.UInt32, "RP_ENTITY_ID": pl.List(pl.String),
+               "RELEVANCE": pl.List(pl.UInt8)})
+    indptr, asset, rel = headline_assets(rows, u.asset_map(), 2)
+    assert indptr.tolist() == [0, 1, 2]
+    assert asset.tolist() == [0, 1] and rel.tolist() == [100, 55]
+    day = AssetDay(1, 3, 2, 0.75)
+    day.add_attention(np.zeros(2, dtype=np.int8), indptr, asset, rel)
+    assert day.n_stories.tolist() == [[1, 1]] and day.n_rel.tolist() == [[1, 0]]
+    day.add_cross(np.zeros(2, dtype=np.int8), np.array([2, 0], dtype=np.int32),
+                  np.array([[0, 2, -1], [-1, -1, -1]], dtype=np.int32),
+                  np.array([[0.5, 0.25, np.nan], [np.nan] * 3]), indptr, asset, rel)
+    keys, sums, peaks = day.cross()
+    assert keys.size == 2 and sums[:, 0].tolist() == [1.0, 1.0]       # once per narrative
+    assert peaks[:, 0].tolist() == [0.5, 0.25]
 
 
 # ---------------------------------------------------------------------------
@@ -639,3 +775,26 @@ def test_cold_start_without_mu_skips_day_entirely(world, tmp_path: Path):
         score_dates([D0], cfg, table=world["table"], primitive_embeddings=world["P"],
                     source=InMemoryHeadlineSource(world["X"]), calibration=early,
                     use_kernel=False)
+
+
+@pytest.mark.parametrize("use_kernel", [False, KERNEL])
+def test_null_partitions_across_chunk_sizes(world, tmp_path, use_kernel):
+    """The draw stream is one RNG per period and columns are drawn before rejection, so
+    the sampled columns do not depend on chunk boundaries; only S's BLAS rounding does,
+    which can move a kept/rejected draw exactly at the trim threshold (none here)."""
+    cfg = ScoringConfig(q=0.75, null_draws_per_headline=5)
+    cal = FixedTauProvider(_tau(0.2), world["mu_df"])
+    parts = {}
+    for cs in (7, 1000):
+        sink = MonthlyNullPartitionWriter(tmp_path / str(cs), config=cfg, table=world["table"],
+                                          seed=2)
+        score_dates(world["days"], cfg, table=world["table"], primitive_embeddings=world["P"],
+                    source=InMemoryHeadlineSource(world["X"], chunk_size=cs), calibration=cal,
+                    use_kernel=use_kernel, null_sink=sink)
+        sink.finalise_before(date(2008, 10, 1))
+        parts[cs] = load_partitions(tmp_path / str(cs)).row(0, named=True)
+    a, b = parts[7], parts[1000]
+    for key in ("N_HEADLINES", "N_DRAWS_AVAILABLE", "N_DRAWS_SAMPLED", "WELFORD_COUNT"):
+        assert a[key] == b[key], key
+    assert a["WELFORD_MEAN"] == pytest.approx(b["WELFORD_MEAN"], rel=1e-6)
+    assert a["WELFORD_M2"] == pytest.approx(b["WELFORD_M2"], rel=1e-5)

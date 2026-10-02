@@ -15,7 +15,7 @@ from narrative_scoring.calibration import TauRecord
 from narrative_scoring.config import AggRule, ScoringConfig
 from narrative_scoring.f0 import n_keep, n_trim, sample_null_draws, trim_threshold
 from narrative_scoring.partitions import NullPartitionWriter, load_partitions
-from narrative_scoring.pipeline import _accumulate_block, score_dates
+from narrative_scoring.pipeline import _accumulate_block, _DayState, _Funnel, score_dates
 from narrative_scoring.primitives import (
     BipolarPairs,
     PrimitiveTable,
@@ -339,10 +339,11 @@ def test_trim_threshold_and_draws_come_from_the_masked_row(toy_table, use_kernel
     n_masked_ref = apply_pole_mask(masked, pairs)
     cfg = _raw(0.75, mask_bipolar=True)
     S_run = S.copy()
-    thr, n_masked = _accumulate_block(
+    state = _DayState([DayAccumulator(toy_table.n_narratives)], None, [_Funnel()])
+    blk = _accumulate_block(
         S_run, 0.2, 2, cfg, toy_table.primitive_to_narrative, toy_table.n_narratives,
-        DayAccumulator(toy_table.n_narratives), None, use_kernel, 2, None,
-        n_trim(toy_table.n_primitives, cfg.trim_frac), pairs)
+        state, None, use_kernel, 2, n_trim(toy_table.n_primitives, cfg.trim_frac), pairs)
+    thr, n_masked = blk.thresholds, blk.n_masked
     np.testing.assert_array_equal(S_run, masked)
     np.testing.assert_array_equal(n_masked, n_masked_ref)
     np.testing.assert_array_equal(thr, trim_threshold(masked, cfg.trim_frac))
@@ -424,8 +425,8 @@ def _day_frame(S, table, nodes, p2n, pairs, use_kernel, q=0.5, tau=0.1):
     cfg = _raw(q, mask_bipolar=pairs is not None)
     acc = DayAccumulator(nodes.height)
     k = max(1, int(np.ceil((1 - q) * table.n_primitives - 1e-9)))
-    _accumulate_block(S.copy(), tau, k, cfg, p2n, nodes.height, acc, None, use_kernel, 2, None,
-                      0, pairs)
+    _accumulate_block(S.copy(), tau, k, cfg, p2n, nodes.height,
+                      _DayState([acc], None, [_Funnel()]), None, use_kernel, 2, 0, pairs)
     return acc.frame(nodes, D0)
 
 

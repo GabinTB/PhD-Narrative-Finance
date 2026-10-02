@@ -15,6 +15,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
 
+from narrative_scoring.tags import SentimentTags
 from nlp.corrections import Correction
 
 SPEC_PATH = "python/doc/narratives.md"
@@ -61,31 +62,16 @@ def n_candidates_for(q: float, n_primitives: int) -> int:
     return max(1, int(math.ceil((1.0 - q) * n_primitives - 1e-9)))
 
 
-class SentimentFilter(str, Enum):
-    """Which headlines a run scores. ``none`` = all of them; the four others are the
-    sentiment buckets, which partition the headlines (see ``ScoringConfig``)."""
-
-    NONE = "none"
-    POSITIVE = "positive"
-    NEUTRAL = "neutral"
-    NEGATIVE = "negative"
-    UNSCORED = "unscored"
-
-
-SENTIMENT_ALL = "all"          # narrative_daily SENTIMENT value of a ``none`` run
-SENTIMENT_NONE = "none"
-SENTIMENT_BUCKETS = (SentimentFilter.POSITIVE, SentimentFilter.NEUTRAL,
-                     SentimentFilter.NEGATIVE, SentimentFilter.UNSCORED)
-MODEL_SOURCES = ("ravenbert", "finbert")      # grid tables (P_00..P_40)
-VENDOR_SOURCES = ("ravenpack",)               # one score column (SENT_CSS)
-MODEL_RULES = ("argmax", "mean", "median")    # nlp.sentiment.ordinal_sql.RULES
-VENDOR_RULES = ("css",)
-_SENTIMENT_FIELDS = ("sentiment", "sentiment_source", "sentiment_rule", "neg_max", "pos_min",
-                     "min_conf")
-# what a no-filter config hashed as before the sentiment filter existed: kept so the
+SENTIMENT_ALL = "all"          # narrative_daily SENTIMENT value of a run without tags
+MODEL_SOURCES = ("ravenbert", "finbert")      # headline_sentiment grid tables (P_00..P_40)
+# what a config without tags hashed as before any sentiment layer existed: kept so the
 # config_id of every existing all-headlines run stays the same
 _LEGACY_NO_SENTIMENT = {"sentiment_split": "none", "neutral_eps": 0.0,
                         "sentiment_source": "none", "sentiment_column": ""}
+# fields of earlier config forms, read back by from_dict
+_LEGACY_SPLIT = ("sentiment_split", "neutral_eps", "sentiment_column")
+_LEGACY_BUCKET = ("sentiment", "sentiment_source", "sentiment_rule", "neg_max", "pos_min",
+                  "min_conf")
 
 
 @dataclass(frozen=True)
@@ -107,25 +93,15 @@ class ScoringConfig:
         min_month_draws: the tau job extends its window backwards until the merged pool
             holds at least this many draws (tau_asof.py).
         gap_alert_threshold: |tau_gauss - tau_empirical| above this is logged (warning only).
-        sentiment: which headlines are scored: ``none`` (all) or one bucket. A bucket is
-            selected at load time, from the ``headline_sentiment`` artifact of
-            ``sentiment_source``, with SENT and CONF computed by ``sentiment_rule``
-            (``nlp.sentiment.ordinal_sql``; vendor: the SENT_CSS score, no CONF):
-
-                unscored = SENT null OR CONF < min_conf
-                negative = SENT <= neg_max          (and not unscored)
-                positive = SENT >= pos_min          (and not unscored)
-                neutral  = neg_max < SENT < pos_min (and not unscored)
-
-            -1 <= neg_max < pos_min <= 1, so the four buckets partition the headlines,
-            and a bucket run reuses the all-headlines tau and mu: the four bucket runs
-            add up exactly to the ``none`` run (validation.sum_sentiment_runs).
-        sentiment_source: ``ravenbert`` | ``finbert`` (grid tables) | ``ravenpack`` (SENT_CSS).
-        sentiment_rule: ``argmax`` | ``mean`` | ``median`` (models) or ``css`` (vendor).
-        neg_max, pos_min, min_conf: the bucket thresholds above; ``min_conf`` applies to
-            model sources only.
-        The sentiment fields do not enter ``f0_digest`` / ``warmup_digest``, and a
-        ``none`` config hashes exactly as before they existed.
+        tags: the sentiment layer (``narrative_scoring.tags.SentimentTags``): score source
+            (a ``headline_sentiment`` grid table, ``ravenbert`` | ``finbert``), ordinal rule
+            and disjoint intervals of the score, one output label each. In ONE pass every
+            headline is scored and feeds the null model; a tagged headline also feeds its
+            tag's rows, an untagged one (no interval, or no score) feeds no row and is
+            counted. ``None``: one label, ``all``, every headline. The tags enter
+            ``digest`` only (never ``f0_digest`` / ``warmup_digest``: the null model is the
+            same whatever the tags), and a config without tags hashes exactly as before
+            any sentiment layer existed.
         mask_bipolar: per headline, keep one pole of every bipolar pair (two signed
             SUB_TYPEs under one TOPIC/GROUP/TYPE): the pole with the higher mean of its
             top-3 primitive scores (first pole in table order on an exact tie); every
@@ -149,20 +125,14 @@ class ScoringConfig:
     null_draws_per_headline: int = 64
     min_month_draws: int = 20_000_000
     gap_alert_threshold: float = 0.05
-    sentiment: SentimentFilter = SentimentFilter.NONE
-    sentiment_source: str = SENTIMENT_NONE
-    sentiment_rule: str = "mean"
-    neg_max: float = -1.0 / 3.0
-    pos_min: float = 1.0 / 3.0
-    min_conf: float = 0.0
+    tags: SentimentTags | None = None
     mask_bipolar: bool = False
     label: str = ""
 
     def __post_init__(self) -> None:
         # accept the string form of every enum (CLI / JSON round trips)
         for name, enum_type in (("mode", Correction), ("paraphrase_style", ParaphraseStyle),
-                                ("paraphrase_pooling", PoolRule), ("narrative_agg", AggRule),
-                                ("sentiment", SentimentFilter)):
+                                ("paraphrase_pooling", PoolRule), ("narrative_agg", AggRule)):
             value = getattr(self, name)
             if not isinstance(value, enum_type):
                 object.__setattr__(self, name, enum_type(value))
@@ -180,39 +150,29 @@ class ScoringConfig:
             raise ValueError("min_month_draws must be >= 1")
         if self.gap_alert_threshold <= 0:
             raise ValueError("gap_alert_threshold must be > 0")
-        if self.sentiment is SentimentFilter.NONE:
-            if self.sentiment_source != SENTIMENT_NONE:
-                raise ValueError("sentiment_source is only meaningful with a sentiment filter")
-            return
-        if self.sentiment_source in MODEL_SOURCES:
-            rules = MODEL_RULES
-        elif self.sentiment_source in VENDOR_SOURCES:
-            rules = VENDOR_RULES
-            if self.min_conf != 0.0:
-                raise ValueError(f"min_conf applies to model sources only; "
-                                 f"{self.sentiment_source} has no confidence")
-        else:
-            raise ValueError(f"sentiment_source must be one of "
-                             f"{MODEL_SOURCES + VENDOR_SOURCES}, got {self.sentiment_source!r}")
-        if self.sentiment_rule not in rules:
-            raise ValueError(f"sentiment_rule for {self.sentiment_source} must be one of "
-                             f"{rules}, got {self.sentiment_rule!r}")
-        if not -1.0 <= self.neg_max < self.pos_min <= 1.0:
-            raise ValueError(f"need -1 <= neg_max < pos_min <= 1, got neg_max={self.neg_max}, "
-                             f"pos_min={self.pos_min}")
-        if not 0.0 <= self.min_conf <= 1.0:
-            raise ValueError(f"min_conf must be in [0, 1], got {self.min_conf}")
+        if isinstance(self.tags, dict):
+            object.__setattr__(self, "tags", SentimentTags.from_dict(self.tags))
+        if self.tags is not None:
+            if not isinstance(self.tags, SentimentTags):
+                raise ValueError(f"tags must be SentimentTags or its dict, got {self.tags!r}")
+            if self.tags.source not in MODEL_SOURCES:
+                raise ValueError(f"tags source must be one of {MODEL_SOURCES} (a grid table), "
+                                 f"got {self.tags.source!r}")
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> ScoringConfig:
-        """A config from its ``to_dict`` form, including the pre-filter form recorded by
-        older runs (``sentiment_split`` / ``neutral_eps`` / ``sentiment_column``)."""
+        """A config from its ``to_dict`` form, including the forms recorded by older runs:
+        the in-run split (``sentiment_split`` ...) and the bucket filter (``sentiment``
+        ...), readable when they selected every headline, refused otherwise."""
         d = dict(d)
-        legacy = {k: d.pop(k) for k in ("sentiment_split", "neutral_eps", "sentiment_column")
-                  if k in d}
+        legacy = {k: d.pop(k) for k in _LEGACY_SPLIT if k in d}
         if legacy.get("sentiment_split", "none") != "none":
             raise ValueError("this run used the removed in-run sentiment split "
                              f"({legacy}); it cannot be rebuilt")
+        bucket = {k: d.pop(k) for k in _LEGACY_BUCKET if k in d}
+        if bucket.get("sentiment", "none") != "none":
+            raise ValueError("this run used the removed single-bucket sentiment filter "
+                             f"({bucket}); it cannot be rebuilt")
         return cls(**d)
 
     def to_dict(self) -> dict[str, Any]:
@@ -220,30 +180,22 @@ class ScoringConfig:
         for k, v in d.items():
             if isinstance(v, Enum):
                 d[k] = v.value
+        d["tags"] = self.tags.to_dict() if self.tags is not None else None
         return d
 
-    def _hashable(self, *, with_filter: bool = True) -> dict[str, Any]:
+    def _hashable(self) -> dict[str, Any]:
         d = self.to_dict()
         d.pop("label")
         _drop_default_mask(d)
-        if self.sentiment is SentimentFilter.NONE:
-            for k in _SENTIMENT_FIELDS:
-                d.pop(k)
+        if self.tags is None:
+            d.pop("tags")
             d.update(_LEGACY_NO_SENTIMENT)
-        elif not with_filter:
-            d.pop("sentiment")
         return d
 
     def digest(self) -> str:
-        """Stable hash of every numerical choice (``label`` excluded). A ``none`` config
-        hashes as it did before the sentiment filter existed."""
+        """Stable hash of every numerical choice (``label`` excluded). A config without
+        tags hashes as it did before any sentiment layer existed."""
         return hashlib.sha1(json.dumps(self._hashable(), sort_keys=True).encode()).hexdigest()[:16]
-
-    def digest_without_filter(self) -> str:
-        """``digest`` with the bucket removed: equal across the four bucket runs of one
-        sentiment setup (same source, rule and thresholds)."""
-        d = self._hashable(with_filter=False)
-        return hashlib.sha1(json.dumps(d, sort_keys=True).encode()).hexdigest()[:16]
 
     def f0_digest(self) -> str:
         """Hash of the choices the null model depends on: mode, pooling, style, master,
@@ -263,13 +215,10 @@ class ScoringConfig:
         return hashlib.sha1(json.dumps(d, sort_keys=True).encode()).hexdigest()[:16]
 
     @property
-    def filtered(self) -> bool:
-        return self.sentiment is not SentimentFilter.NONE
-
-    @property
-    def row_label(self) -> str:
-        """The narrative_daily SENTIMENT value of this run: "all" or the bucket."""
-        return SENTIMENT_ALL if not self.filtered else self.sentiment.value
+    def labels(self) -> list[str]:
+        """The narrative_daily SENTIMENT values of this run, in tag order: the tag names,
+        or ``["all"]`` without tags."""
+        return self.tags.names if self.tags is not None else [SENTIMENT_ALL]
 
 
 def _drop_default_mask(d: dict[str, Any]) -> None:
@@ -301,7 +250,7 @@ class RunMetadata:
     n_eff: float                  # of the first tau row used; per-day values in day_diagnostics
     seed: int
     code_version: str | None
-    sentiment_artifact_id: str | None = None   # headline_sentiment artifact read by the split
+    sentiment_artifact_id: str | None = None   # headline_sentiment artifact behind the tags
     # what produced both sides of S = H @ P.T: primitive-text embeddings (backend,
     # serving metadata, checks) and the headline_embeddings artifact + model card
     embeddings_provenance: dict[str, Any] | None = None

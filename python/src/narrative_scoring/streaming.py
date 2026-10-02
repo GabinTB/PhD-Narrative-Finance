@@ -1,32 +1,23 @@
 """Bounded-memory, point-in-time access to headline embeddings, one day at a time.
 
-A ``HeadlineSource`` yields, for one calendar day, ``Chunk`` objects: a
-contiguous float32 (n, EMBEDDING_DIM) embedding block of at most
-``chunk_size`` rows plus, optionally, one sentiment score per row (NaN where
-unknown). That is the only contract the pipeline relies on, so a live
-micro-batch, a historical range and an in-memory test fixture all go
-through the same code.
+A ``HeadlineSource`` yields, for one calendar day, ``Chunk`` objects: a contiguous
+float32 (n, EMBEDDING_DIM) embedding block of at most ``chunk_size`` rows, plus, when
+the pass has those layers, each row's sentiment tag code (``tags.SentimentTags``) and
+its assets (CSR over ``assets.AssetUniverse``). That is the only contract the pipeline
+relies on, so a live micro-batch, a historical range and an in-memory test fixture
+all go through the same code. Every row of a day is yielded (the null model sees every
+headline); the tags only route a row's scores.
 
-``ParquetHeadlineSource`` is the datalake implementation. The day filter is
-pushed into the DuckDB query (one query per day, ~0.8 s on a 1.1M-row
-month measured locally), the embedding is cast to a fixed-size FLOAT array
-in SQL, and each Arrow batch is viewed as numpy without going through
-polars or a per-row list conversion: exactly one copy, made by DuckDB.
-DuckDB's own memory limit bounds the join, and ``prefetch`` overlaps the
-next chunk's I/O with the current chunk's scoring. Rows are ordered by
-RP_STORY_ID so the chunk stream, and with it the seeded null-draw sample,
-is deterministic across runs (a hash join's output order is not).
+``PartitionHeadlineSource`` is the datalake implementation: each storage partition is
+read ONCE (headlines, embeddings, and the sentiment grid / entity lists when needed),
+joined once on RP_STORY_ID with strict coverage, sorted by (day, RP_STORY_ID) and served
+day by day as slices. ``ParquetHeadlineSource`` is the previous per-day DuckDB query,
+kept as the reference the partition source is tested against (same rows, same order,
+same float32 values). Rows are ordered by RP_STORY_ID within a day so the chunk stream,
+and with it the seeded null-draw sample, is deterministic across runs.
 
-A filtered run (``config.sentiment`` = a bucket, sentiment_filter.py) scores only the
-headlines of its bucket: the day query LEFT JOINs the SENT / CONF of the day's stories,
-computed from the ``headline_sentiment`` partition (ravenpack/headlines/sentiment.py)
-restricted to those stories, and keeps the rows of the bucket, so nothing else is read
-into Python or scored. Strict coverage: a headline without a sentiment ROW raises; a row
-with null P_* (no model output) is "unscored", not an error. ``day_total(day)`` counts
-the day's headlines x embeddings rows with the SAME query builder and no filter: the
-denominator a filtered run shares with the all-headlines run, so attention adds up.
-The score is a function of the story as published, hence available at the headline's
-own timestamp (point-in-time).
+Point-in-time: a sentiment score and an entity list are functions of the story as
+published, available at the headline's own timestamp.
 """
 from __future__ import annotations
 
@@ -44,10 +35,16 @@ import polars as pl
 import pyarrow as pa
 
 from datalake.layout import Layout
+from narrative_scoring.assets import ENTITY_COL, AssetUniverse, headline_assets
 from narrative_scoring.schema import EMBEDDING_DIM
-from narrative_scoring.sentiment_filter import SentimentBucket
+from narrative_scoring.tags import UNTAGGED, SentimentTags
+from nlp.sentiment import GRID_COLUMNS
+from nlp.sentiment.ordinal_sql import reference
 
 log = logging.getLogger(__name__)
+
+ID_COL = "RP_STORY_ID"
+_SCORE_BLOCK = 1_000_000          # rows per block when computing grid scores
 
 
 class MemoryBudgetExceeded(RuntimeError):
@@ -68,9 +65,17 @@ def rss_gb() -> float:
 
 @dataclass
 class Chunk:
-    """One bounded block of a day's headlines."""
+    """One bounded block of a day's headlines.
+
+    ``tags``: int8 tag code per row (-1 untagged), None without a sentiment layer.
+    ``asset_indptr`` / ``asset_idx`` / ``asset_rel``: each row's assets (CSR, one entry
+    per (row, asset), RELEVANCE = max), None without an asset layer."""
 
     embeddings: np.ndarray                 # float32 (n, EMBEDDING_DIM), C-contiguous
+    tags: np.ndarray | None = None
+    asset_indptr: np.ndarray | None = None
+    asset_idx: np.ndarray | None = None
+    asset_rel: np.ndarray | None = None
 
     @property
     def n(self) -> int:
@@ -78,25 +83,18 @@ class Chunk:
 
 
 class HeadlineSource(Protocol):
-    """Point-in-time day access: the day's (possibly bucket-filtered) headlines, and the
-    day's total headline count before any filter."""
+    """Point-in-time day access: every headline of the day, in a deterministic order."""
 
     def iter_day(self, day: date) -> Iterator[Chunk]: ...
-
-    def day_total(self, day: date) -> int: ...
 
     def describe(self) -> str: ...
 
 
 @dataclass
 class ParquetHeadlineSource:
-    """Partitioned headline + embedding artifacts, joined on RP_STORY_ID.
-
-    Both artifacts share one ``layout`` (an embedding partition has the key of the
-    headlines partition it was computed from), so a day is read from the one pair
-    of files that holds it, whatever the partition frequency. With ``sentiment`` (a
-    ``SentimentBucket``), only the headlines of that bucket are yielded.
-    """
+    """The per-day DuckDB query (headlines x embeddings within the day, ordered by
+    RP_STORY_ID): the reference ``PartitionHeadlineSource`` is tested against. It reads
+    a whole embeddings partition for every day; production uses the partition source."""
 
     headlines_dir: Path
     embeddings_dir: Path
@@ -105,7 +103,6 @@ class ParquetHeadlineSource:
     duckdb_memory_limit: str = "6GB"
     temp_directory: str | None = "/tmp/duckdb_spill"
     source_id: str = ""
-    sentiment: SentimentBucket | None = None
     layout: Layout = field(default_factory=Layout)
 
     def __post_init__(self) -> None:
@@ -115,8 +112,7 @@ class ParquetHeadlineSource:
             raise ValueError("chunk_size must be >= 1")
 
     def describe(self) -> str:
-        base = self.source_id or f"parquet:{self.headlines_dir.name}+{self.embeddings_dir.name}"
-        return base if self.sentiment is None else f"{base}+sentiment:{self.sentiment.describe()}"
+        return self.source_id or f"parquet:{self.headlines_dir.name}+{self.embeddings_dir.name}"
 
     def has_day(self, day: date) -> bool:
         return (self.layout.file_for(self.headlines_dir, day).exists()
@@ -133,10 +129,6 @@ class ParquetHeadlineSource:
         return conn
 
     def _day_sql(self, day: date, *, count: bool = False) -> str:
-        """THE day query: headlines x embeddings on RP_STORY_ID within the day. ``count``
-        gives its row count with no sentiment filter (``day_total``); otherwise the
-        embeddings (+ the strict-coverage flag, filtered to the bucket, when ``sentiment``
-        is set) ordered by RP_STORY_ID."""
         hl = self.layout.file_for(self.headlines_dir, day)
         emb = self.layout.file_for(self.embeddings_dir, day)
         within = (f"h.TIMESTAMP_UTC >= '{day.isoformat()}' "
@@ -144,19 +136,10 @@ class ParquetHeadlineSource:
         joined = f"read_parquet('{hl}') h JOIN read_parquet('{emb}') e USING (RP_STORY_ID)"
         if count:
             return f"SELECT COUNT(*) FROM {joined} WHERE {within}"
-        if self.sentiment is None:
-            return (f"SELECT CAST(e.EMBEDDING AS FLOAT[{EMBEDDING_DIM}]) AS EMBEDDING "
-                    f"FROM {joined} WHERE {within} ORDER BY h.RP_STORY_ID")
-        day_ids = (f"SELECT h.RP_STORY_ID FROM read_parquet('{hl}') h WHERE {within}")
-        sent = self.sentiment.select_sql(self._sentiment_file(day), day_ids)
-        return (f"SELECT CAST(e.EMBEDDING AS FLOAT[{EMBEDDING_DIM}]) AS EMBEDDING, "
-                f"s.RP_STORY_ID IS NULL AS NO_ROW "
-                f"FROM {joined} LEFT JOIN ({sent}) s USING (RP_STORY_ID) "
-                f"WHERE {within} AND ({self.sentiment.predicate()} OR s.RP_STORY_ID IS NULL) "
-                f"ORDER BY h.RP_STORY_ID")
+        return (f"SELECT CAST(e.EMBEDDING AS FLOAT[{EMBEDDING_DIM}]) AS EMBEDDING "
+                f"FROM {joined} WHERE {within} ORDER BY h.RP_STORY_ID")
 
     def day_total(self, day: date) -> int:
-        """The day's headlines x embeddings rows, unfiltered (= a ``none`` run's N_HEADLINES)."""
         if not self.has_day(day):
             return 0
         conn = self._connect()
@@ -171,29 +154,10 @@ class ParquetHeadlineSource:
         conn = self._connect()
         try:
             for batch in conn.sql(self._day_sql(day)).to_arrow_reader(self.chunk_size):
-                if not batch.num_rows:
-                    continue
-                if self.sentiment is not None:
-                    no_row = batch.column(1).to_numpy(zero_copy_only=False)
-                    if no_row.any():
-                        raise LookupError(
-                            f"{day}: {int(no_row.sum())} headline(s) have no row in "
-                            f"{self.sentiment.describe()} (strict coverage)")
-                yield Chunk(arrow_embeddings_to_numpy(batch.column(0)))
+                if batch.num_rows:
+                    yield Chunk(arrow_embeddings_to_numpy(batch.column(0)))
         finally:
             conn.close()
-
-    def _sentiment_file(self, day: date) -> Path:
-        """The day's sentiment partition file (must exist)."""
-        assert self.sentiment is not None
-        path = self.layout.file_for(self.sentiment.sentiment_dir, day)
-        if not path.exists():
-            raise FileNotFoundError(f"{day}: sentiment partition file missing: {path} "
-                                    f"({self.sentiment.describe()})")
-        return path
-
-
-ID_COL = "RP_STORY_ID"
 
 
 def day_expr(dtype: pl.DataType) -> pl.Expr:
@@ -205,23 +169,32 @@ def day_expr(dtype: pl.DataType) -> pl.Expr:
     return ts.dt.date()
 
 
+def grid_tag_codes(P: np.ndarray, tags: SentimentTags) -> np.ndarray:
+    """Tag codes of the grid rows ``P`` (n, 41): the ordinal rule's score
+    (``ordinal_sql.reference``, the reference the SQL rules are tested against), then
+    the tag intervals; an all-null row (no model output) is untagged."""
+    out = np.full(P.shape[0], UNTAGGED, dtype=np.int8)
+    for i in range(0, P.shape[0], _SCORE_BLOCK):
+        sent, _ = reference(P[i:i + _SCORE_BLOCK], tags.rule)
+        out[i:i + _SCORE_BLOCK] = tags.codes(sent)
+    return out
+
+
 @dataclass
 class PartitionHeadlineSource:
-    """Headlines + embeddings read ONCE per storage partition, served day by day.
+    """Every input of a pass read ONCE per storage partition, served day by day.
 
-    ``ParquetHeadlineSource`` joins a day's headlines against the whole partition's
-    embeddings file for every day (2022-03: a 4.76 GB file read 31 times). Here a
-    partition's needed columns are read once and joined once on RP_STORY_ID, with
-    strict coverage: every headline has exactly one embedding row and every embedding
-    row a headline (a mismatch raises, naming the partition). The rows are sorted by
-    (day, RP_STORY_ID), the day query's order, and kept with the embeddings in float16
-    until a day of another partition is asked for; a day is then a contiguous slice,
-    converted to float32 (exactly) chunk by chunk. Same rows, same order, same float32
-    values as ``ParquetHeadlineSource``, hence the same scores and null draws.
+    A partition's needed columns are read once and joined once on RP_STORY_ID, with
+    strict coverage: every headline has exactly one embedding row (and one sentiment
+    row when ``sentiment_dir`` is set) and no row lacks a headline; a mismatch raises,
+    naming the partition. The rows are sorted by (day, RP_STORY_ID) and kept, the
+    embeddings in float16 (converted to float32 exactly, chunk by chunk), the tag codes
+    in int8 and the assets as CSR, until a day of another partition is asked for.
+    Same rows, order and float32 values as ``ParquetHeadlineSource``.
 
-    One partition is held at a time (2022-03: ~9.5M rows x 384 x 2 B = 7.3 GB); the
-    pipeline's ``prefetch`` thread loads the next one while the last chunks of the
-    previous are scored.
+    One partition is held at a time (2022-03: ~9.5M rows x 384 x 2 B = 7.3 GB of
+    embeddings); the pipeline's ``prefetch`` thread loads the next one while the last
+    chunks of the previous are scored.
     """
 
     headlines_dir: Path
@@ -229,8 +202,14 @@ class PartitionHeadlineSource:
     chunk_size: int = 8_192
     source_id: str = ""
     layout: Layout = field(default_factory=Layout)
+    sentiment_dir: Path | None = None
+    tags: SentimentTags | None = None
+    assets: AssetUniverse | None = None
     _path: Path | None = field(default=None, init=False, repr=False)
     _emb: np.ndarray | None = field(default=None, init=False, repr=False)
+    _codes: np.ndarray | None = field(default=None, init=False, repr=False)
+    _csr: tuple[np.ndarray, np.ndarray, np.ndarray] | None = field(default=None, init=False,
+                                                                   repr=False)
     _days: dict[date, tuple[int, int]] = field(default_factory=dict, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
@@ -239,6 +218,10 @@ class PartitionHeadlineSource:
         self.embeddings_dir = Path(self.embeddings_dir)
         if self.chunk_size < 1:
             raise ValueError("chunk_size must be >= 1")
+        if (self.sentiment_dir is None) != (self.tags is None):
+            raise ValueError("sentiment tags need the sentiment directory, and vice versa")
+        if self.sentiment_dir is not None:
+            self.sentiment_dir = Path(self.sentiment_dir)
 
     def describe(self) -> str:
         return self.source_id or f"partition:{self.headlines_dir.name}+{self.embeddings_dir.name}"
@@ -247,39 +230,69 @@ class PartitionHeadlineSource:
         return (self.layout.file_for(self.headlines_dir, day).exists()
                 and self.layout.file_for(self.embeddings_dir, day).exists())
 
+    def _read_strict(self, path: Path, columns: list[str], what: str, n: int,
+                     ids: pl.DataFrame) -> pl.DataFrame:
+        """``columns`` of ``path`` in the order of ``ids`` (one row per story id)."""
+        if not path.exists():
+            raise FileNotFoundError(f"{what} partition missing: {path}")
+        df = pl.read_parquet(path, columns=[ID_COL, *columns])
+        if df[ID_COL].is_duplicated().any():
+            raise ValueError(f"{path.name}: duplicate {ID_COL} in the {what} partition")
+        out = ids.join(df, on=ID_COL, how="inner", maintain_order="left")
+        if out.height != n or df.height != n:
+            raise ValueError(f"{path.name}: {n} headlines, {df.height} {what} rows, "
+                             f"{out.height} matched (strict coverage)")
+        return out
+
     def _load(self, day: date) -> bool:
         """Hold the partition of ``day`` (reading it if another one is held). False when
         the partition does not exist."""
         hl_path = self.layout.file_for(self.headlines_dir, day)
         if hl_path == self._path:
             return True
-        self._path, self._emb, self._days = None, None, {}       # release before reading
+        self._path, self._emb, self._codes, self._csr, self._days = None, None, None, None, {}
         if not self.has_day(day):
             return False
-        em_path = self.layout.file_for(self.embeddings_dir, day)
-        hl = pl.read_parquet(hl_path, columns=[ID_COL, "TIMESTAMP_UTC"])
-        em = pl.read_parquet(em_path, columns=[ID_COL, "EMBEDDING"])
         name = hl_path.name
-        for what, frame in (("headlines", hl), ("embeddings", em)):
-            if frame[ID_COL].is_duplicated().any():
-                raise ValueError(f"{name}: duplicate {ID_COL} in the {what} partition")
-        joined = hl.select(ID_COL, day_expr(hl.schema["TIMESTAMP_UTC"]).alias("_day")).join(
-            em, on=ID_COL, how="inner")
-        if joined.height != hl.height or joined.height != em.height:
-            raise ValueError(f"{name}: {hl.height} headlines, {em.height} embeddings, "
-                             f"{joined.height} matched (strict coverage)")
-        if joined["EMBEDDING"].null_count():
-            raise ValueError(f"{name}: {joined['EMBEDDING'].null_count()} null embedding(s)")
-        joined = joined.sort(["_day", ID_COL])
-        bounds = (joined.with_row_index("_i").group_by("_day")
-                  .agg(pl.col("_i").min().alias("lo"), pl.col("_i").max().alias("hi")))
+        cols = [ID_COL, "TIMESTAMP_UTC"]
+        if self.assets is not None:
+            cols += [ENTITY_COL, "RELEVANCE"]
+        try:
+            hl = pl.read_parquet(hl_path, columns=cols)
+        except pl.exceptions.ColumnNotFoundError as exc:
+            raise ValueError(f"{name}: the headlines lack {cols[2:]} (the asset layer needs "
+                             "headlines with RELEVANCE)") from exc
+        if hl[ID_COL].is_duplicated().any():
+            raise ValueError(f"{name}: duplicate {ID_COL} in the headlines partition")
+        rows = (hl.with_columns(day_expr(hl.schema["TIMESTAMP_UTC"]).alias("_day"))
+                .drop("TIMESTAMP_UTC").sort(["_day", ID_COL])
+                .with_row_index("_r"))
+        n = rows.height
+        ids = rows.select(ID_COL)
+        em = self._read_strict(self.layout.file_for(self.embeddings_dir, day), ["EMBEDDING"],
+                               "embeddings", n, ids)
+        if em["EMBEDDING"].null_count():
+            raise ValueError(f"{name}: {em['EMBEDDING'].null_count()} null embedding(s)")
+        emb = em["EMBEDDING"].to_numpy()
+        if emb.shape != (n, EMBEDDING_DIM):
+            raise ValueError(f"{name}: embeddings of shape {emb.shape}")
+        del em
+        codes = None
+        if self.tags is not None:
+            grid = self._read_strict(self.layout.file_for(self.sentiment_dir, day),
+                                     list(GRID_COLUMNS), "sentiment", n, ids)
+            P = grid.select(GRID_COLUMNS).to_numpy().astype(np.float64)
+            del grid
+            codes = grid_tag_codes(P, self.tags)
+            del P
+        csr = None
+        if self.assets is not None:
+            csr = headline_assets(rows, self.assets.asset_map(), n)
+        bounds = (rows.group_by("_day")
+                  .agg(pl.col("_r").min().alias("lo"), pl.col("_r").max().alias("hi")))
         self._days = {d: (int(lo), int(hi) + 1) for d, lo, hi in bounds.iter_rows()}
-        self._emb = joined["EMBEDDING"].to_numpy()
-        if self._emb.shape != (joined.height, EMBEDDING_DIM):
-            raise ValueError(f"{name}: embeddings of shape {self._emb.shape}")
-        self._path = hl_path
-        log.info("partition %s: %d headlines over %d day(s) held", name, joined.height,
-                 len(self._days))
+        self._emb, self._codes, self._csr, self._path = emb, codes, csr, hl_path
+        log.info("partition %s: %d headlines over %d day(s) held", name, n, len(self._days))
         return True
 
     def day_total(self, day: date) -> int:
@@ -294,12 +307,21 @@ class PartitionHeadlineSource:
             if not self._load(day) or day not in self._days:
                 return
             lo, hi = self._days[day]
-            emb = self._emb
+            emb, codes, csr = self._emb, self._codes, self._csr
         for i in range(lo, hi, self.chunk_size):
-            block = emb[i:min(i + self.chunk_size, hi)]
+            j = min(i + self.chunk_size, hi)
+            block = emb[i:j]
             if not np.isfinite(block).all():
                 raise ValueError(f"{day}: non-finite embedding value(s)")
-            yield Chunk(np.ascontiguousarray(block, dtype=np.float32))
+            chunk = Chunk(np.ascontiguousarray(block, dtype=np.float32))
+            if codes is not None:
+                chunk.tags = codes[i:j]
+            if csr is not None:
+                indptr, aidx, arel = csr
+                a0, a1 = indptr[i], indptr[j]
+                chunk.asset_indptr = indptr[i:j + 1] - a0
+                chunk.asset_idx, chunk.asset_rel = aidx[a0:a1], arel[a0:a1]
+            yield chunk
 
 
 def arrow_embeddings_to_numpy(column: pa.Array) -> np.ndarray:
@@ -317,14 +339,15 @@ def arrow_embeddings_to_numpy(column: pa.Array) -> np.ndarray:
 class InMemoryHeadlineSource:
     """Embeddings already in memory, keyed by day. Tests/notebooks.
 
-    ``keep`` (optional, per day, a boolean mask over that day's rows) plays the role of a
-    sentiment bucket: only kept rows are yielded, while ``day_total`` still counts all.
-    """
+    ``tags`` (optional, per day, int8 codes over that day's rows) plays the sentiment
+    layer; ``assets`` (optional, per day, a list per row of (asset index, relevance))
+    the asset layer."""
 
     days: dict[date, np.ndarray] = field(default_factory=dict)
     chunk_size: int = 8_192
     source_id: str = "in-memory"
-    keep: dict[date, np.ndarray] | None = None
+    tags: dict[date, np.ndarray] | None = None
+    assets: dict[date, list[list[tuple[int, int]]]] | None = None
 
     def describe(self) -> str:
         return self.source_id
@@ -338,22 +361,29 @@ class InMemoryHeadlineSource:
         if X is None:
             return
         X = np.ascontiguousarray(X, dtype=np.float32)
-        if self.keep is not None:
-            mask = np.asarray(self.keep.get(day, np.zeros(X.shape[0], bool)), dtype=bool)
-            if mask.shape != (X.shape[0],):
-                raise ValueError(f"keep mask for {day} has shape {mask.shape}, expected "
+        codes = None
+        if self.tags is not None:
+            codes = np.asarray(self.tags.get(day, np.full(X.shape[0], UNTAGGED)), dtype=np.int8)
+            if codes.shape != (X.shape[0],):
+                raise ValueError(f"tags for {day} have shape {codes.shape}, expected "
                                  f"({X.shape[0]},)")
-            X = X[mask]
         for i in range(0, X.shape[0], self.chunk_size):
-            yield Chunk(X[i:i + self.chunk_size])
+            j = min(i + self.chunk_size, X.shape[0])
+            chunk = Chunk(X[i:j], tags=codes[i:j] if codes is not None else None)
+            if self.assets is not None:
+                per_row = self.assets.get(day, [[] for _ in range(X.shape[0])])[i:j]
+                counts = [len(r) for r in per_row]
+                chunk.asset_indptr = np.concatenate([[0], np.cumsum(counts)]).astype(np.int64)
+                chunk.asset_idx = np.array([a for r in per_row for a, _ in r], dtype=np.int32)
+                chunk.asset_rel = np.array([w for r in per_row for _, w in r], dtype=np.uint8)
+            yield chunk
 
 
 def prefetch(iterator: Iterator[Any], depth: int = 2) -> Iterator[Any]:
     """Run ``iterator`` on a background thread with a bounded queue.
 
-    DuckDB releases the GIL while producing batches, so the next chunk's
-    join + decode overlaps with scoring the current one. Exceptions on the
-    producer side are re-raised on the consumer side; the queue depth
+    The next chunk's (or next partition's) read overlaps with scoring the current one.
+    Exceptions on the producer side are re-raised on the consumer side; the queue depth
     bounds how many chunks are in flight.
     """
     q: queue.Queue = queue.Queue(maxsize=max(1, depth))

@@ -203,11 +203,12 @@ _RUN_SPECIFIC = ("RSS_GB_BEFORE", "RSS_GB_AFTER", "SECONDS", "RSS_PEAK_GB", "COD
 
 def case_narrative_daily(root: Path, freq: str) -> Env:
     from narrative_scoring import artifacts as A
+    from narrative_scoring.assets import AssetUniverse
     from narrative_scoring.config import ScoringConfig
     from narrative_scoring.primitives import load_primitive_table
     from narrative_scoring.tau_asof import CalibrationCalendar
     from tests.narrative_scoring.conftest import TAX_NAME, unit_rows, write_toy_taxonomy
-    from tests.narrative_scoring.test_artifacts import _make_lake, _source
+    from tests.narrative_scoring.test_artifacts import _make_lake, _register_universe, _source
 
     table = load_primitive_table(write_toy_taxonomy(root / "tax"), TAX_NAME, "headline")
     P = unit_rows(np.random.default_rng(11), table.n_primitives * table.n_texts)
@@ -215,22 +216,34 @@ def case_narrative_daily(root: Path, freq: str) -> Env:
     calendar = CalibrationCalendar(*_CALENDARS[freq])
     months = [(2008, m) for m in range(1, 7)]
     index = _make_lake(root / "lake")
-    kw = dict(table=table, P=P, window="5Y", use_kernel=False, temp=True, calendar=calendar)
+    universe = _register_universe(index)                  # the asset tables are siblings too
+    assets = AssetUniverse.from_artifact(universe)
+    kw = dict(table=table, P=P, window="5Y", use_kernel=False, temp=True, calendar=calendar,
+              assets=assets, universe=universe)
+
+    def source():
+        src = _source(table, P, months)
+        rng = np.random.default_rng(4)
+        src.assets = {d: [[(int(a), int(rng.integers(0, 101)))]
+                          for a in rng.integers(0, assets.n_assets, X.shape[0])]
+                      for d, X in src.days.items()}
+        return src
 
     def new_job() -> Job:
-        return A.ScoringJob(index, START, END, cfg, source=_source(table, P, months), **kw)
+        return A.ScoringJob(index, START, END, cfg, source=source(), **kw)
 
     def resume(runner: JobRunner, aid: str):
         rc = json.loads((index.get(aid).path / A.RUN_CONFIG_FILE).read_text())
         job = A.ScoringJob(index, date.fromisoformat(rc["start"]),
                            date.fromisoformat(rc["end"]), cfg,
-                           source=_source(table, P, months), inputs=rc["inputs"],
+                           source=source(), inputs=rc["inputs"],
                            resume=rc["artifacts"], **kw)
         return runner.resume_job(aid, job)
 
     def outputs(art) -> dict[str, Any]:
         rc = json.loads((art.path / A.RUN_CONFIG_FILE).read_text())
         out: dict[str, Any] = {}
+        assert rc["artifacts"]["asset_attention"] and rc["artifacts"]["narrative_asset"]
         for role, aid in rc["artifacts"].items():
             for p in sorted(index.get(aid).path.glob("*.parquet")):
                 df = pl.read_parquet(p)

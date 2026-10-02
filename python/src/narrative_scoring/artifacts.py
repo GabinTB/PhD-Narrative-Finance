@@ -5,22 +5,27 @@ per-file content hashes, hyperparams carrying the config hashes, source
 artifact ids, git revision, timestamps):
 
     headline_sentiment      (read only) a sentiment database (RP_STORY_ID + a model's 41-grid
-                            P_00..P_40 or vendor SENT_* scores, see
-                            ravenpack/headlines/sentiment.py); a sentiment-filtered run
-                            reads one bucket of it (sentiment_filter.py)
+                            P_00..P_40, see ravenpack/headlines/sentiment.py); a run with
+                            sentiment tags reads its grid to give each headline its tag
+    universe                (read only) a registered universe with RavenPack entity ids: the
+                            asset layer of a run (assets.py)
     narrative_taxonomy      (raw layer) one dir per taxonomy version: authored CSV + the
                             headline and semantic paraphrase JSONLs, validated before
                             registration; the scorer loads the taxonomy from here
     f0_monthly_partitions   one dir per F0 config, EXTENDED month by month (YYYY-MM.parquet)
     tau_asof                one dir per (F0 config, window), EXTENDED cutoff by cutoff
-    narrative_daily         one dir per scoring run (YYYY-MM.parquet, run_metadata.json)
-    day_diagnostics         one dir per scoring run, same file layout
+    narrative_daily         one dir per scoring run (YYYY-MM.parquet, run_metadata.json),
+                            one SENTIMENT label per tag ("all" without tags)
+    day_diagnostics         one dir per scoring run, same file layout, one row per label
+    asset_attention_daily   with an asset layer: day x label x asset counts (sparse)
+    narrative_asset_daily   with an asset layer: day x label x narrative x asset sums (sparse)
 
 There is exactly one scoring path, ``score_range_to_datalake``: it walks the
 months of [start, end] in order and, for each month, first runs the monthly
 tau_asof job as of the first day of that month (delay enforced there), then
 scores the month's days through ``pipeline.score_dates`` with the tau/mu
-providers resolving as of each day. Days for which no tau row is old enough
+providers resolving as of each day, in ONE pass: every family above is written
+from the same read of each headlines partition. Days for which no tau row is old enough
 (cold start) feed the null partitions only. Feeding this driver historical
 dates is the live loop replayed; nothing else exists.
 
@@ -53,8 +58,12 @@ from datalake import Artifact, DatalakeError, DatalakeIndex
 from datalake.jobs import Job, JobContext, Unit, register_job
 from datalake.layout import Layout, layout_of
 from datalake.meta import git_commit
-from narrative_scoring.calibration import LookaheadError
-from narrative_scoring.config import MODEL_SOURCES, ScoringConfig
+from narrative_scoring.assets import (
+    ASSET_ATTENTION_SCHEMA,
+    NARRATIVE_ASSET_SCHEMA,
+    AssetUniverse,
+)
+from narrative_scoring.config import ScoringConfig
 from narrative_scoring.partitions import (
     NullPartitionWriter,
     SkipClosedDays,
@@ -74,17 +83,13 @@ from narrative_scoring.schema import (
     DAY_DIAGNOSTICS_SCHEMA_V1,
     DAY_DIAGNOSTICS_SCHEMA_V2,
     DAY_DIAGNOSTICS_SCHEMA_V3,
+    DAY_DIAGNOSTICS_SCHEMA_V4,
     F0_PARTITION_SCHEMA,
     NARRATIVE_DAILY_SCHEMA,
     NARRATIVE_DAILY_SCHEMA_V1,
     TAU_ASOF_SCHEMA,
 )
-from narrative_scoring.sentiment_filter import VENDOR_COLUMN, SentimentBucket
-from narrative_scoring.streaming import (
-    HeadlineSource,
-    ParquetHeadlineSource,
-    PartitionHeadlineSource,
-)
+from narrative_scoring.streaming import HeadlineSource, PartitionHeadlineSource
 from narrative_scoring.tau_asof import (
     CALIBRATION_DELAY_DEFAULT,
     CALIBRATION_FREQ_DEFAULT,
@@ -101,7 +106,9 @@ log = logging.getLogger(__name__)
 
 PIPELINE = "PhD-Narrative-Finance"
 PIPELINE_REPO = "https://github.com/GabinTB/PhD-Narrative-Finance"
-PIPELINE_VERSION = "v2.2.0"   # v2.2.0: nlp embeddings, P digest in ids, provenance
+PIPELINE_VERSION = "v2.3.0"   # v2.3.0: one pass (each partition read once), sentiment
+#                               tags as labels, asset outputs, per-label day_diagnostics;
+#                               v2.2.0: nlp embeddings, P digest in ids, provenance
 TEMP_SUFFIX = "__TEMP"
 
 KIND_TAXONOMY = "narrative_taxonomy"
@@ -113,11 +120,22 @@ KIND_HEADLINES = "ravenpack_headlines"
 KIND_EMBEDDINGS = "headline_embeddings"
 KIND_MU_ASOF = "mu_asof"
 KIND_SENTIMENT = "headline_sentiment"
-AGENT_KINDS = (KIND_PARTITIONS, KIND_TAU_ASOF, KIND_NARRATIVE_DAILY, KIND_DAY_DIAGNOSTICS)
+KIND_UNIVERSE = "universe"
+KIND_ASSET_ATTENTION = "asset_attention_daily"
+KIND_NARRATIVE_ASSET = "narrative_asset_daily"
+AGENT_KINDS = (KIND_PARTITIONS, KIND_TAU_ASOF, KIND_NARRATIVE_DAILY, KIND_DAY_DIAGNOSTICS,
+               KIND_ASSET_ATTENTION, KIND_NARRATIVE_ASSET)
 
 TAU_ASOF_FILE = "tau_asof.parquet"
 DEFAULT_CALENDAR = CalibrationCalendar()
 RUN_CONFIG_FILE = "run_config.json"      # everything a resume needs, written at run start
+# Fixed per run (recorded, enforced on resume): a block's float32 scores can move by ~1e-7
+# with the block's row count (BLAS blocking), which can flip a retention at tau.
+# Benchmark (2022-03-15, 371,818 headlines, three tags + MSCI World assets, 64 GB machine):
+# 8192 -> 35.1k headlines/s, 32768 -> 43.2k, 65536 -> 45.5k, 131072 -> 42.5k; peak RSS
+# 14.5-15.9 GB with the month held in memory.
+CHUNK_SIZE = 65_536
+RSS_BUDGET_GB = 48.0         # ~75% of the 64 GB machine: room for the OS and page cache
 PROVENANCE_FILE = "embeddings_provenance.json"
 PARAPHRASE_STYLES = ("headline", "semantic")
 
@@ -398,26 +416,24 @@ def load_tau_series(art: Artifact | None) -> pl.DataFrame:
 
 def headline_source(upstream: DatalakeIndex, chunk_size: int = 8_192, threads: int = 8,
                     sentiment: Artifact | None = None, config: ScoringConfig | None = None, *,
-                    headlines: Artifact | None = None,
-                    embeddings: Artifact | None = None) -> HeadlineSource:
+                    headlines: Artifact | None = None, embeddings: Artifact | None = None,
+                    assets: AssetUniverse | None = None) -> HeadlineSource:
     """Headlines + embeddings (the latest, or the given ones), each partition read once
-    (``PartitionHeadlineSource``); with ``sentiment`` (a ``headline_sentiment`` artifact)
-    and a filtered ``config``, only the headlines of ``config.sentiment``'s bucket are read
-    (``ParquetHeadlineSource``'s per-day query)."""
+    (``PartitionHeadlineSource``), with the tag codes of ``config.tags`` from
+    ``sentiment`` (a ``headline_sentiment`` grid artifact) and the assets of ``assets``
+    when given. ``threads`` is unused (kept for callers)."""
     hl = headlines or upstream.latest(KIND_HEADLINES)
     em = embeddings or upstream.latest(KIND_EMBEDDINGS)
+    tags = config.tags if config is not None else None
+    if (sentiment is None) != (tags is None):
+        raise ValueError("a sentiment artifact is needed iff the config has sentiment tags")
     layout = shared_layout(hl, em, *([sentiment] if sentiment is not None else []))
-    bucket = None
     if sentiment is not None:
-        if config is None or not config.filtered:
-            raise ValueError("a sentiment artifact needs a config with a sentiment filter")
         check_sentiment(sentiment, headlines_id=hl.artifact_id, config=config)
-        bucket = SentimentBucket(config, sentiment.path, sentiment.artifact_id)
-        return ParquetHeadlineSource(hl.path, em.path, chunk_size=chunk_size, threads=threads,
-                                     source_id=f"{hl.artifact_id}+{em.artifact_id}",
-                                     sentiment=bucket, layout=layout)
-    return PartitionHeadlineSource(hl.path, em.path, chunk_size=chunk_size,
-                                   source_id=f"{hl.artifact_id}+{em.artifact_id}", layout=layout)
+    return PartitionHeadlineSource(
+        hl.path, em.path, chunk_size=chunk_size, source_id=f"{hl.artifact_id}+{em.artifact_id}",
+        layout=layout, sentiment_dir=sentiment.path if sentiment is not None else None,
+        tags=tags, assets=assets)
 
 
 def shared_layout(*artifacts: Artifact) -> Layout:
@@ -437,25 +453,24 @@ def sentiment_columns(art: Artifact) -> list[str]:
 
 
 def check_sentiment(art: Artifact, *, headlines_id: str, config: ScoringConfig) -> None:
-    """Refuse a sentiment artifact that cannot serve ``config``'s filter: wrong kind, built
-    on another headlines artifact (story sets would differ), another source, or without
-    the columns its rule reads (model sources: the grid P_00..P_40; vendor: SENT_CSS)."""
+    """Refuse a sentiment artifact that cannot serve ``config.tags``: wrong kind, built on
+    another headlines artifact (story sets would differ), another source, or not a grid
+    table (P_00..P_40, which every ordinal rule reads)."""
     hp = art.meta.hyperparams
+    if config.tags is None:
+        raise ValueError("the config has no sentiment tags")
     if art.kind != KIND_SENTIMENT:
         raise DatalakeError(f"{art.artifact_id} is a {art.kind}, not a {KIND_SENTIMENT}")
     if hp.get("headlines_id") != headlines_id:
         raise DatalakeError(f"{art.artifact_id} was built on {hp.get('headlines_id')}, the "
                             f"scorer reads {headlines_id}")
-    if hp.get("source") != config.sentiment_source:
-        raise DatalakeError(f"{art.artifact_id} is source {hp.get('source')!r}, config says "
-                            f"{config.sentiment_source!r}")
+    if hp.get("source") != config.tags.source:
+        raise DatalakeError(f"{art.artifact_id} is source {hp.get('source')!r}, the tags say "
+                            f"{config.tags.source!r}")
     cols = sentiment_columns(art)
-    need = (["P_00", "P_40"] if config.sentiment_source in MODEL_SOURCES
-            else [VENDOR_COLUMN[config.sentiment_source]])
-    if not all(c in cols for c in need):
-        raise DatalakeError(f"{art.artifact_id} has no {need} column(s) for rule "
-                            f"{config.sentiment_rule!r} (has {cols[:5]}...); a model table "
-                            "must be a grid table (sentiment spec 2.1)")
+    if not ("P_00" in cols and "P_40" in cols):
+        raise DatalakeError(f"{art.artifact_id} is not a grid table (has {cols[:5]}...); the "
+                            "tags read P_00..P_40 (sentiment spec 2.1)")
 
 
 def resolve_sentiment(indexes: list[DatalakeIndex], *, headlines_id: str, config: ScoringConfig,
@@ -653,9 +668,12 @@ def calibration_as_of(dl: DatalakeIndex, config: ScoringConfig, table: Primitive
 class ScoringJob(Job):
     """Narrative scores over [start, end]: per calibration period, tau then the days.
 
-    The replay of the live loop; one unit = one calibration period. Writes narrative_daily (the
-    job's artifact) with its siblings day_diagnostics and the null partitions, which
-    ``session`` holds open across units; tau_asof is extended by its own nested runs."""
+    The replay of the live loop, ONE pass: one unit = one calibration period. Writes
+    narrative_daily (the job's artifact, one label per sentiment tag) with its siblings
+    day_diagnostics, the null partitions and, with an asset layer, asset_attention_daily
+    and narrative_asset_daily, which ``session`` holds open across units; tau_asof is
+    extended by its own nested runs. The chunk size is part of the run (a different one
+    can move a score at the tau boundary): recorded, and a resume refuses another."""
 
     kind = KIND_NARRATIVE_DAILY
     pipeline_version = PIPELINE_VERSION
@@ -666,28 +684,32 @@ class ScoringJob(Job):
         table: PrimitiveTable, P: np.ndarray, upstream: DatalakeIndex | None = None,
         source: HeadlineSource | None = None, window: str = WINDOW_DEFAULT, seed: int = 0,
         keep_primitive_daily: bool = False, threads: int = 8,
-        rss_budget_gb: float | None = 30.0, use_kernel: bool | None = None,
+        rss_budget_gb: float | None = RSS_BUDGET_GB, use_kernel: bool | None = None,
         temp: bool = False, label: str = "", taxonomy_id: str | None = None,
         sentiment: Artifact | None = None, primitive_meta: dict[str, Any] | None = None,
         inputs: dict[str, str | None] | None = None, resume: dict[str, str] | None = None,
-        calendar: CalibrationCalendar = DEFAULT_CALENDAR,
+        calendar: CalibrationCalendar = DEFAULT_CALENDAR, chunk_size: int = CHUNK_SIZE,
+        assets: AssetUniverse | None = None, universe: Artifact | None = None,
     ) -> None:
         upstream = upstream or dl
         if end < start:
             raise ValueError("end before start")
+        if (assets is None) != (universe is None):
+            raise ValueError("an asset layer needs its universe artifact, and vice versa")
         inputs = inputs or {}
         hl = upstream.get(inputs["headlines"]) if inputs.get("headlines") \
             else upstream.latest(KIND_HEADLINES)
         em = upstream.get(inputs["embeddings"]) if inputs.get("embeddings") \
             else upstream.latest(KIND_EMBEDDINGS)
         mu_id = inputs.get("mu_asof")
-        if config.filtered != (sentiment is not None):
-            raise ValueError("a sentiment artifact is required iff the config selects a "
-                             "sentiment bucket")
+        if (config.tags is not None) != (sentiment is not None):
+            raise ValueError("a sentiment artifact is required iff the config has sentiment "
+                             "tags")
         if sentiment is not None:
             check_sentiment(sentiment, headlines_id=hl.artifact_id, config=config)
-        source = source or headline_source(upstream, threads=threads, sentiment=sentiment,
-                                           config=config, headlines=hl, embeddings=em)
+        source = source or headline_source(upstream, chunk_size=chunk_size, sentiment=sentiment,
+                                           config=config, headlines=hl, embeddings=em,
+                                           assets=assets)
         mu_art, first_mu = _mu_inputs(upstream, config, mu_id)
 
         earliest = earliest_headline_day(hl)
@@ -714,21 +736,20 @@ class ScoringJob(Job):
         # never yield a partition: not walked at all
         first_correctable = first_mu["DATE"].min() if first_mu is not None else earliest
         walk = [p for p in calendar.periods(earliest, end) if p.last >= first_correctable]
+        tags = config.tags
         hp = {**_taxonomy_params(table), "embeddings_id": emb_key,
               "config_id": config.digest(),
               "f0_config_id": config.f0_digest(), "mode": config.mode.value,
               "pooling": config.paraphrase_pooling.value, "q": config.q,
-              "split": config.sentiment.value if config.filtered else "none",
+              "labels": ",".join(config.labels),
               **({"mask_bipolar": True} if config.mask_bipolar else {}),
               "window": window, "seed": seed,
               "start": start.isoformat(), "end": end.isoformat(), "label": label,
               "taxonomy_artifact_id": taxonomy_id, "agent_created": temp,
               **calendar.hyperparams()}
-        if sentiment is not None:
-            hp.update(sentiment=config.sentiment.value, sentiment_source=config.sentiment_source,
-                      sentiment_rule=config.sentiment_rule, neg_max=config.neg_max,
-                      pos_min=config.pos_min, min_conf=config.min_conf,
-                      sentiment_artifact_id=sentiment.artifact_id)
+        if tags is not None:
+            hp.update(sentiment_source=tags.source, sentiment_rule=tags.rule,
+                      tags_id=tags.digest(), sentiment_artifact_id=sentiment.artifact_id)
 
         self.dl, self.upstream, self.config, self.table, self.P = dl, upstream, config, table, P
         self.source, self.window, self.seed, self.temp = source, window, seed, temp
@@ -740,7 +761,9 @@ class ScoringJob(Job):
         self.hl, self.em, self.mu_art, self.mu_id = hl, em, mu_art, mu_id
         self.earliest, self.emb_key, self.parts_art, self.have = earliest, emb_key, \
             parts_art, have
+        self.chunk_size, self.assets, self.universe = chunk_size, assets, universe
         self.hp = hp
+        self.asset_hp = ({**hp, **assets.params()} if assets is not None else None)
         self.provenance = embeddings_provenance(P, primitive_meta, em)
         self._sources: list[Any] = ([hl, em] + ([mu_art] if mu_art else [])
                                     + ([taxonomy_id] if taxonomy_id else []))
@@ -751,42 +774,14 @@ class ScoringJob(Job):
         start_period = calendar.period_of(start).first
         self._plan: dict[str, tuple[Any, list[date], str]] = {}
         for period in walk:
-            all_days = period.days()
-            days = [d for d in all_days if d <= end]
+            days = [d for d in period.days() if d <= end]
             if period.first < start_period:
-                if config.filtered:          # the null model is the all-headlines run's
-                    continue
                 mode = "null-only (pre-start)"
             else:
                 days = [d for d in days if d >= start]
                 mode = "score"
             if days:
                 self._plan[period.key] = (period, days, mode)
-        if config.filtered:
-            self._check_tau_covers()
-
-    def _check_tau_covers(self) -> None:
-        """A filtered run reads the all-headlines run's tau_asof and never builds one: it
-        must exist and hold the row the live loop had for the last period scored."""
-        tau_art = find_tau_asof(self.dl, self.config, self.table, self.emb_key, self.window,
-                                self.seed, self.temp, self.calendar)
-        todo = ("run the all-headlines scoring first: `jobs start narrative_daily "
-                f"--sentiment none --from {self.start} --to {self.end}` with the same "
-                "taxonomy, embeddings, window and calibration")
-        if tau_art is None:
-            raise DatalakeError(f"no tau_asof for this config and taxonomy; {todo}")
-        if not self._plan:
-            return
-        last = list(self._plan.values())[-1][0]
-        cal = calibration_as_of(self.dl, self.config, self.table, self.emb_key,
-                                upstream=self.upstream, window=self.window, seed=self.seed,
-                                temp=self.temp, mu_id=self.mu_id, as_of=last.first,
-                                calendar=self.calendar)
-        try:
-            cal.tau_for(last.first)
-        except LookaheadError:
-            raise DatalakeError(f"{tau_art.artifact_id} has no tau row for {last.key} (built "
-                                f"as of {last.first}); {todo}") from None
 
     # -- identity -------------------------------------------------------------
 
@@ -795,6 +790,9 @@ class ScoringJob(Job):
 
     def sources(self) -> list[Any]:
         return self._sources + ([self.sentiment] if self.sentiment is not None else [])
+
+    def asset_sources(self) -> list[Any]:
+        return self.sources() + [self.universe]
 
     # -- units ----------------------------------------------------------------
 
@@ -809,7 +807,8 @@ class ScoringJob(Job):
 
     @contextmanager
     def session(self, ctx: JobContext) -> Iterator[None]:
-        """Open day_diagnostics and the null partitions next to narrative_daily."""
+        """Open day_diagnostics, the null partitions and the asset tables next to
+        narrative_daily."""
         dl, config, calendar = self.dl, self.config, self.calendar
         run_kw = dict(pipeline=self.pipeline, pipeline_version=self.version,
                       pipeline_repo=self.pipeline_repo, repo_dir=_repo_dir())
@@ -821,16 +820,24 @@ class ScoringJob(Job):
                 kind=KIND_DAY_DIAGNOSTICS, hyperparams=self.hp, sources=self.sources(),
                 verifier=KIND_DAY_DIAGNOSTICS, hash_pattern="*",
                 resume=self.resume.get("day_diagnostics"), **run_kw))
-            pt_run = None
-            if not config.filtered:          # a bucket run never feeds the null model
-                pt_run = stack.enter_context(dl.run(
-                    kind=KIND_PARTITIONS,
-                    hyperparams=partitions_params(config, self.table, self.emb_key, self.seed,
-                                                  self.temp, calendar),
-                    sources=self._sources, verifier=KIND_PARTITIONS, hash_pattern="*.parquet",
-                    extend=parts_art.artifact_id if parts_art and not pt_partial else None,
-                    resume=parts_art.artifact_id if pt_partial else None, **run_kw))
-            for run in (nd_run, dg_run, pt_run):
+            pt_run = stack.enter_context(dl.run(
+                kind=KIND_PARTITIONS,
+                hyperparams=partitions_params(config, self.table, self.emb_key, self.seed,
+                                              self.temp, calendar),
+                sources=self._sources, verifier=KIND_PARTITIONS, hash_pattern="*.parquet",
+                extend=parts_art.artifact_id if parts_art and not pt_partial else None,
+                resume=parts_art.artifact_id if pt_partial else None, **run_kw))
+            att_run = cross_run = None
+            if self.assets is not None:
+                att_run = stack.enter_context(dl.run(
+                    kind=KIND_ASSET_ATTENTION, hyperparams=self.asset_hp,
+                    sources=self.asset_sources(), verifier=KIND_ASSET_ATTENTION,
+                    hash_pattern="*", resume=self.resume.get("asset_attention"), **run_kw))
+                cross_run = stack.enter_context(dl.run(
+                    kind=KIND_NARRATIVE_ASSET, hyperparams=self.asset_hp,
+                    sources=self.asset_sources(), verifier=KIND_NARRATIVE_ASSET,
+                    hash_pattern="*", resume=self.resume.get("narrative_asset"), **run_kw))
+            for run in (nd_run, dg_run, pt_run, att_run, cross_run):
                 if run is not None:
                     record_provenance(run.out_dir, self.provenance)
             if not self.resume:
@@ -839,10 +846,14 @@ class ScoringJob(Job):
                     "end": self.end.isoformat(), "window": self.window, "seed": self.seed,
                     "label": self.label, "temp": self.temp,
                     "keep_primitive_daily": self.keep_primitive_daily,
+                    "chunk_size": self.chunk_size,
                     "taxonomy_artifact_id": self.taxonomy_id,
                     "calibration": {"freq": calendar.freq, "delay": calendar.delay},
                     "sentiment_artifact_id": (self.sentiment.artifact_id if self.sentiment
                                               else None),
+                    "assets": ({"universe_artifact_id": self.universe.artifact_id,
+                                "min_relevance": self.assets.min_relevance}
+                               if self.assets is not None else None),
                     "inputs": {"headlines": self.hl.artifact_id,
                                "embeddings": self.em.artifact_id,
                                "mu_asof": self.mu_art.artifact_id if self.mu_art else None},
@@ -852,40 +863,43 @@ class ScoringJob(Job):
                         "model_card": (self.primitive_meta or {}).get("model_card")},
                     "artifacts": {"narrative_daily": nd_run.artifact_id,
                                   "day_diagnostics": dg_run.artifact_id,
-                                  "partitions": pt_run.artifact_id if pt_run else None},
+                                  "partitions": pt_run.artifact_id,
+                                  "asset_attention": att_run.artifact_id if att_run else None,
+                                  "narrative_asset": (cross_run.artifact_id if cross_run
+                                                      else None)},
                 })
             self.nd_run, self.dg_run, self.pt_run = nd_run, dg_run, pt_run
-            self.writer = ParquetMonthWriter(nd_run.out_dir, dg_run.out_dir, freq=calendar.freq)
-            self.sink = None
-            if pt_run is not None:
-                partition_writer = NullPartitionWriter(
-                    pt_run.out_dir, config=config, table=self.table, seed=self.seed,
-                    input_ids={"headlines": self.hl.artifact_id,
-                               "embeddings": self.em.artifact_id,
-                               "mu_asof": self.mu_art.artifact_id if self.mu_art else None},
-                    code_version=pt_run.record.pipeline_commit, freq=calendar.freq)
-                self.sink = (SkipClosedDays(partition_writer) if self.resume
-                             else partition_writer)
+            self.att_run, self.cross_run = att_run, cross_run
+            self.writer = ParquetMonthWriter(
+                nd_run.out_dir, dg_run.out_dir, freq=calendar.freq,
+                asset_attention_dir=att_run.out_dir if att_run else None,
+                narrative_asset_dir=cross_run.out_dir if cross_run else None)
+            partition_writer = NullPartitionWriter(
+                pt_run.out_dir, config=config, table=self.table, seed=self.seed,
+                input_ids={"headlines": self.hl.artifact_id,
+                           "embeddings": self.em.artifact_id,
+                           "mu_asof": self.mu_art.artifact_id if self.mu_art else None},
+                code_version=pt_run.record.pipeline_commit, freq=calendar.freq)
+            self.sink = SkipClosedDays(partition_writer) if self.resume else partition_writer
             self.last_metadata = None
             yield
         self.summary.update(narrative_daily_id=nd_run.artifact_id,
                             day_diagnostics_id=dg_run.artifact_id,
-                            partitions_id=pt_run.artifact_id if pt_run else None)
+                            partitions_id=pt_run.artifact_id,
+                            asset_attention_id=att_run.artifact_id if att_run else None,
+                            narrative_asset_id=cross_run.artifact_id if cross_run else None)
 
     def run_unit(self, unit: Unit, ctx: JobContext) -> None:
         """(1) the tau job as of the period's first day; (2) its days, through the one
         pipeline; (3) the period's null partition closes when the period does."""
         period, days, mode = self._plan[unit.key]
         dl, config, calendar, summary = self.dl, self.config, self.calendar, self.summary
-        tau_art = None
-        if self.pt_run is not None:          # a bucket run reads the existing tau_asof
-            tau_art = build_tau_asof(dl, config, self.table, self.P, upstream=self.upstream,
-                                     window=self.window, seed=self.seed, today=period.first,
-                                     temp=self.temp,
-                                     partitions_art=dl.get(self.pt_run.artifact_id),
-                                     taxonomy_id=self.taxonomy_id,
-                                     primitive_meta=self.primitive_meta, mu_id=self.mu_id,
-                                     calendar=calendar)
+        tau_art = build_tau_asof(dl, config, self.table, self.P, upstream=self.upstream,
+                                 window=self.window, seed=self.seed, today=period.first,
+                                 temp=self.temp, partitions_art=dl.get(self.pt_run.artifact_id),
+                                 taxonomy_id=self.taxonomy_id,
+                                 primitive_meta=self.primitive_meta, mu_id=self.mu_id,
+                                 calendar=calendar)
         cal = calibration_as_of(dl, config, self.table, self.emb_key, upstream=self.upstream,
                                 window=self.window, seed=self.seed, temp=self.temp,
                                 mu_id=self.mu_id, as_of=period.first, calendar=calendar)
@@ -902,31 +916,36 @@ class ScoringJob(Job):
             rss_budget_gb=self.rss_budget_gb, seed=self.seed,
             code_version=self.nd_run.record.pipeline_commit,
             sentiment_artifact_id=self.sentiment.artifact_id if self.sentiment else None,
-            embeddings_provenance=self.provenance,
+            embeddings_provenance=self.provenance, assets=self.assets,
             extra_metadata={"narrative_daily_id": self.nd_run.artifact_id,
                             "day_diagnostics_id": self.dg_run.artifact_id,
-                            "partitions_id": self.pt_run.artifact_id if self.pt_run else None})
+                            "partitions_id": self.pt_run.artifact_id,
+                            "chunk_size": self.chunk_size,
+                            **({"asset_attention_id": self.att_run.artifact_id,
+                                "narrative_asset_id": self.cross_run.artifact_id}
+                               if self.att_run is not None else {})})
         summary["n_days_scored"] += res.n_days
         summary["n_days_null_only"] += len(res.null_only_days)
         summary["peak_rss_gb"] = max(summary["peak_rss_gb"], res.peak_rss_gb)
         if res.metadata is not None:
             self.last_metadata = res.metadata
-        if self.sink is not None and days[-1] == period.last:   # the period closed on schedule
+        if days[-1] == period.last:                     # the period closed on schedule
             self.sink.finalise_before(period.next().first)
 
     def finalize(self, ctx: JobContext) -> None:
         summary, calendar = self.summary, self.calendar
-        summary["months_finalised"] = ([p.name for p in self.sink.finalised]
-                                       if self.sink is not None else [])
+        summary["months_finalised"] = [p.name for p in self.sink.finalised]
         if self.last_metadata is not None:
             self.writer.close(self.last_metadata)
-        if self.pt_run is not None:
-            self.pt_run.note(f"{len(self.sink.finalised)} {calendar.freq} partition(s) "
-                             f"finalised in [{self.earliest}, {self.end}]")
+        self.pt_run.note(f"{len(self.sink.finalised)} {calendar.freq} partition(s) "
+                         f"finalised in [{self.earliest}, {self.end}]")
         self.nd_run.note(f"{summary['n_days_scored']} day(s) scored, "
                          f"{summary['n_days_null_only']} null-only, peak RSS "
                          f"{summary['peak_rss_gb']:.2f} GB")
         self.dg_run.note(f"{summary['n_days_scored']} day(s)")
+        for run in (self.att_run, self.cross_run):
+            if run is not None:
+                run.note(f"{summary['n_days_scored']} day(s)")
 
     def final_summary(self) -> dict[str, Any]:
         """The run summary (artifact ids, counts) once the job has completed."""
@@ -939,15 +958,16 @@ class ScoringJob(Job):
     @classmethod
     def from_artifact(cls, artifact: Artifact, index: DatalakeIndex, *,
                       upstream: DatalakeIndex | None = None, cache_dir: Path | None = None,
-                      threads: int = 8, chunk_size: int = 8_192,
-                      rss_budget_gb: float | None = 30.0, use_kernel: bool | None = None,
-                      embedder: Any = None) -> ScoringJob:
+                      threads: int = 8, chunk_size: int | None = None,
+                      rss_budget_gb: float | None = RSS_BUDGET_GB,
+                      use_kernel: bool | None = None, embedder: Any = None) -> ScoringJob:
         """Everything from the run's ``run_config.json`` (written at its start):
-        config, dates, window, seed, taxonomy, sentiment, the exact upstream inputs
-        (never "latest") and the sibling artifact ids. The primitive-text embedder is
-        rebuilt from the recorded model card and must serve the same model (a remote
-        server's metadata is read first); its embeddings come from the recipe-keyed
-        cache. Only throughput knobs come from the caller."""
+        config, dates, window, seed, taxonomy, sentiment, asset layer, chunk size, the exact
+        upstream inputs (never "latest") and the sibling artifact ids. The primitive-text
+        embedder is rebuilt from the recorded model card and must serve the same model (a
+        remote server's metadata is read first); its embeddings come from the recipe-keyed
+        cache. Only throughput knobs come from the caller; a ``chunk_size`` other than the
+        recorded one is refused."""
         from datalake import ModelCard
         from narrative_scoring.primitives import embed_primitive_texts
         from nlp.embedding import embedder_from_card
@@ -962,6 +982,11 @@ class ScoringJob(Job):
             raise ValueError(f"{nd.artifact_id} has no {RUN_CONFIG_FILE} (written before "
                              "resume support); it cannot be resumed")
         rc = json.loads(path.read_text())
+        recorded_chunk = rc.get("chunk_size", 8_192)     # absent: the earlier default
+        if chunk_size is not None and chunk_size != recorded_chunk:
+            raise ValueError(f"{nd.artifact_id} was scored with chunk_size={recorded_chunk}; "
+                             f"resuming with {chunk_size} could move scores at the tau "
+                             "boundary. Resume without --chunk-size")
         config = ScoringConfig.from_dict(rc["config"])
         tax_art = resolve_taxonomy([dl, upstream], artifact_id=rc["taxonomy_artifact_id"])
         table = load_registered_table(tax_art, rc["primitive_embeddings"]["paraphrase_style"])
@@ -976,15 +1001,21 @@ class ScoringJob(Job):
         if embedding_key(P, meta) != rc["primitive_embeddings"]["embedding_key"]:
             raise ValueError("the primitive-embedding recipe differs from the one the run "
                              "started with")
-        sentiment = None
-        if rc.get("sentiment_artifact_id"):
-            sentiment = next(ix.get(rc["sentiment_artifact_id"]) for ix in (dl, upstream)
-                             if ix.exists(rc["sentiment_artifact_id"]))
+
+        def _get(aid: str) -> Artifact:
+            return next(ix.get(aid) for ix in (dl, upstream) if ix.exists(aid))
+
+        sentiment = _get(rc["sentiment_artifact_id"]) if rc.get("sentiment_artifact_id") \
+            else None
+        universe = assets = None
+        if rc.get("assets"):
+            universe = _get(rc["assets"]["universe_artifact_id"])
+            assets = AssetUniverse.from_artifact(
+                universe, min_relevance=rc["assets"]["min_relevance"])
         inputs = rc["inputs"]
-        source = headline_source(upstream, chunk_size=chunk_size, threads=threads,
-                                 sentiment=sentiment, config=config,
-                                 headlines=upstream.get(inputs["headlines"]),
-                                 embeddings=upstream.get(inputs["embeddings"]))
+        source = headline_source(upstream, chunk_size=recorded_chunk, sentiment=sentiment,
+                                 config=config, headlines=upstream.get(inputs["headlines"]),
+                                 embeddings=upstream.get(inputs["embeddings"]), assets=assets)
         calendar = CalibrationCalendar(**rc.get("calibration", {}))   # absent: the default
         log.info("resuming %s (%s -> %s)", nd.artifact_id, rc["start"], rc["end"])
         return cls(
@@ -993,7 +1024,8 @@ class ScoringJob(Job):
             seed=rc["seed"], keep_primitive_daily=rc["keep_primitive_daily"], threads=threads,
             rss_budget_gb=rss_budget_gb, use_kernel=use_kernel, temp=rc["temp"],
             label=rc["label"], taxonomy_id=rc["taxonomy_artifact_id"], sentiment=sentiment,
-            primitive_meta=meta, inputs=inputs, resume=rc["artifacts"], calendar=calendar)
+            primitive_meta=meta, inputs=inputs, resume=rc["artifacts"], calendar=calendar,
+            chunk_size=recorded_chunk, assets=assets, universe=universe)
 
     @classmethod
     def add_cli_args(cls, parser: Any) -> None:
@@ -1178,25 +1210,55 @@ def verify_narrative_daily(artifact: Artifact):
 
 def load_day_diagnostics(artifact: Artifact) -> pl.DataFrame:
     """Every day_diagnostics row of an artifact, whatever layout its files were written
-    with: columns absent from an older layout come back null, and a missing N_SCORED is
-    N_HEADLINES (an all-headlines run scores every headline)."""
+    with: columns absent from an older layout come back null, a missing N_SCORED is
+    N_HEADLINES (an all-headlines run scores every headline), a missing SENTIMENT is "all"
+    and a missing N_UNTAGGED 0 (one row per day, before the tags)."""
     files = sorted(p for p in artifact.files() if p.suffix == ".parquet")
     if not files:
         return pl.DataFrame(schema=DAY_DIAGNOSTICS_SCHEMA)
     df = pl.concat([pl.read_parquet(f) for f in files], how="diagonal_relaxed")
-    if "N_SCORED" not in df.columns:
-        df = df.with_columns(pl.lit(None, dtype=pl.Int64).alias("N_SCORED"))
-    df = df.with_columns(pl.col("N_SCORED").fill_null(pl.col("N_HEADLINES")))
+    for col, dtype in (("N_SCORED", pl.Int64), ("SENTIMENT", pl.String),
+                       ("N_UNTAGGED", pl.Int64)):
+        if col not in df.columns:
+            df = df.with_columns(pl.lit(None, dtype=dtype).alias(col))
+    df = df.with_columns(pl.col("N_SCORED").fill_null(pl.col("N_HEADLINES")),
+                         pl.col("SENTIMENT").fill_null("all"),
+                         pl.col("N_UNTAGGED").fill_null(0))
     return df.select([pl.col(c).cast(t) if c in df.columns else pl.lit(None, dtype=t).alias(c)
-                      for c, t in DAY_DIAGNOSTICS_SCHEMA.items()]).sort("DATE")
+                      for c, t in DAY_DIAGNOSTICS_SCHEMA.items()]).sort("DATE", "SENTIMENT")
 
 
 def verify_day_diagnostics(artifact: Artifact):
     def check():
         yield from _schema_check(artifact.files(), DAY_DIAGNOSTICS_SCHEMA, KIND_DAY_DIAGNOSTICS,
-                                 accepted=(DAY_DIAGNOSTICS_SCHEMA_V3, DAY_DIAGNOSTICS_SCHEMA_V2,
-                                           DAY_DIAGNOSTICS_SCHEMA_V1))
+                                 accepted=(DAY_DIAGNOSTICS_SCHEMA_V4, DAY_DIAGNOSTICS_SCHEMA_V3,
+                                           DAY_DIAGNOSTICS_SCHEMA_V2, DAY_DIAGNOSTICS_SCHEMA_V1))
     return _findings(KIND_DAY_DIAGNOSTICS, artifact, check)
+
+
+def _sparse_check(artifact: Artifact, schema: pl.Schema, kind: str):
+    """Schema of every partition (a day with no support writes no row, so an empty file
+    is valid), plus run_metadata.json."""
+    files = [p for p in artifact.files() if p.suffix == ".parquet"]
+    if not files:
+        yield f"{kind}: no parquet files"
+    for p in files[:6]:
+        if pl.read_parquet_schema(p) != schema:
+            yield f"{p.name}: schema mismatch"
+    if not (artifact.path / "run_metadata.json").exists():
+        yield "run_metadata.json missing"
+
+
+def verify_asset_attention(artifact: Artifact):
+    return _findings(KIND_ASSET_ATTENTION, artifact,
+                     lambda: _sparse_check(artifact, ASSET_ATTENTION_SCHEMA,
+                                           KIND_ASSET_ATTENTION))
+
+
+def verify_narrative_asset(artifact: Artifact):
+    return _findings(KIND_NARRATIVE_ASSET, artifact,
+                     lambda: _sparse_check(artifact, NARRATIVE_ASSET_SCHEMA,
+                                           KIND_NARRATIVE_ASSET))
 
 
 __all__ = [
@@ -1206,5 +1268,6 @@ __all__ = [
     "find_tau_asof",
     "build_tau_asof", "calibration_as_of", "headline_source", "earliest_headline_day",
     "KIND_SENTIMENT", "resolve_sentiment", "check_sentiment", "sentiment_columns",
+    "KIND_ASSET_ATTENTION", "KIND_NARRATIVE_ASSET", "CHUNK_SIZE",
     "score_range_to_datalake",
 ]

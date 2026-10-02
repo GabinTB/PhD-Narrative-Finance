@@ -413,15 +413,16 @@ class TestTaxonomyRegistration:
 
 
 # ---------------------------------------------------------------------------
-# Sentiment buckets through the one scoring path (parquet lake, SQL filter)
+# Sentiment tags and assets through the one scoring path (parquet lake)
 # ---------------------------------------------------------------------------
 
 BUCKET_MONTHS = [(2008, m) for m in range(1, 6)]
 
 
-def _parquet_lake(root: Path, table, P, n: int = 12) -> DatalakeIndex:
-    """A sandbox lake with REAL headline + embedding months (so the day query, the
-    sentiment join and the bucket filter run in DuckDB) and a mu_asof series."""
+def _parquet_lake(root: Path, table, P, n: int = 12, entities: bool = False) -> DatalakeIndex:
+    """A sandbox lake with REAL headline + embedding months (read through the partition
+    source) and a mu_asof series; with ``entities``, per-detection RP_ENTITY_ID / RELEVANCE
+    lists on the headlines (E0..E3, an entity sometimes detected twice)."""
     from narrative_scoring.schema import EMBEDDING_DIM
 
     rng = np.random.default_rng(3)
@@ -437,8 +438,17 @@ def _parquet_lake(root: Path, table, P, n: int = 12) -> DatalakeIndex:
     dl = DatalakeIndex(root)
     with dl.run(kind=A.KIND_HEADLINES, pipeline="t", pipeline_version="v0") as r:
         for name, (ids, ts, _) in months.items():
-            pl.DataFrame({"RP_STORY_ID": ids, "TIMESTAMP_UTC": ts,
-                          "HEADLINE": [f"h {i}" for i in ids]}).write_parquet(r.out_dir / name)
+            frame = pl.DataFrame({"RP_STORY_ID": ids, "TIMESTAMP_UTC": ts,
+                                  "HEADLINE": [f"h {i}" for i in ids]})
+            if entities:
+                k = np.arange(len(ids))
+                frame = frame.with_columns(
+                    pl.Series("RP_ENTITY_ID", [[f"E{j % 4}", f"E{j % 4}", f"E{(j + 1) % 4}"]
+                                               if j % 3 else [] for j in k],
+                              dtype=pl.List(pl.String)),
+                    pl.Series("RELEVANCE", [[int(j % 101), 100, 50] if j % 3 else []
+                                            for j in k], dtype=pl.List(pl.UInt8)))
+            frame.write_parquet(r.out_dir / name)
     with dl.run(kind=A.KIND_EMBEDDINGS, pipeline="t", pipeline_version="v0") as r:
         for name, (ids, _, X) in months.items():
             pl.DataFrame({"RP_STORY_ID": ids, "EMBEDDING": X},
@@ -485,67 +495,83 @@ def _register_vendor_sentiment(dl: DatalakeIndex):
                               end_year=2008, extra_hyperparams={}, temp=True)
 
 
-def _bucket_config(bucket, source, rule, **kw) -> ScoringConfig:
-    return ScoringConfig(q=0.75, null_draws_per_headline=4, min_month_draws=1, sentiment=bucket,
-                         sentiment_source=source, sentiment_rule=rule, **kw)
+TERNARY = [("neg", "x <= -1/3"), ("neu", "-1/3 < x < 1/3"), ("pos", "x >= 1/3")]
+
+
+def _tag_config(source="ravenbert", rule="mean", tags=TERNARY, **kw) -> ScoringConfig:
+    from narrative_scoring.tags import SentimentTags
+
+    return ScoringConfig(q=0.75, null_draws_per_headline=4, min_month_draws=1,
+                         tags=SentimentTags.build(source, rule, tags), **kw)
+
+
+def _register_universe(dl: DatalakeIndex) -> object:
+    """A universe artifact: E0..E2 from 2008-01, E2 out from 2008-05, one unmapped row."""
+    with dl.run(kind=A.KIND_UNIVERSE, pipeline="t", pipeline_version="v0", layer="raw",
+                hyperparams={"name": "toy"}) as r:
+        pl.DataFrame({
+            "snapshot_date": [date(2008, 1, 2)] * 4 + [date(2008, 5, 1)] * 2,
+            "name": ["a", "b", "c", "d", "a", "b"], "ticker": list("abcdab"),
+            "rp_entity_id": ["E0", "E1", "E2", None, "E0", "E1"],
+        }).write_parquet(r.out_dir / "data.parquet")
+    return dl.get(r.artifact_id)
 
 
 def _read(art) -> pl.DataFrame:
     return pl.concat([pl.read_parquet(p) for p in art.files() if p.suffix == ".parquet"
-                      and p.parent == art.path]).sort(["DATE", "narrative_key"])
+                      and p.parent == art.path]).sort(["DATE", "SENTIMENT", "narrative_key"])
 
 
-class TestSentimentBuckets:
+def _content(parts: pl.DataFrame) -> pl.DataFrame:
+    """Partition rows without run telemetry / provenance."""
+    return parts.drop([c for c in ("RSS_PEAK_GB", "CODE_VERSION") if c in parts.columns])
+
+
+class TestOnePass:
     START, END = date(2008, 3, 1), date(2008, 5, 31)
 
-    @pytest.mark.parametrize("source,rule,kw", [
-        ("ravenbert", "mean", {"min_conf": 0.05}),
-        ("ravenpack", "css", {"neg_max": -0.1, "pos_min": 0.4}),
-    ])
-    def test_four_bucket_runs_add_up_to_the_all_headlines_run(self, tmp_path, toy_table,
-                                                             toy_embeddings, source, rule, kw):
-        from narrative_scoring.config import SENTIMENT_BUCKETS
-        from narrative_scoring.validation import SentimentRun, sum_sentiment_runs
+    def test_tags_write_every_label_and_the_same_null_model(self, tmp_path, toy_table,
+                                                           toy_embeddings):
+        from narrative_scoring.partitions import load_partitions
+        from narrative_scoring.validation import sum_tags
+
+        run = dict(table=toy_table, P=toy_embeddings, use_kernel=False, temp=True)
+        base_lake = _parquet_lake(tmp_path / "base", toy_table, toy_embeddings)
+        base = ScoringConfig(q=0.75, null_draws_per_headline=4, min_month_draws=1)
+        s_all = A.score_range_to_datalake(base_lake, self.START, self.END, base, **run)
 
         dl = _parquet_lake(tmp_path / "lake", toy_table, toy_embeddings)
-        sent = (_register_vendor_sentiment(dl) if source == "ravenpack"
-                else _register_grid_sentiment(dl))
-        base = ScoringConfig(q=0.75, null_draws_per_headline=4, min_month_draws=1)
-        run = dict(table=toy_table, P=toy_embeddings, use_kernel=False, temp=True)
-        # a bucket run before the all-headlines run: no tau to reuse, refused
-        with pytest.raises(DatalakeError, match="no tau_asof"):
-            A.score_range_to_datalake(dl, self.START, self.END,
-                                      _bucket_config("positive", source, rule, **kw),
-                                      sentiment=sent, **run)
-        s_all = A.score_range_to_datalake(dl, self.START, self.END, base, **run)
-        n_partitions = len(dl.list(A.KIND_PARTITIONS, include_partial=True))
-        summaries = {b: A.score_range_to_datalake(dl, self.START, self.END,
-                                                  _bucket_config(b, source, rule, **kw),
-                                                  sentiment=sent, **run)
-                     for b in SENTIMENT_BUCKETS}
-        assert len(dl.list(A.KIND_PARTITIONS, include_partial=True)) == n_partitions
-        full = _read(dl.get(s_all["narrative_daily_id"]))
-        arts = [dl.get(sm["narrative_daily_id"]) for sm in summaries.values()]
-        total = sum_sentiment_runs([SentimentRun.from_artifact(a) for a in arts]).sort(
-            ["DATE", "narrative_key"])
-        assert total.height == full.height and total.columns == full.columns
-        np.testing.assert_array_equal(total["SUPPORT"].to_numpy(), full["SUPPORT"].to_numpy())
-        np.testing.assert_allclose(total["TOTAL_SCORE"].fill_null(0).to_numpy(),
-                                   full["TOTAL_SCORE"].fill_null(0).to_numpy(), rtol=1e-6)
-        assert (total["N_HEADLINES"] == full["N_HEADLINES"]).all()
-        assert (total["N_LABELLED"] == full["N_LABELLED"]).all()
-        for b, sm in summaries.items():
-            assert sm["partitions_id"] is None and sm["tau_asof_id"] == s_all["tau_asof_id"]
-            nd, dg = dl.get(sm["narrative_daily_id"]), dl.get(sm["day_diagnostics_id"])
-            hp = nd.meta.hyperparams
-            assert hp["sentiment"] == b.value and hp["sentiment_source"] == source
-            assert hp["sentiment_rule"] == rule and hp["sentiment_artifact_id"] == sent.artifact_id
-            assert sent.artifact_id in nd.meta.sources and A.verify_day_diagnostics(dg) == []
-            diag = A.load_day_diagnostics(dg)
-            full_diag = A.load_day_diagnostics(dl.get(s_all["day_diagnostics_id"]))
-            assert diag["DATE"].to_list() == full_diag["DATE"].to_list()
-            assert diag["N_HEADLINES"].to_list() == full_diag["N_HEADLINES"].to_list()
-            assert (diag["N_SCORED"] <= diag["N_HEADLINES"]).all()
+        sent = _register_grid_sentiment(dl)
+        cfg = _tag_config()
+        s = A.score_range_to_datalake(dl, self.START, self.END, cfg, sentiment=sent, **run)
+        nd, dg = dl.get(s["narrative_daily_id"]), dl.get(s["day_diagnostics_id"])
+        hp = nd.meta.hyperparams
+        assert hp["labels"] == "neg,neu,pos" and hp["sentiment_source"] == "ravenbert"
+        assert hp["sentiment_rule"] == "mean" and hp["tags_id"] == cfg.tags.digest()
+        assert hp["sentiment_artifact_id"] == sent.artifact_id
+        assert sent.artifact_id in nd.meta.sources and A.verify_day_diagnostics(dg) == []
+        assert hp["f0_config_id"] == base.f0_digest() and hp["config_id"] == cfg.digest()
+        frame = _read(nd)
+        assert set(frame["SENTIMENT"].unique()) == {"neg", "neu", "pos"}
+        diag = A.load_day_diagnostics(dg)
+        full = _read(base_lake.get(s_all["narrative_daily_id"]))
+        assert sorted(diag["DATE"].unique()) == sorted(full["DATE"].unique())
+        assert diag.height == 3 * full["DATE"].n_unique()
+        per_day = diag.group_by("DATE").agg(pl.col("N_SCORED").sum(),
+                                            pl.col("N_UNTAGGED").first(),
+                                            pl.col("N_HEADLINES").first())
+        assert (per_day["N_SCORED"] + per_day["N_UNTAGGED"] == per_day["N_HEADLINES"]).all()
+        assert per_day["N_UNTAGGED"].sum() > 0          # every 7th story has no model output
+        total = sum_tags(frame, diag).sort(["DATE", "narrative_key"])
+        assert (total["SUPPORT"] <= full.sort(["DATE", "narrative_key"])["SUPPORT"]).all()
+        # one pass builds the null model from every headline: the untagged run's partitions
+        a = _content(load_partitions(base_lake.get(s_all["partitions_id"]).path))
+        b = _content(load_partitions(dl.get(s["partitions_id"]).path))
+        assert a.drop("INPUT_IDS").equals(b.drop("INPUT_IDS"))
+        rc = json.loads((nd.path / A.RUN_CONFIG_FILE).read_text())
+        assert rc["chunk_size"] == A.CHUNK_SIZE and rc["assets"] is None
+        assert rc["config"]["tags"]["rule"] == "mean"
+        base_lake.close()
         dl.close()
 
     def test_incompatible_sentiment_is_refused(self, tmp_path, toy_table, toy_embeddings):
@@ -553,17 +579,18 @@ class TestSentimentBuckets:
         grid = _register_grid_sentiment(dl)
         vendor = _register_vendor_sentiment(dl)
         hl_id = dl.latest(A.KIND_HEADLINES).artifact_id
-        mean_cfg = _bucket_config("negative", "ravenbert", "mean")
-        css_cfg = _bucket_config("negative", "ravenpack", "css")
+        mean_cfg = _tag_config()
         A.check_sentiment(grid, headlines_id=hl_id, config=mean_cfg)
-        A.check_sentiment(vendor, headlines_id=hl_id, config=css_cfg)
-        with pytest.raises(DatalakeError, match="config says"):
-            A.check_sentiment(grid, headlines_id=hl_id, config=css_cfg)
+        with pytest.raises(DatalakeError, match="the tags say"):
+            A.check_sentiment(grid, headlines_id=hl_id, config=_tag_config("finbert"))
+        with pytest.raises(DatalakeError, match="not a grid table"):
+            A.check_sentiment(_relabel(vendor, "ravenbert"), headlines_id=hl_id,
+                              config=mean_cfg)
         with pytest.raises(DatalakeError, match="built on"):
             A.check_sentiment(grid, headlines_id="other", config=mean_cfg)
         fin = _register_grid_sentiment(dl, source="finbert")
-        assert A.resolve_sentiment([dl], headlines_id=hl_id, config=_bucket_config(
-            "negative", "finbert", "argmax"), source="finbert").artifact_id == fin.artifact_id
+        assert A.resolve_sentiment([dl], headlines_id=hl_id, config=_tag_config(
+            "finbert", "argmax"), source="finbert").artifact_id == fin.artifact_id
         base = ScoringConfig(q=0.75, null_draws_per_headline=4, min_month_draws=1)
         run = dict(table=toy_table, P=toy_embeddings, use_kernel=False, temp=True)
         with pytest.raises(ValueError, match="required iff"):
@@ -572,6 +599,45 @@ class TestSentimentBuckets:
         with pytest.raises(ValueError, match="required iff"):
             A.score_range_to_datalake(dl, date(2008, 3, 1), date(2008, 3, 31), mean_cfg, **run)
         dl.close()
+
+    def test_assets_write_their_own_artifacts(self, tmp_path, toy_table, toy_embeddings):
+        from narrative_scoring.assets import AssetUniverse
+
+        dl = _parquet_lake(tmp_path / "lake", toy_table, toy_embeddings, entities=True)
+        sent = _register_grid_sentiment(dl)
+        uni = _register_universe(dl)
+        assets = AssetUniverse.from_artifact(uni, min_relevance=0.75)
+        run = dict(table=toy_table, P=toy_embeddings, use_kernel=False, temp=True)
+        s = A.score_range_to_datalake(dl, self.START, self.END, _tag_config(), sentiment=sent,
+                                      assets=assets, universe=uni, **run)
+        nd = dl.get(s["narrative_daily_id"])
+        att, cross = dl.get(s["asset_attention_id"]), dl.get(s["narrative_asset_id"])
+        assert "universe_artifact_id" not in nd.meta.hyperparams
+        for art in (att, cross):
+            hp = art.meta.hyperparams
+            assert hp["universe_artifact_id"] == uni.artifact_id and hp["min_relevance"] == 0.75
+            assert hp["config_id"] == nd.meta.hyperparams["config_id"]
+            assert uni.artifact_id in art.meta.sources
+        assert A.verify_asset_attention(att) == [] and A.verify_narrative_asset(cross) == []
+        a = pl.concat([pl.read_parquet(p) for p in att.files() if p.suffix == ".parquet"])
+        assert a.height > 0 and set(a["RP_ENTITY_ID"]) <= {"E0", "E1", "E2"}
+        e2 = a.filter(pl.col("RP_ENTITY_ID") == "E2")
+        cut = date(2008, 5, 1)          # March is cold start: scoring begins in April
+        assert set(e2.filter(pl.col("DATE") >= cut)["IN_UNIVERSE"]) == {False}
+        assert set(e2.filter(pl.col("DATE") < cut)["IN_UNIVERSE"]) == {True}
+        diag = A.load_day_diagnostics(dl.get(s["day_diagnostics_id"]))
+        assert set(diag.filter(pl.col("DATE") < cut)["N_UNMAPPED"]) == {1}
+        assert set(diag.filter(pl.col("DATE") >= cut)["N_UNMAPPED"]) == {0}
+        rc = json.loads((nd.path / A.RUN_CONFIG_FILE).read_text())
+        assert rc["assets"] == {"universe_artifact_id": uni.artifact_id, "min_relevance": 0.75}
+        assert rc["artifacts"]["asset_attention"] == att.artifact_id
+        dl.close()
+
+
+def _relabel(art, source: str):
+    """``art`` as if its producer were ``source`` (to reach the grid check)."""
+    art.meta.hyperparams["source"] = source
+    return art
 
 
 def test_day_diagnostics_verifier_accepts_the_previous_schema(tmp_path):

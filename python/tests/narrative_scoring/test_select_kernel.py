@@ -119,3 +119,92 @@ def test_invalid_k_raises():
     S = np.zeros((2, 5), dtype=np.float32)
     with pytest.raises(ValueError):
         select_aggregate_rowwise(S, 0.0, 6, -1, np.zeros(5, np.int32), 1, False, False, 1)
+
+
+# ---------------------------------------------------------------------------
+# Sentiment tags (row_tag routing) and (row, narrative, score) triplets
+# ---------------------------------------------------------------------------
+
+def _block(seed=11, n=600, p=120, n_narr=17):
+    rng = np.random.default_rng(seed)
+    S = np.ascontiguousarray(rng.normal(0.2, 0.1, size=(n, p)).astype(np.float32))
+    p2n = np.sort(rng.integers(0, n_narr, p)).astype(np.int32)
+    pairs = (np.array([0, 40], np.int32), np.array([5, 4], np.int32),
+             np.array([5, 44], np.int32), np.array([6, 3], np.int32))
+    return rng, S, p2n, pairs
+
+
+@pytest.mark.parametrize("use_pairs", [False, True])
+def test_one_tag_on_every_row_is_the_untagged_call(use_pairs):
+    _, S, p2n, pairs = _block()
+    pa = pairs if use_pairs else (None, None, None, None)
+    a = select_aggregate_rowwise(S.copy(), 0.25, 6, 3, p2n, 17, False, True, 3, 12, *pa)
+    b = select_aggregate_rowwise(S.copy(), 0.25, 6, 3, p2n, 17, False, True, 3, 12, *pa,
+                                 row_tag=np.zeros(S.shape[0], np.int8), n_tags=1)
+    for key in ("narr_count", "narr_total", "narr_sumsq", "narr_peak", "prim_count",
+                "prim_total", "prim_sumsq", "prim_peak"):
+        np.testing.assert_array_equal(b[key][0], a[key])                     # bit for bit
+    for key in ("n_candidates", "n_retained", "n_unassigned", "n_pole_masked",
+                "n_mask_changed_retention", "jump_gap_sum"):
+        assert b[key][0] == a[key] and b[key][1] == 0                   # untagged slot empty
+    np.testing.assert_array_equal(a["trim_threshold"], b["trim_threshold"])
+    np.testing.assert_array_equal(a["n_masked"], b["n_masked"])
+
+
+@pytest.mark.parametrize("use_pairs", [False, True])
+def test_each_tag_equals_the_untagged_call_on_its_rows(use_pairs):
+    rng, S, p2n, pairs = _block()
+    pa = pairs if use_pairs else (None, None, None, None)
+    codes = rng.integers(-1, 3, S.shape[0]).astype(np.int8)
+    S_all = S.copy()
+    got = select_aggregate_rowwise(S_all, 0.25, 6, 3, p2n, 17, True, True, 1, 12, *pa,
+                                   row_tag=codes, n_tags=3)
+    masked = np.empty_like(S)
+    for t in (-1, 0, 1, 2):
+        idx = np.flatnonzero(codes == t)
+        sub = np.ascontiguousarray(S[idx])
+        ref = select_aggregate_rowwise(sub, 0.25, 6, 3, p2n, 17, True, True, 1, 12, *pa)
+        masked[idx] = sub
+        np.testing.assert_array_equal(got["trim_threshold"][idx], ref["trim_threshold"])
+        slot = t if t >= 0 else 3
+        assert got["n_candidates"][slot] == ref["n_candidates"]
+        assert got["n_unassigned"][slot] == ref["n_unassigned"]
+        assert got["n_pole_masked"][slot] == ref["n_pole_masked"]
+        if t < 0:
+            continue
+        for key in ("narr_count", "narr_total", "narr_sumsq", "narr_peak", "prim_count"):
+            np.testing.assert_array_equal(got[key][t], ref[key])   # one thread: same order
+    np.testing.assert_array_equal(S_all, masked)               # every row masked in place
+
+
+@pytest.mark.parametrize("rule", [AggRule.MEAN, AggRule.MEDIAN])
+def test_triplets_are_the_numpy_headline_narrative_scores(rule):
+    rng, S, p2n, _ = _block(seed=5)
+    codes = rng.integers(-1, 2, S.shape[0]).astype(np.int8)
+    k = select_aggregate_rowwise(S.copy(), 0.22, 6, -1, p2n, 17, rule is AggRule.MEDIAN,
+                                 False, 2, row_tag=codes, n_tags=2, want_triplets=True)
+    sel = select(S, float(np.float32(0.22)), 6)
+    rows, nid, val = headline_narrative_scores(sel.rows, sel.cols, sel.vals, p2n, 17, rule)
+    tagged = codes[rows] >= 0
+    want = {}
+    for r, n, v in zip(rows[tagged], nid[tagged], val[tagged]):
+        want.setdefault(int(r), []).append((int(n), float(v)))
+    for r in range(S.shape[0]):
+        got = [(int(k["trip_narr"][r, j]), float(k["trip_score"][r, j]))
+               for j in range(k["trip_n"][r])]
+        exp = want.get(r, [])
+        assert [g[0] for g in got] == [e[0] for e in exp], r
+        np.testing.assert_allclose([g[1] for g in got], [e[1] for e in exp], rtol=1e-12)
+    assert (k["trip_n"][codes < 0] == 0).all()
+
+
+def test_row_tag_validation():
+    _, S, p2n, _ = _block()
+    with pytest.raises(ValueError, match="one code per row"):
+        select_aggregate_rowwise(S, 0.2, 6, -1, p2n, 17, False, False, 1,
+                                 row_tag=np.zeros(3, np.int8), n_tags=1)
+    with pytest.raises(ValueError, match=r"\[-1, n_tags\)"):
+        select_aggregate_rowwise(S, 0.2, 6, -1, p2n, 17, False, False, 1,
+                                 row_tag=np.full(S.shape[0], 2, np.int8), n_tags=2)
+    with pytest.raises(ValueError, match="needs row_tag"):
+        select_aggregate_rowwise(S, 0.2, 6, -1, p2n, 17, False, False, 1, n_tags=2)
