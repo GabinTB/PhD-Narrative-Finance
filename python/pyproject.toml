@@ -60,6 +60,7 @@ headline_sentiment = "ravenpack.headlines.sentiment:verify_artifact"
 cb_speeches = "bis_gingado.cb_speeches.speeches:verify_artifact"
 cb_speech_ner = "bis_gingado.cb_speeches.ner:verify_artifact"
 rp_headlines = "ravenpack.annotations.ingest:verify_headlines"
+ciq_keydev = "wrds_client.capitaliq.keydev:verify_artifact"
 rp_headline_entities = "ravenpack.annotations.ingest:verify_entities"
 
 [project.entry-points."narrative_finance.jobs"]
@@ -71,6 +72,7 @@ narrative_daily = "narrative_scoring.artifacts:ScoringJob"
 cb_speeches = "bis_gingado.cb_speeches.speeches:SpeechesJob"
 cb_speech_ner = "bis_gingado.cb_speeches.ner:NerJob"
 rp_headlines = "ravenpack.annotations.ingest:RPA1IngestJob"
+ciq_keydev = "wrds_client.capitaliq.keydev:KeyDevJob"
 
 [build-system]
 requires      = ["hatchling"]

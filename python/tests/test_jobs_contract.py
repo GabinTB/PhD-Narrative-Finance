@@ -336,6 +336,34 @@ def case_rp_headlines(root: Path, freq: str) -> Env:
                                                                raw_dir=raw))
 
 
+def case_ciq_keydev(root: Path, freq: str) -> Env:
+    """Capital IQ Key Developments (monthly by construction, like rp_headlines)."""
+    import pandas as pd
+
+    from tests.wrds_client.capitaliq.fakes import FakeWRDS, make_events
+    from tests.wrds_client.capitaliq.test_keydev import T0, Clock
+    from wrds_client.capitaliq.keydev import KeyDevJob
+
+    wrds = FakeWRDS(*make_events(START, END))
+    index = DatalakeIndex(root / "lake")
+
+    def mutate() -> None:                          # July events arrive; one May event is edited
+        links, events = make_events(date(2008, 7, 1), date(2008, 7, 31), first_id=5000)
+        wrds.links = pd.concat([wrds.links, links], ignore_index=True)
+        wrds.events = pd.concat([wrds.events, events], ignore_index=True)
+        may = wrds.events["announceddate"].dt.month == 5
+        wrds.events.loc[may.idxmax(), "situation"] = "Revised paragraph."
+
+    return Env(index,
+               lambda: KeyDevJob.new(Layout("M", START, END), temp=True, source=wrds.source(),
+                                     clock=Clock(T0)),
+               lambda runner, aid: runner.resume(aid, source=wrds.source()), _frames,
+               mutate=mutate,
+               update_job=lambda aid: KeyDevJob.for_update(
+                   index.get(aid), index, source=wrds.source(), end=date(2008, 7, 31),
+                   clock=Clock(T0 + timedelta(days=1))))
+
+
 CASES: dict[str, Callable[[Path, str], Env]] = {
     "ravenpack_headlines": case_ravenpack_headlines,
     "headline_sentiment": case_headline_sentiment,
@@ -345,9 +373,10 @@ CASES: dict[str, Callable[[Path, str], Env]] = {
     "cb_speeches": case_cb_speeches,
     "cb_speech_ner": case_cb_speech_ner,
     "rp_headlines": case_rp_headlines,
+    "ciq_keydev": case_ciq_keydev,
 }
 WITH_MODEL = [k for k in CASES if k in ("headline_embeddings", "cb_speech_ner")]
-UPDATABLE = ["cb_speeches", "cb_speech_ner", "rp_headlines"]
+UPDATABLE = ["cb_speeches", "cb_speech_ner", "rp_headlines", "ciq_keydev"]
 
 
 def test_every_registered_job_has_a_case():
