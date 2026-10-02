@@ -9,6 +9,9 @@ on:
 jobs:
   lint-type-test:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: python        # pyproject.toml, src/ and tests/ live here
     steps:
       - uses: actions/checkout@v4
 
@@ -24,13 +27,13 @@ jobs:
         run: uv sync --group dev
 
       - name: ruff check
-        run: uv run ruff check src/edgar_tools tests/edgar_tools
+        run: uv run ruff check src/sec_edgar tests/sec_edgar
 
       - name: ruff format --check
-        run: uv run ruff format --check src/edgar_tools tests/edgar_tools
+        run: uv run ruff format --check src/sec_edgar tests/sec_edgar
 
       - name: pytest
-        run: uv run pytest tests/edgar_tools
+        run: uv run pytest tests/sec_edgar
 
       - name: mypy
-        run: uv run mypy src/edgar_tools
+        run: uv run mypy src/sec_edgar

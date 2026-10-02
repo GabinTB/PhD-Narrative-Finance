@@ -144,7 +144,7 @@ def normalise_isin(isin: str) -> str:
 def normalise_cik(cik: str) -> str:
     """Zero-pad to WRDS's stored 10-digit CIK format (e.g. "320193" -> "0000320193").
 
-    Matches `edgar_tools.config._normalise_cik`'s convention -- confirmed live
+    Matches `sec_edgar.edgar_toolbox.config._normalise_cik`'s convention -- confirmed live
     against `comp.company.cik`, which stores CIKs this way.
     """
     return str(cik).strip().zfill(10)

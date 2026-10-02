@@ -1,4 +1,4 @@
-"""Smoke test for the edgar_tools package skeleton (task 01).
+"""Smoke test for the sec_edgar.edgar_toolbox package skeleton (task 01).
 
 Real behaviour arrives with later tasks; this only pins that the package is
 importable, typed (py.typed present), and carries a version string.

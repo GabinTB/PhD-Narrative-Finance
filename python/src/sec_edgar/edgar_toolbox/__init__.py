@@ -1,4 +1,4 @@
-"""edgar_tools: SEC EDGAR filing acquisition, storage, and item-level extraction.
+"""sec_edgar.edgar_toolbox: SEC EDGAR filing acquisition, storage, and item-level extraction.
 
 See .claude/skills/sec-filing-db-coding/SKILL.md for the design and
 .claude/tasks/README.md for the build plan. The public API (`Store`) lands

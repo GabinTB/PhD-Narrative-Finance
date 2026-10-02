@@ -429,8 +429,8 @@ def ingest_range(
 # The Job (datalake.jobs) and the datalake-aware entry point
 # ---------------------------------------------------------------------------
 
-PIPELINE_VERSION = "v0.3.0"   # v0.3.0: RELEVANCE + RP_SOURCE_ID columns (enrich.py adds
-                              # them to an earlier artifact); v0.2.0: partition layout in the id
+PIPELINE_VERSION = "v0.3.0"   # v0.3.0: RELEVANCE + RP_SOURCE_ID columns;
+                              # v0.2.0: partition layout in the id
 RAW_SUBDIR = ("RavenPack", "headlines_edge_v1.0")
 
 

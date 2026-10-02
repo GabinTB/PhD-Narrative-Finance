@@ -1,4 +1,4 @@
-"""Tests for edgar_tools.config: resolution, canonicalisation, hashing.
+"""Tests for sec_edgar.edgar_toolbox.config: resolution, canonicalisation, hashing.
 
 Per .claude/tasks/02-config-schema-and-hashing.md.
 """
