@@ -7,7 +7,7 @@ from datetime import date
 
 import pytest
 
-from edgar_tools.config import (
+from sec_edgar.edgar_toolbox.config import (
     ConfigError,
     archive_name,
     canonicalise,
