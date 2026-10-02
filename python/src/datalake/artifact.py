@@ -31,6 +31,10 @@ Slugs sort sensibly, are greppable, and survive being read out loud.  They are
 NOT content hashes: two artifacts with identical parameters created on
 different days get different IDs.  Content identity lives in the file hashes.
 
+The folder group (``{layer}/{group}/{kind}/{id}``, e.g. the data source an
+artifact derives from) is NOT part of the ID: an artifact can be moved
+between groups without changing identity.
+
 Completeness
 ------------
 An artifact is complete when its last RunRecord has partial=False.  Any
@@ -221,6 +225,12 @@ class RunMeta:
     notes: str = ""
     # Frozen at creation so the artifact_id stays stable across executions.
     created: str = ""
+    # Folder the artifact lives under, {layer}/{group}/{kind}/{id} (None: {layer}/{kind}/{id}).
+    # Not part of the identity: moving an artifact never changes its id.
+    group: str | None = None
+    # Set on an artifact registered by DatalakeIndex.relink: {"from": old id, "replace":
+    # {old parent: new parent}, "checks": [check results], "commit": git commit}.
+    relink: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if not self.created:
@@ -291,6 +301,8 @@ class RunMeta:
             "deprecation_reason": self.deprecation_reason,
             "notes": self.notes,
             "created": self.created,
+            "group": self.group,
+            "relink": dict(self.relink) if self.relink is not None else None,
             # Denormalised aggregates for human/tool convenience (never read back).
             "partial": self.partial,
             "run_start": self.run_start,
@@ -339,6 +351,10 @@ class Artifact:
     @property
     def deprecated(self) -> bool:
         return self.meta.deprecated
+
+    @property
+    def group(self) -> str | None:
+        return self.meta.group
 
     def glob(self, pattern: str = "*.parquet") -> str:
         """A glob string ready to hand to DuckDB's read_parquet()."""

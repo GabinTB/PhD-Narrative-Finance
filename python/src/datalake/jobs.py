@@ -3,6 +3,9 @@
 A ``Job`` declares WHAT it computes; ``JobRunner`` owns HOW it runs:
 
     kind / pipeline / pipeline_version     the datalake artifact it produces
+    group                                  optional folder group of NEW artifacts
+                                           ({layer}/{group}/{kind}/{id}); siblings
+                                           opened in ``session`` follow it
     params()                               the artifact's hyperparams (its identity)
     sources() / model_card() / backends()  lineage, model provenance, live model checks
     units()                                ordered work units (the partitions of its range)
@@ -114,6 +117,7 @@ class Job(ABC):
     pipeline_repo: ClassVar[str | None] = "https://github.com/GabinTB/PhD-Narrative-Finance"
     pipeline_version: ClassVar[str]
     hash_pattern: ClassVar[str] = "*.parquet"
+    group: ClassVar[str | None] = None
     temp: bool = False
 
     @property
@@ -543,7 +547,8 @@ class JobRunner:
         artifact_id: str | None = resume or extend
         previous = self._install_signals()
         try:
-            with self.index.run(resume=resume, extend=extend, **run_kwargs) as run:
+            with self.index.default_group(job.group), \
+                    self.index.run(resume=resume, extend=extend, **run_kwargs) as run:
                 artifact_id = run.artifact_id
                 self._loop(job, run, new_execution=extend is not None)
             return self.index.get(artifact_id)

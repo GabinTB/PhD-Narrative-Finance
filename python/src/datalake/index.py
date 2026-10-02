@@ -2,11 +2,16 @@
 
 The datalake is a POSIX tree of immutable artifact directories:
 
-    {root}/{layer}/{kind}/{artifact_id}/
+    {root}/{layer}/{kind}/{artifact_id}/            (no group)
+    {root}/{layer}/{group}/{kind}/{artifact_id}/    (group, e.g. the data source)
         meta.json
         README.md
         2000-01.parquet
         ...
+
+The group is a folder only, never part of the id: `move()` re-files an artifact
+under another group without touching its content, and `relink()` registers an
+existing artifact's files (hard links) under new inputs (`datalake.relink`).
 
 `index.db` at the root is a SQLite cache over the meta.json sidecars.  It
 exists to make lookups and lineage queries fast; it holds no information that
@@ -38,8 +43,11 @@ appends another, preserving each execution's own commit and timestamps.
 """
 from __future__ import annotations
 
+import builtins
 import json
 import logging
+import os
+import re
 import sqlite3
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -54,6 +62,7 @@ from datalake.artifact import (
     utc_now_iso,
 )
 from datalake.meta import (
+    JOB_CONTROL_FILES,
     META_FILENAME,
     git_commit,
     hash_directory,
@@ -70,6 +79,13 @@ VALID_LAYERS = ("raw", "derived", "output")
 
 # Which layer a kind lands in.  Kinds not listed default to 'derived'.
 _LAYER_OVERRIDES: dict[str, str] = {}
+
+# A group is one folder name (CamelCase allowed: RavenPack, WRDS, CapIQ).
+_GROUP_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+_LOCK_FILE = JOB_CONTROL_FILES[1]
+# A job.lock whose heartbeat is younger than this belongs to a live job (jobs.JobRunner default).
+LIVE_LOCK_S = 600.0
 
 
 class DatalakeError(RuntimeError):
@@ -153,7 +169,17 @@ class DatalakeIndex:
         self._conn.execute("PRAGMA journal_mode = WAL")
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.executescript(_SCHEMA_PATH.read_text())
+        self._migrate()
         self._conn.commit()
+        self._default_group: str | None = None
+
+    def _migrate(self) -> None:
+        """Bring an index created by an older schema up to date (idempotent, additive)."""
+        columns = {r["name"] for r in self._conn.execute("PRAGMA table_info(artifacts)")}
+        if "grp" not in columns:
+            self._conn.execute("ALTER TABLE artifacts ADD COLUMN grp TEXT")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_artifacts_group "
+                           "ON artifacts (layer, grp, kind)")
 
     def close(self) -> None:
         self._conn.close()
@@ -169,10 +195,44 @@ class DatalakeIndex:
     def layer_for(self, kind: str) -> str:
         return _LAYER_OVERRIDES.get(kind, "derived")
 
-    def artifact_dir(self, layer: str, kind: str, artifact_id: str) -> Path:
+    def artifact_dir(self, layer: str, kind: str, artifact_id: str,
+                     group: str | None = None) -> Path:
         if layer not in VALID_LAYERS:
             raise DatalakeError(f"invalid layer {layer!r}, expected one of {VALID_LAYERS}")
-        return self.root / layer / kind / artifact_id
+        base = self.root / layer
+        return (base / group if group else base) / kind / artifact_id
+
+    @contextmanager
+    def default_group(self, group: str | None) -> Iterator[None]:
+        """New artifacts created by ``run()`` inside this block (without an explicit
+        ``group``) go under ``group``: how a job's sibling artifacts follow its group."""
+        previous, self._default_group = self._default_group, group
+        try:
+            yield
+        finally:
+            self._default_group = previous
+
+    def check_group(self, group: str | None, kind: str, layer: str) -> None:
+        """Refuse a (group, kind) whose folder would collide with another one.
+
+        Directly under a layer, a name is either a kind folder (artifacts without a
+        group) or a group folder: a group may not be named like a kind filed at the
+        root of that layer, nor a root-level kind like an existing group."""
+        if group is None:
+            clash = self._conn.execute(
+                "SELECT 1 FROM artifacts WHERE layer = ? AND grp = ? LIMIT 1",
+                (layer, kind)).fetchone()
+            if clash:
+                raise DatalakeError(f"kind {kind!r} is the name of a group folder in {layer}/")
+            return
+        if not _GROUP_NAME.match(group):
+            raise DatalakeError(f"invalid group name {group!r} (one folder name: letters, "
+                                "digits, '.', '_', '-')")
+        clash = self._conn.execute(
+            "SELECT 1 FROM artifacts WHERE layer = ? AND grp IS NULL AND kind = ? LIMIT 1",
+            (layer, group)).fetchone()
+        if clash:
+            raise DatalakeError(f"group {group!r} is the name of a kind folder in {layer}/")
 
     # -- registration ------------------------------------------------------
 
@@ -198,9 +258,11 @@ class DatalakeIndex:
                 pipeline, pipeline_version, pipeline_commit, pipeline_repo,
                 model_id, model_version, model_commit,
                 hyperparams_json, model_card_json, meta_json,
-                run_start, run_end, partial, deprecated, deprecation_reason, notes
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                run_start, run_end, partial, deprecated, deprecation_reason, notes, grp
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT (artifact_id) DO UPDATE SET
+                path               = excluded.path,
+                grp                = excluded.grp,
                 meta_json          = excluded.meta_json,
                 run_start          = excluded.run_start,
                 run_end            = excluded.run_end,
@@ -222,7 +284,7 @@ class DatalakeIndex:
                 json.dumps(meta.to_dict()),
                 meta.run_start, meta.run_end,
                 int(meta.partial), int(meta.deprecated),
-                meta.deprecation_reason, meta.notes,
+                meta.deprecation_reason, meta.notes, meta.group,
             ),
         )
 
@@ -271,6 +333,7 @@ class DatalakeIndex:
         hash_pattern: str = "*",
         extend: str | None = None,
         resume: str | None = None,
+        group: str | None = None,
     ) -> Iterator[RunHandle]:
         """Register, execute, and finalise one pipeline execution.
 
@@ -304,6 +367,9 @@ class DatalakeIndex:
             hash_pattern:     Glob for which output files to hash.
             extend:           Artifact ID to append a new execution to.
             resume:           Partial artifact ID to continue in place.
+            group:            Folder group of a NEW artifact ({layer}/{group}/{kind}/{id});
+                              default: the enclosing ``default_group`` scope, else none.
+                              Ignored on extend / resume (the artifact stays where it is).
         """
         source_ids = [
             s.artifact_id if isinstance(s, Artifact) else str(s)
@@ -347,9 +413,11 @@ class DatalakeIndex:
                 sources=source_ids,
                 model_card=model_card,
                 verifier=verifier,
+                group=group if group is not None else self._default_group,
             )
             resolved_layer = layer or self.layer_for(kind)
-            out_dir = self.artifact_dir(resolved_layer, kind, meta.artifact_id)
+            self.check_group(meta.group, kind, resolved_layer)
+            out_dir = self.artifact_dir(resolved_layer, kind, meta.artifact_id, meta.group)
             out_dir.mkdir(parents=True, exist_ok=True)
 
         record = RunRecord(
@@ -434,6 +502,7 @@ class DatalakeIndex:
         model: str | None = None,
         version: str | None = None,
         layer: str | None = None,
+        group: str | None = None,
         include_partial: bool = False,
         include_deprecated: bool = False,
     ) -> list[Artifact]:
@@ -441,6 +510,7 @@ class DatalakeIndex:
 
         Partial and deprecated artifacts are excluded by default: consuming
         either one silently is the failure this layer exists to prevent.
+        ``group`` filters on the folder group (None: any; "": artifacts without one).
         """
         clauses: list[str] = []
         params: list[Any] = []
@@ -456,6 +526,11 @@ class DatalakeIndex:
         if layer is not None:
             clauses.append("layer = ?")
             params.append(layer)
+        if group == "":
+            clauses.append("grp IS NULL")
+        elif group is not None:
+            clauses.append("grp = ?")
+            params.append(group)
         if not include_partial:
             clauses.append("partial = 0")
         if not include_deprecated:
@@ -498,11 +573,11 @@ class DatalakeIndex:
 
     # -- lineage -----------------------------------------------------------
 
-    def parents(self, artifact_id: str) -> list[str]:
+    def parents(self, artifact_id: str) -> builtins.list[str]:
         """Direct inputs of an artifact."""
         return self._parents_of(artifact_id)
 
-    def children(self, artifact_id: str) -> list[str]:
+    def children(self, artifact_id: str) -> builtins.list[str]:
         """Artifacts that directly consumed this one."""
         return [
             r["child_id"]
@@ -512,7 +587,7 @@ class DatalakeIndex:
             )
         ]
 
-    def descendants(self, artifact_id: str) -> list[str]:
+    def descendants(self, artifact_id: str) -> builtins.list[str]:
         """All artifacts transitively downstream of this one.
 
         This is the "what is now stale?" query.  Cycles are impossible in a
@@ -528,7 +603,7 @@ class DatalakeIndex:
                     frontier.append(child)
         return sorted(seen)
 
-    def ancestors(self, artifact_id: str) -> list[str]:
+    def ancestors(self, artifact_id: str) -> builtins.list[str]:
         """All artifacts transitively upstream of this one."""
         seen: set[str] = set()
         frontier = [artifact_id]
@@ -579,6 +654,57 @@ class DatalakeIndex:
         write_sidecars(artifact.path, artifact.meta, file_hashes)
         return self.get(artifact_id)
 
+    def move(self, artifact_id: str, group: str | None, *, dry_run: bool = False,
+             allow_partial: bool = False) -> tuple[Path, Path]:
+        """Re-file an artifact under ``group`` (None: no group). Returns (old, new) path.
+
+        Content, id, hashes and lineage are untouched: the directory is renamed (one
+        atomic step, the commit point), then ``meta.json`` / README and the index row
+        get the new group and path. A crash in between is repaired by ``reindex()``
+        (the folder wins). Refused: a live ``job.lock``; a partial artifact (the
+        siblings of a running job hold no lock) unless ``allow_partial``; an existing
+        target; a target on another device (a rename never becomes a copy).
+        """
+        art = self.get(artifact_id)
+        source = art.path
+        target = self.artifact_dir(art.layer, art.kind, artifact_id, group)
+        if group == art.group and source == target:
+            return source, target
+        self.check_group(group, art.kind, art.layer)
+        if not source.is_dir():
+            raise DatalakeError(f"{artifact_id}: directory missing from disk: {source}")
+        lock = source / _LOCK_FILE
+        if lock.exists() and _lock_age_s(lock) < LIVE_LOCK_S:
+            raise DatalakeError(f"{artifact_id} is held by a live job ({lock}); pause it first")
+        if art.partial and not allow_partial:
+            raise DatalakeError(f"{artifact_id} is partial (a running job may be writing it); "
+                                "pass allow_partial once no job uses it")
+        if target.exists():
+            raise DatalakeError(f"target already exists: {target}")
+        _same_device(source, target)
+        if dry_run:
+            return source, target
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.rename(source, target)
+        meta, file_hashes = read_meta(target)
+        meta.group = group
+        write_sidecars(target, meta, file_hashes)
+        self._upsert(meta, art.layer, target, file_hashes)
+        for empty in (source.parent, source.parent.parent):     # kind folder, group folder
+            if empty != self.root / art.layer:
+                try:
+                    empty.rmdir()                                 # only when empty
+                except OSError:
+                    break
+        log.info("moved %s: %s -> %s", artifact_id, source, target)
+        return source, target
+
+    def relink(self, artifact_id: str, **kwargs: Any) -> Any:
+        """Register ``artifact_id``'s files under new inputs / code (``datalake.relink``)."""
+        from datalake.relink import relink
+
+        return relink(self, artifact_id, **kwargs)
+
     # -- reindex -----------------------------------------------------------
 
     def reindex(self) -> int:
@@ -600,13 +726,25 @@ class DatalakeIndex:
             layer_dir = self.root / layer
             if not layer_dir.is_dir():
                 continue
-            for meta_path in sorted(layer_dir.glob(f"*/*/{META_FILENAME}")):
-                artifact_dir = meta_path.parent
+            for artifact_dir in _artifact_dirs(layer_dir):
+                rel = artifact_dir.relative_to(layer_dir).parts
+                if len(rel) not in (2, 3):
+                    log.warning("skipping %s: not {kind}/{id} nor {group}/{kind}/{id}",
+                                artifact_dir)
+                    continue
                 try:
                     meta, file_hashes = read_meta(artifact_dir)
                 except (OSError, ValueError) as exc:
-                    log.warning("skipping unreadable sidecar %s: %s", meta_path, exc)
+                    log.warning("skipping unreadable sidecar %s: %s", artifact_dir, exc)
                     continue
+                folder_group = rel[0] if len(rel) == 3 else None
+                if meta.group != folder_group:           # moved by hand: the folder wins
+                    log.warning("%s: sidecar group %r, folder group %r (folder kept)",
+                                meta.artifact_id, meta.group, folder_group)
+                    meta.group = folder_group
+                if rel[-2] != meta.kind:
+                    log.warning("%s: a %s filed under the %r folder", meta.artifact_id,
+                                meta.kind, rel[-2])
                 self._upsert(meta, layer, artifact_dir, file_hashes)
                 count += 1
 
@@ -646,3 +784,41 @@ class DatalakeIndex:
             f"SELECT * FROM read_parquet('{artifact.glob(pattern)}')"
         )
         return view
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _artifact_dirs(layer_dir: Path) -> list[Path]:
+    """Every directory under ``layer_dir`` holding a meta.json, sorted; never descends
+    into an artifact (its own sub-directories are content, not artifacts)."""
+    found: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(layer_dir):
+        if META_FILENAME in filenames and Path(dirpath) != layer_dir:
+            found.append(Path(dirpath))
+            dirnames[:] = []
+        else:
+            dirnames.sort()
+    return sorted(found)
+
+
+def _lock_age_s(lock: Path) -> float:
+    """Seconds since a job.lock's last heartbeat (inf when unreadable)."""
+    from datetime import datetime, timezone
+
+    try:
+        beat = json.loads(lock.read_text())["heartbeat_at"]
+        return (datetime.now(timezone.utc) - datetime.fromisoformat(beat)).total_seconds()
+    except (OSError, ValueError, KeyError):
+        return float("inf")
+
+
+def _same_device(source: Path, target: Path) -> None:
+    """Refuse a rename / hard link across filesystems (it would need a copy)."""
+    anchor = target
+    while not anchor.exists():
+        anchor = anchor.parent
+    if source.stat().st_dev != anchor.stat().st_dev:
+        raise DatalakeError(f"{source} and {target} are on different filesystems: "
+                            "refusing to copy")

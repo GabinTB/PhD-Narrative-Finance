@@ -183,6 +183,8 @@ def render_readme(
         f"- **Kind**: `{meta.kind}`",
         f"- **Pipeline**: `{meta.pipeline}` version `{meta.pipeline_version}`",
     ]
+    if meta.group:
+        lines.append(f"- **Group**: `{meta.group}`")
     if meta.pipeline_repo:
         lines.append(f"- **Repo**: {meta.pipeline_repo}")
     if meta.verifier:
@@ -244,6 +246,22 @@ def render_readme(
         lines += ["## Inputs", ""]
         for source in meta.sources:
             lines.append(f"- `{source}`")
+        lines.append("")
+
+    if meta.relink:
+        rl = meta.relink
+        lines += ["## Relinked", "",
+                  f"Same files as `{rl.get('from')}` (hard links), registered under new "
+                  "inputs or code after the equivalence checks below.", ""]
+        for old, new in sorted((rl.get("replace") or {}).items()):
+            lines.append(f"- `{old}` -> `{new}`")
+        checks = rl.get("checks") or []
+        if checks:
+            lines += ["", "| Check | Result | Details |", "| --- | --- | --- |"]
+            for c in checks:
+                details = str(c.get("details", "")).replace("|", "/").replace("\n", " ")
+                lines.append(f"| `{c.get('name')}` | {'pass' if c.get('passed') else 'FAIL'} "
+                             f"| {details} |")
         lines.append("")
 
     if files:

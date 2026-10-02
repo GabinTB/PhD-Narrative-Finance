@@ -42,7 +42,12 @@ CREATE TABLE IF NOT EXISTS artifacts (
     partial             INTEGER NOT NULL DEFAULT 1 CHECK (partial IN (0, 1)),
     deprecated          INTEGER NOT NULL DEFAULT 0 CHECK (deprecated IN (0, 1)),
     deprecation_reason  TEXT,
-    notes               TEXT NOT NULL DEFAULT ''
+    notes               TEXT NOT NULL DEFAULT '',
+
+    -- Folder group: the artifact lives at {layer}/{grp}/{kind}/{id} (NULL: {layer}/{kind}/{id}).
+    -- Indexes created before groups existed get the column by an ALTER TABLE at
+    -- connect time (index.py), together with idx_artifacts_group.
+    grp                 TEXT
 );
 
 -- `latest(kind, model=..., version=...)` is the hottest query in the API.

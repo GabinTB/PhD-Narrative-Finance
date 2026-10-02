@@ -332,6 +332,13 @@ def test_every_registered_job_has_a_case():
     assert sorted(set(registered_jobs()) - {"toy_series", "toy_cli"}) == sorted(CASES)
 
 
+def test_job_groups_are_valid_folder_names():
+    from datalake.index import _GROUP_NAME
+
+    for kind, cls in registered_jobs().items():
+        assert cls.group is None or _GROUP_NAME.match(cls.group), (kind, cls.group)
+
+
 # ---------------------------------------------------------------------------
 # The contract
 # ---------------------------------------------------------------------------

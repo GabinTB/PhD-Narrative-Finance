@@ -197,6 +197,39 @@ def verify_completeness(index: DatalakeIndex, report: VerifyReport) -> None:
             )
 
 
+def verify_layout(index: DatalakeIndex, report: VerifyReport) -> None:
+    """Flag artifacts not where their group says, and relinks whose record is off."""
+    for artifact in index.list(include_partial=True, include_deprecated=True):
+        expected = index.artifact_dir(artifact.layer, artifact.kind, artifact.artifact_id,
+                                      artifact.group)
+        if artifact.path != expected:
+            report.add(
+                Severity.WARNING, artifact.artifact_id,
+                f"filed at {artifact.path}, its group says {expected}; "
+                "`datalake reindex` (folder wins) or `datalake move` fixes it",
+            )
+        relinked = artifact.meta.relink
+        if not relinked:
+            continue
+        source = relinked.get("from")
+        if not source or not index.exists(source):
+            report.add(
+                Severity.WARNING, artifact.artifact_id,
+                f"relinked from {source!r}, which is not registered in this index",
+            )
+        failed = [c.get("name") for c in relinked.get("checks") or [] if not c.get("passed")]
+        if failed:
+            report.add(
+                Severity.ERROR, artifact.artifact_id,
+                f"registered by a relink whose checks failed: {failed}",
+            )
+        elif not relinked.get("checks"):
+            report.add(
+                Severity.ERROR, artifact.artifact_id,
+                "registered by a relink without any equivalence check",
+            )
+
+
 def verify_lineage(index: DatalakeIndex, report: VerifyReport) -> None:
     """Flag lineage edges pointing at unregistered artifacts."""
     for artifact in index.list(include_partial=True, include_deprecated=True):
@@ -306,6 +339,7 @@ def verify(
         )
 
     verify_completeness(index, report)
+    verify_layout(index, report)
 
     if check_lineage:
         verify_lineage(index, report)
