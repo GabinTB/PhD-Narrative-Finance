@@ -101,12 +101,22 @@ from narrative_scoring.tau_asof import (
 )
 from nlp.corrections import Correction
 from nlp.reference_vector import load_reference_series
+from ravenpack.annotations.access import (
+    ENTITIES_KIND,
+    HEADLINES_KIND,
+    duckdb_day,
+    entities_of,
+    pin_utc,
+    require_headlines,
+)
 
 log = logging.getLogger(__name__)
 
 PIPELINE = "PhD-Narrative-Finance"
 PIPELINE_REPO = "https://github.com/GabinTB/PhD-Narrative-Finance"
-PIPELINE_VERSION = "v2.3.0"   # v2.3.0: one pass (each partition read once), sentiment
+PIPELINE_VERSION = "v2.4.0"   # v2.4.0: reads rp_headlines + rp_headline_entities (assets
+#                               from the entities table), UTC-pinned DuckDB;
+#                               v2.3.0: one pass (each partition read once), sentiment
 #                               tags as labels, asset outputs, per-label day_diagnostics;
 #                               v2.2.0: nlp embeddings, P digest in ids, provenance
 TEMP_SUFFIX = "__TEMP"
@@ -116,7 +126,8 @@ KIND_PARTITIONS = "f0_monthly_partitions"
 KIND_TAU_ASOF = "tau_asof"
 KIND_NARRATIVE_DAILY = "narrative_daily"
 KIND_DAY_DIAGNOSTICS = "day_diagnostics"
-KIND_HEADLINES = "ravenpack_headlines"
+KIND_HEADLINES = HEADLINES_KIND         # rp_headlines (ravenpack.annotations)
+KIND_ENTITIES = ENTITIES_KIND           # rp_headline_entities, its sibling
 KIND_EMBEDDINGS = "headline_embeddings"
 KIND_MU_ASOF = "mu_asof"
 KIND_SENTIMENT = "headline_sentiment"
@@ -422,18 +433,20 @@ def headline_source(upstream: DatalakeIndex, chunk_size: int = 8_192, threads: i
     (``PartitionHeadlineSource``), with the tag codes of ``config.tags`` from
     ``sentiment`` (a ``headline_sentiment`` grid artifact) and the assets of ``assets``
     when given. ``threads`` is unused (kept for callers)."""
-    hl = headlines or upstream.latest(KIND_HEADLINES)
+    hl = require_headlines(headlines or upstream.latest(KIND_HEADLINES))
     em = embeddings or upstream.latest(KIND_EMBEDDINGS)
     tags = config.tags if config is not None else None
     if (sentiment is None) != (tags is None):
         raise ValueError("a sentiment artifact is needed iff the config has sentiment tags")
-    layout = shared_layout(hl, em, *([sentiment] if sentiment is not None else []))
+    ent = entities_of(upstream, hl) if assets is not None else None
+    layout = shared_layout(hl, em, *([sentiment] if sentiment is not None else []),
+                           *([ent] if ent is not None else []))
     if sentiment is not None:
         check_sentiment(sentiment, headlines_id=hl.artifact_id, config=config)
     return PartitionHeadlineSource(
         hl.path, em.path, chunk_size=chunk_size, source_id=f"{hl.artifact_id}+{em.artifact_id}",
         layout=layout, sentiment_dir=sentiment.path if sentiment is not None else None,
-        tags=tags, assets=assets)
+        tags=tags, assets=assets, entities_dir=ent.path if ent is not None else None)
 
 
 def shared_layout(*artifacts: Artifact) -> Layout:
@@ -497,10 +510,10 @@ def earliest_headline_day(headlines: Artifact) -> date:
     files = list(layout_of(headlines).existing(headlines.path).values())
     if not files:
         raise DatalakeError(f"{headlines.artifact_id} has no partition files")
-    conn = duckdb.connect()
+    conn = pin_utc(duckdb.connect())
     try:
         row = conn.sql(
-            f"SELECT MIN(CAST(TIMESTAMP_UTC AS DATE)) FROM read_parquet('{files[0]}')"
+            f"SELECT MIN({duckdb_day('TIMESTAMP_UTC')}) FROM read_parquet('{files[0]}')"
         ).fetchone()
     finally:
         conn.close()
@@ -697,8 +710,8 @@ class ScoringJob(Job):
         if (assets is None) != (universe is None):
             raise ValueError("an asset layer needs its universe artifact, and vice versa")
         inputs = inputs or {}
-        hl = upstream.get(inputs["headlines"]) if inputs.get("headlines") \
-            else upstream.latest(KIND_HEADLINES)
+        hl = require_headlines(upstream.get(inputs["headlines"]) if inputs.get("headlines")
+                               else upstream.latest(KIND_HEADLINES))
         em = upstream.get(inputs["embeddings"]) if inputs.get("embeddings") \
             else upstream.latest(KIND_EMBEDDINGS)
         mu_id = inputs.get("mu_asof")

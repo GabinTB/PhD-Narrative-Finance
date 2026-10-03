@@ -72,6 +72,15 @@ from nlp.reference_vector import (
     parse_window,
     validate_window_after_delay,
 )
+from ravenpack.annotations.access import (
+    DEFAULT_DAY_TZ,
+    HEADLINES_KIND,
+    day_tz_params,
+    duckdb_day,
+    latest_headlines,
+    pin_utc,
+    require_headlines,
+)
 from ravenpack.headlines.schema import EMBEDDING_DIM
 
 if TYPE_CHECKING:
@@ -82,7 +91,7 @@ log = logging.getLogger(__name__)
 
 # Datalake artifact kind produced by this module, and the kinds it reads from.
 KIND = "mu_asof"
-SOURCE_HEADLINES_KIND = "ravenpack_headlines"
+SOURCE_HEADLINES_KIND = HEADLINES_KIND     # rp_headlines
 SOURCE_EMBEDDINGS_KIND = "headline_embeddings"
 
 PIPELINE = "PhD-Narrative-Finance"
@@ -129,6 +138,7 @@ def compute_daily_stats(
     pooling: str = "mean",
     threads: int = 8,
     checkpoint_dir: Path | None = None,
+    day_tz: str = DEFAULT_DAY_TZ,
 ) -> tuple[pd.DatetimeIndex, np.ndarray, np.ndarray]:
     """Per-month DuckDB join + aggregate, accumulated across months in Python.
 
@@ -141,11 +151,11 @@ def compute_daily_stats(
     month, so each month's join+aggregate is trivially small -- DuckDB never
     needs to spill.
 
-    A day never spans two monthly files, so restricting the join to
-    same-month files is exact (not an approximation): the per-day
-    (aggregate, count) pairs from each month are merged into a running Python
-    dict keyed by day. This deliberately avoids a single cross-corpus join
-    (all headlines x all embeddings at once), which spills to disk past
+    The per-day (aggregate, count) pairs of each month are merged into a running
+    Python dict keyed by day, so a calendar day spanning two monthly files (a
+    ``day_tz`` other than UTC, the files being UTC months) is still exact. This
+    deliberately avoids a single cross-corpus join (all headlines x all embeddings
+    at once), which spills to disk past
     available memory once the corpus spans decades.
 
     MAX(n_vals) doubles as the per-day headline count: every headline
@@ -153,8 +163,8 @@ def compute_daily_stats(
     scan needed for counts.
 
     Args:
-        headlines_dir:  Directory of the ravenpack_headlines artifact
-                        (RP_STORY_ID, TIMESTAMP_UTC), one parquet per month.
+        headlines_dir:  Directory of the rp_headlines artifact
+                        (RP_STORY_ID, TIMESTAMP_UTC in UTC), one parquet per month.
         embeddings_dir: Directory of the headline_embeddings artifact
                         (RP_STORY_ID, EMBEDDING), one parquet per month with
                         the same file names as headlines_dir.
@@ -166,6 +176,7 @@ def compute_daily_stats(
                         there (``YYYY-MM.npz``, atomically) as soon as its query
                         finishes, and months already saved are loaded instead
                         of queried -- an interrupted pass resumes where it stopped.
+        day_tz:         Time zone of the calendar days (default UTC).
 
     Returns:
         (days, stat_matrix, count_vector): days is the sorted index of
@@ -201,7 +212,7 @@ def compute_daily_stats(
                                    "day_stat": list(saved["stat"]), "n": saved["n"]})
             n_reused += 1
         else:
-            result = _month_stats(hl_file, emb_file, pooling, threads)
+            result = _month_stats(hl_file, emb_file, pooling, threads, day_tz)
             if ckpt is not None:
                 _save_checkpoint(result, ckpt)
         _accumulate(pooling, result, day_stat, day_cnt)
@@ -227,15 +238,17 @@ def _save_checkpoint(result: pl.DataFrame, ckpt: Path) -> None:
     tmp.replace(ckpt)
 
 
-def _month_stats(hl_file: Path, emb_file: Path, pooling: str, threads: int) -> pl.DataFrame:
-    """One month's per-day aggregate (day, day_stat, n) via a fresh DuckDB connection."""
-    conn = duckdb.connect()
+def _month_stats(hl_file: Path, emb_file: Path, pooling: str, threads: int,
+                 day_tz: str = DEFAULT_DAY_TZ) -> pl.DataFrame:
+    """One month's per-day aggregate (day, day_stat, n) via a fresh DuckDB connection
+    (session pinned to UTC; days in ``day_tz``)."""
+    conn = pin_utc(duckdb.connect())
     try:
         conn.execute(f"PRAGMA threads={threads}")
         result = conn.sql(f"""
             WITH joined AS (
                 SELECT
-                    CAST(h.TIMESTAMP_UTC AS DATE) AS day,
+                    {duckdb_day("h.TIMESTAMP_UTC", day_tz)} AS day,
                     e.EMBEDDING
                 FROM read_parquet('{hl_file}') h
                 JOIN read_parquet('{emb_file}') e
@@ -316,7 +329,8 @@ def output_name(delay: str, mode: str, pooling: str = "mean") -> str:
     return f"mu_asof_delay-{delay}_mode-{mode}{suffix}.parquet"
 
 
-PIPELINE_VERSION = "v0.2.0"   # v0.2.0: pooling in the hyperparams (mean/min/max)
+PIPELINE_VERSION = "v0.3.0"   # v0.3.0: reads rp_headlines (UTC datetimes), day_tz;
+                              # v0.2.0: pooling in the hyperparams (mean/min/max)
 
 
 @register_job
@@ -328,8 +342,10 @@ class MuAsofJob(Job):
 
     def __init__(self, headlines: Artifact, embeddings: Artifact, delay: str, mode: str, *,
                  pooling: str = "mean", threads: int = 8, temp: bool = False,
-                 pipeline_version: str | None = None) -> None:
+                 pipeline_version: str | None = None, day_tz: str = DEFAULT_DAY_TZ) -> None:
         validate_window_after_delay(parse_delay(delay), parse_window(mode))
+        require_headlines(headlines)
+        self.day_tz = day_tz
         if pooling not in POOLINGS:
             raise ValueError(f"pooling must be one of {POOLINGS}, got {pooling!r}")
         _check_same_layout(headlines, embeddings)
@@ -346,7 +362,8 @@ class MuAsofJob(Job):
     def params(self) -> dict[str, Any]:
         return {"delay": self.delay, "mode": self.mode, "pooling": self.pooling,
                 "dim": EMBEDDING_DIM, "source_headlines": self.headlines.artifact_id,
-                "source_embeddings": self.embeddings.artifact_id}
+                "source_embeddings": self.embeddings.artifact_id,
+                **day_tz_params(self.day_tz)}
 
     def sources(self) -> list[Any]:
         return [self.headlines, self.embeddings]
@@ -373,14 +390,14 @@ class MuAsofJob(Job):
         ckpt_dir = ctx.out_dir / CHECKPOINT_DIR
         ckpt_dir.mkdir(exist_ok=True)
         result = _month_stats(self.headlines.path / name, self.embeddings.path / name,
-                              self.pooling, self.threads)
+                              self.pooling, self.threads, self.day_tz)
         _save_checkpoint(result, ckpt_dir / f"{unit.key}.npz")
         ctx.log.info("%s  %d day(s) aggregated", unit.key, result.height)
 
     def finalize(self, ctx: JobContext) -> None:
         """Pass 2 from the checkpoints (nothing re-queried), then drop them."""
         _build_series(ctx.run, self.headlines, self.embeddings, self.delay, self.mode,
-                      self.pooling, self.threads)
+                      self.pooling, self.threads, self.day_tz)
 
     @classmethod
     def from_artifact(cls, artifact: Artifact, index: DatalakeIndex, *,
@@ -389,7 +406,8 @@ class MuAsofJob(Job):
         hp = artifact.meta.hyperparams
         return cls(index.get(hp["source_headlines"]), index.get(hp["source_embeddings"]),
                    hp["delay"], hp["mode"], pooling=hp.get("pooling", "mean"),
-                   threads=threads, temp=artifact.meta.pipeline_version.endswith(TEMP_SUFFIX))
+                   threads=threads, temp=artifact.meta.pipeline_version.endswith(TEMP_SUFFIX),
+                   day_tz=hp.get("day_tz", DEFAULT_DAY_TZ))
 
     @classmethod
     def add_cli_args(cls, parser: Any) -> None:
@@ -400,22 +418,25 @@ class MuAsofJob(Job):
                             help="'expanding', or a rolling window >= 1 week: '4W', '6M'")
         parser.add_argument("--pooling", default="mean", choices=list(POOLINGS))
         parser.add_argument("--headlines-artifact", default=None,
-                            help="default: the latest ravenpack_headlines")
+                            help="default: the latest rp_headlines")
         parser.add_argument("--embeddings-artifact", default=None,
                             help="default: the latest headline_embeddings")
         parser.add_argument("--threads", type=int, default=8, help="DuckDB PRAGMA threads")
+        parser.add_argument("--day-tz", default=DEFAULT_DAY_TZ,
+                            help="time zone of the calendar days (default UTC; any other "
+                                 "value enters the artifact id)")
         parser.add_argument("--temp", action="store_true", help="agent-created (__TEMP)")
 
     @classmethod
     def from_args(cls, args: Any, index: DatalakeIndex) -> MuAsofJob:
         return cls(*_sources(index, args.headlines_artifact, args.embeddings_artifact),
                    args.delay, args.mode, pooling=args.pooling, threads=args.threads,
-                   temp=args.temp)
+                   temp=args.temp, day_tz=args.day_tz)
 
 
 def _sources(index: DatalakeIndex, headlines_id: str | None,
              embeddings_id: str | None) -> tuple[Artifact, Artifact]:
-    return (index.get(headlines_id) if headlines_id else index.latest(SOURCE_HEADLINES_KIND),
+    return (index.get(headlines_id) if headlines_id else latest_headlines(index),
             index.get(embeddings_id) if embeddings_id
             else index.latest(SOURCE_EMBEDDINGS_KIND))
 
@@ -432,11 +453,12 @@ def mu_asof_to_datalake(
     headlines_id: str | None = None,
     embeddings_id: str | None = None,
     repo_dir: Path | None = None,
+    day_tz: str = DEFAULT_DAY_TZ,
 ) -> "Artifact":
     """Dated reference-vector series for the corpus, registered as a ``mu_asof`` artifact
     (library entry point; runs ``MuAsofJob``).
 
-    Sources default to the latest ``ravenpack_headlines`` and
+    Sources default to the latest ``rp_headlines`` and
     ``headline_embeddings`` artifacts (never hardcoded paths) and are recorded
     as lineage. Writes a single parquet (``output_name``): the series is one
     daily time series, not a partitioned corpus.
@@ -454,7 +476,8 @@ def mu_asof_to_datalake(
     from datalake.jobs import JobRunner
 
     job = MuAsofJob(*_sources(index, headlines_id, embeddings_id), delay, mode,
-                    pooling=pooling, threads=threads, pipeline_version=pipeline_version)
+                    pooling=pooling, threads=threads, pipeline_version=pipeline_version,
+                    day_tz=day_tz)
     job.pipeline_repo = pipeline_repo
     return JobRunner(index, repo_dir=repo_dir, allow_dirty=True,
                      handle_signals=False).start(job)
@@ -474,7 +497,8 @@ def _check_same_layout(headlines_artifact: Artifact, embeddings_artifact: Artifa
 
 
 def _build_series(run: Any, headlines_artifact: Artifact, embeddings_artifact: Artifact,
-                  delay: str, mode: str, pooling: str, threads: int) -> None:
+                  delay: str, mode: str, pooling: str, threads: int,
+                  day_tz: str = DEFAULT_DAY_TZ) -> None:
     """Both passes into ``run.out_dir``; pass 1 is checkpointed per partition so an
     interrupted run resumes without re-querying finished partitions."""
     _check_same_layout(headlines_artifact, embeddings_artifact)
@@ -482,7 +506,7 @@ def _build_series(run: Any, headlines_artifact: Artifact, embeddings_artifact: A
     log.info("pass 1/2: daily embedding %s aggregates (SQL join, per month)", pooling)
     days, stats, counts = compute_daily_stats(
         headlines_artifact.path, embeddings_artifact.path, pooling=pooling, threads=threads,
-        checkpoint_dir=ckpt_dir,
+        checkpoint_dir=ckpt_dir, day_tz=day_tz,
     )
     log.info("pass 2/2: reference series for %d asof dates, delay=%s mode=%s pooling=%s",
              len(days), delay, mode, pooling)

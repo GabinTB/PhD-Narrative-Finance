@@ -94,12 +94,12 @@ def test_empty_batches_give_an_empty_typed_frame():
 def test_end_to_end_story_set_from_headlines(tmp_path: Path):
     _write_zip(tmp_path / "raw", ROWS)
     dl = DatalakeIndex(tmp_path / "lake")
-    with dl.run(kind="ravenpack_headlines", pipeline="t", pipeline_version="v0") as r:
+    with dl.run(kind="rp_headlines", pipeline="t", pipeline_version="v0") as r:
         # the headlines month holds one story (F) that the raw sample does not score
         pl.DataFrame({"RP_STORY_ID": list("ABCDEF")}).write_parquet(r.out_dir / "2008-01.parquet")
     art = ingest_to_datalake(dl, source="ravenpack", columns=COLUMNS,
                              produce=producer(tmp_path / "raw"),
-                             headlines=dl.latest("ravenpack_headlines"), start_year=2008,
+                             headlines=dl.latest("rp_headlines"), start_year=2008,
                              end_year=2008, extra_hyperparams={}, temp=True)
     out = pl.read_parquet(art.path / "2008-01.parquet")
     assert out["RP_STORY_ID"].to_list() == list("ABCDEF")

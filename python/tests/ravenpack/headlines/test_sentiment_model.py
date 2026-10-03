@@ -71,7 +71,7 @@ def _lake_with_headlines(tmp_path: Path):
     from datalake import DatalakeIndex
 
     dl = DatalakeIndex(tmp_path / "lake")
-    with dl.run(kind="ravenpack_headlines", pipeline="t", pipeline_version="v0") as r:
+    with dl.run(kind="rp_headlines", pipeline="t", pipeline_version="v0") as r:
         pl.DataFrame({"RP_STORY_ID": [f"s{i}" for i in range(len(TEXTS))],
                       "HEADLINE": TEXTS}).write_parquet(r.out_dir / "2008-01.parquet")
     return dl
@@ -84,7 +84,7 @@ def test_end_to_end_artifact(cls, fixture, request, tmp_path):
     dl = _lake_with_headlines(tmp_path)
     art = ingest_to_datalake(dl, source=sentimeter.name, columns=sentimeter.columns(),
                              produce=producer(sentimeter, read_rows=4),
-                             headlines=dl.latest("ravenpack_headlines"), start_year=2008,
+                             headlines=dl.latest("rp_headlines"), start_year=2008,
                              end_year=2008, extra_hyperparams=run_hyperparams(sentimeter),
                              model_card=sentimeter.model_card(), temp=True)
     out = pl.read_parquet(art.path / "2008-01.parquet")
@@ -140,11 +140,11 @@ def test_killed_run_resumes_from_its_card_alone(finbert_dir, tmp_path):
     from ravenpack.headlines.sentiment import resume_partial
 
     dl = DatalakeIndex(tmp_path / "lake")
-    with dl.run(kind="ravenpack_headlines", pipeline="t", pipeline_version="v0") as r:
+    with dl.run(kind="rp_headlines", pipeline="t", pipeline_version="v0") as r:
         for month, ids in (("2008-01", ["a", "b"]), ("2008-02", ["x1", "x2"])):
             pl.DataFrame({"RP_STORY_ID": ids, "HEADLINE": ["stocks up", "loss"]}) \
                 .write_parquet(r.out_dir / f"{month}.parquet")
-    hl = dl.latest("ravenpack_headlines")
+    hl = dl.latest("rp_headlines")
     sentimeter = FinbertSentimeter(_local(finbert_dir))
     good = producer(sentimeter)
 
@@ -184,12 +184,12 @@ def test_jobs_resume_rebuilds_the_sentimeter_and_stops_on_a_model_switch(finbert
     from ravenpack.headlines.sentiment import sentiment_layout
 
     dl = DatalakeIndex(tmp_path / "lake")
-    with dl.run(kind="ravenpack_headlines", pipeline="t", pipeline_version="v0",
+    with dl.run(kind="rp_headlines", pipeline="t", pipeline_version="v0",
                 hyperparams={"start_year": 2008, "end_year": 2008}) as r:
         for month, ids in (("2008-01", ["a", "b"]), ("2008-02", ["x1", "x2"])):
             pl.DataFrame({"RP_STORY_ID": ids, "HEADLINE": ["stocks up", "loss"]}) \
                 .write_parquet(r.out_dir / f"{month}.parquet")
-    hl = dl.latest("ravenpack_headlines")
+    hl = dl.latest("rp_headlines")
     backend = _local(finbert_dir)
     switched = {"after": "2008-01"}
     real_check = type(backend).check_unchanged

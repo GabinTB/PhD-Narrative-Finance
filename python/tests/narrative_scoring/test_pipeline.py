@@ -686,18 +686,19 @@ def test_kernel_and_numpy_asset_tables_agree(world):
 
 
 def test_a_story_counts_once_per_asset_at_its_max_relevance():
-    """Three AAPL events in one story: one (story, asset) entry, relevance = max."""
+    """Long (row, entity) input with AAPL three times in one story: one (story, asset)
+    entry, relevance = max (the entities table holds one row per pair; the collapse
+    still guarantees it whatever the input)."""
     from narrative_scoring.assets import headline_assets
 
     u = AssetUniverse.from_frame(pl.DataFrame({"snapshot_date": [date(2008, 1, 1)] * 2,
                                                "rp_entity_id": ["AAPL", "MSFT"]}),
                                  artifact_id="u")
     rows = pl.DataFrame({
-        "_r": [0, 1],
-        "RP_ENTITY_ID": [["AAPL", "AAPL", "USPL", "AAPL"], ["MSFT", "XXXX"]],
-        "RELEVANCE": [[40, 100, 20, 70], [55, 100]],
-    }, schema={"_r": pl.UInt32, "RP_ENTITY_ID": pl.List(pl.String),
-               "RELEVANCE": pl.List(pl.UInt8)})
+        "_r": [0, 0, 0, 0, 1, 1],
+        "RP_ENTITY_ID": ["AAPL", "AAPL", "USPL", "AAPL", "MSFT", "XXXX"],
+        "RELEVANCE": [40, 100, 20, 70, 55, 100],
+    }, schema={"_r": pl.UInt32, "RP_ENTITY_ID": pl.String, "RELEVANCE": pl.UInt8})
     indptr, asset, rel = headline_assets(rows, u.asset_map(), 2)
     assert indptr.tolist() == [0, 1, 2]
     assert asset.tolist() == [0, 1] and rel.tolist() == [100, 55]

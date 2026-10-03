@@ -131,7 +131,7 @@ MONTHS = {"2008-01.parquet": ["s1", "s2", "s3"], "2008-02.parquet": ["t1", "t2"]
 @pytest.fixture
 def lake(tmp_path: Path):
     dl = DatalakeIndex(tmp_path / "lake")
-    with dl.run(kind="ravenpack_headlines", pipeline="t", pipeline_version="v0",
+    with dl.run(kind="rp_headlines", pipeline="t", pipeline_version="v0",
                 hyperparams={"start_year": 2008, "end_year": 2008}) as r:
         for name, ids in MONTHS.items():
             pl.DataFrame({"RP_STORY_ID": ids, "HEADLINE": [f"h {i}" for i in ids]}) \
@@ -153,7 +153,7 @@ def _producer(calls: list[str] | None = None, fail_on: str | None = None):
 
 
 def test_fresh_run_registers_a_valid_temp_artifact(lake):
-    hl = lake.latest("ravenpack_headlines")
+    hl = lake.latest("rp_headlines")
     art = ingest_to_datalake(lake, source="toy", columns=["SENT_A", "SENT_B"],
                              produce=_producer(), headlines=hl, start_year=2008, end_year=2008,
                              extra_hyperparams={"rule": "x"}, temp=True)
@@ -169,13 +169,13 @@ def test_fresh_run_registers_a_valid_temp_artifact(lake):
 
 
 def test_declared_columns_are_enforced(tmp_path: Path, lake):
-    hl = lake.latest("ravenpack_headlines")
+    hl = lake.latest("rp_headlines")
     with pytest.raises(SentimentContractError, match="declared"):
         fill_months(_producer(), hl.path, tmp_path, list(MONTHS), ["SENT_B", "SENT_A"])
 
 
 def test_resume_writes_only_missing_months_and_completes(lake):
-    hl = lake.latest("ravenpack_headlines")
+    hl = lake.latest("rp_headlines")
     with pytest.raises(RuntimeError, match="boom"):
         ingest_to_datalake(lake, source="toy", columns=["SENT_A", "SENT_B"],
                            produce=_producer(fail_on="2008-02.parquet"), headlines=hl,
@@ -191,7 +191,7 @@ def test_resume_writes_only_missing_months_and_completes(lake):
 
 
 def test_verifier_flags_corruption(lake):
-    hl = lake.latest("ravenpack_headlines")
+    hl = lake.latest("rp_headlines")
     art = ingest_to_datalake(lake, source="toy", columns=["SENT_A", "SENT_B"],
                              produce=_producer(), headlines=hl, start_year=2008, end_year=2008,
                              extra_hyperparams={}, temp=True)

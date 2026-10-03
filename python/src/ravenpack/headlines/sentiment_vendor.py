@@ -1,7 +1,7 @@
 """RavenPack vendor sentiment -> a ``headline_sentiment`` artifact (source ``ravenpack``).
 
-One read-only pass over the raw Annotations zips (the same files ingest.py read;
-the ``ravenpack_headlines`` parquet does not carry CSS or EVENT_RELEVANCE). A raw
+One read-only pass over the raw Annotations zips (the same files the ingestion
+read; the story set comes from the ``rp_headlines`` artifact). A raw
 row is one entity x event detection; per story (RP_STORY_ID):
 
     SENT_CSS        the Composite Sentiment Score. Story-level in the vendor feed: it
@@ -43,9 +43,9 @@ import pyarrow as pa
 import pyarrow.csv as pacsv
 
 from datalake.periods import parse_key, periods
+from ravenpack.annotations.access import latest_headlines
 from ravenpack.headlines.sentiment import (
     ID_COL,
-    SOURCE_KIND,
     HeadlineSentimentJob,
     MonthProducer,
     job_from_recorded,
@@ -234,7 +234,7 @@ def main(argv: list[str] | None = None) -> int:
             art = runner.resume(args.artifact_id, raw_dir=args.raw_dir)
         else:
             hl = (dl.get(args.headlines_artifact) if args.headlines_artifact
-                  else dl.latest(SOURCE_KIND))
+                  else latest_headlines(dl))
             layout = sentiment_layout(hl, date(args.start_year, 1, 1),
                                       date(args.end_year, 12, 31))
             art = runner.start(job(hl, layout, _raw_dir(args.raw_dir), temp=args.temp))

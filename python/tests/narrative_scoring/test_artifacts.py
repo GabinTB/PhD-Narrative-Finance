@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import numpy as np
@@ -29,17 +29,15 @@ from .test_pipeline import _headlines, _mu_df
 EARLIEST = date(2008, 1, 1)
 
 
-def _write_headline_month(dir_: Path, name: str, first_day: date) -> None:
-    dir_.mkdir(parents=True, exist_ok=True)
-    pl.DataFrame({"RP_STORY_ID": ["a"], "TIMESTAMP_UTC": [f"{first_day} 09:00:00.000"]}) \
-        .write_parquet(dir_ / name)
-
-
 def _make_lake(root: Path) -> DatalakeIndex:
-    """Sandbox root holding the upstream families the scorer reads (never production)."""
+    """Sandbox root holding the upstream families the scorer reads (never production):
+    rp_headlines (+ its entities sibling) holding one story on the earliest day."""
+    from tests.ravenpack.annotations.fixtures import register_annotations
+
     dl = DatalakeIndex(root)
-    with dl.run(kind=A.KIND_HEADLINES, pipeline="t", pipeline_version="v0") as r:
-        _write_headline_month(r.out_dir, "2008-01.parquet", EARLIEST)   # earliest data
+    first = datetime(EARLIEST.year, EARLIEST.month, EARLIEST.day, 9)
+    register_annotations(dl, {"2008-01": pl.DataFrame({"RP_STORY_ID": ["a"],
+                                                       "TIMESTAMP_UTC": [first]})})
     with dl.run(kind=A.KIND_EMBEDDINGS, pipeline="t", pipeline_version="v0") as r:
         (r.out_dir / "2008-01.parquet").write_bytes(b"0")
     with dl.run(kind=A.KIND_MU_ASOF, pipeline="t", pipeline_version="v0") as r:
@@ -420,10 +418,11 @@ BUCKET_MONTHS = [(2008, m) for m in range(1, 6)]
 
 
 def _parquet_lake(root: Path, table, P, n: int = 12, entities: bool = False) -> DatalakeIndex:
-    """A sandbox lake with REAL headline + embedding months (read through the partition
-    source) and a mu_asof series; with ``entities``, per-detection RP_ENTITY_ID / RELEVANCE
-    lists on the headlines (E0..E3, an entity sometimes detected twice)."""
+    """A sandbox lake with REAL rp_headlines + rp_headline_entities + embedding months
+    (read through the partition source) and a mu_asof series; with ``entities``, two
+    entities on two stories out of three (E0..E3, one row per story x entity)."""
     from narrative_scoring.schema import EMBEDDING_DIM
+    from tests.ravenpack.annotations.fixtures import register_annotations
 
     rng = np.random.default_rng(3)
     months = {}
@@ -432,23 +431,25 @@ def _parquet_lake(root: Path, table, P, n: int = 12, entities: bool = False) -> 
         for d in month_range_days(y, m)[::2]:
             for i, x in enumerate(_headlines(rng, table, P, n)):
                 ids.append(f"{d.isoformat()}-{i:03d}")
-                ts.append(f"{d.isoformat()} {i % 24:02d}:15:00.000")
+                ts.append(datetime(d.year, d.month, d.day, i % 24, 15))
                 X.append(x.astype(np.float16))
         months[f"{y}-{m:02d}.parquet"] = (ids, ts, X)
     dl = DatalakeIndex(root)
-    with dl.run(kind=A.KIND_HEADLINES, pipeline="t", pipeline_version="v0") as r:
-        for name, (ids, ts, _) in months.items():
-            frame = pl.DataFrame({"RP_STORY_ID": ids, "TIMESTAMP_UTC": ts,
-                                  "HEADLINE": [f"h {i}" for i in ids]})
-            if entities:
-                k = np.arange(len(ids))
-                frame = frame.with_columns(
-                    pl.Series("RP_ENTITY_ID", [[f"E{j % 4}", f"E{j % 4}", f"E{(j + 1) % 4}"]
-                                               if j % 3 else [] for j in k],
-                              dtype=pl.List(pl.String)),
-                    pl.Series("RELEVANCE", [[int(j % 101), 100, 50] if j % 3 else []
-                                            for j in k], dtype=pl.List(pl.UInt8)))
-            frame.write_parquet(r.out_dir / name)
+    stories, ents = {}, {}
+    for name, (ids, ts, _) in months.items():
+        key = name.removesuffix(".parquet")
+        stories[key] = pl.DataFrame({"RP_STORY_ID": ids, "TIMESTAMP_UTC": ts,
+                                     "HEADLINE": [f"h {i}" for i in ids]})
+        rows = []
+        for j, sid in enumerate(ids):
+            if entities and j % 3:
+                rows += [(sid, f"E{j % 4}", 100), (sid, f"E{(j + 1) % 4}", 50)]
+            else:
+                rows.append((sid, f"X{j}", 100))                 # not a universe entity
+        ents[key] = pl.DataFrame(rows, schema={"RP_STORY_ID": pl.String,
+                                               "RP_ENTITY_ID": pl.String,
+                                               "RELEVANCE": pl.UInt8}, orient="row")
+    register_annotations(dl, stories, ents)
     with dl.run(kind=A.KIND_EMBEDDINGS, pipeline="t", pipeline_version="v0") as r:
         for name, (ids, _, X) in months.items():
             pl.DataFrame({"RP_STORY_ID": ids, "EMBEDDING": X},
@@ -826,7 +827,7 @@ def test_unrecorded_lineage_warns_and_runs(tmp_path, toy_table, toy_embeddings, 
     with caplog.at_level(logging.WARNING, logger="datalake.lineage"):
         s = _score(lake, date(2008, 3, 1), date(2008, 3, 31), cfg, toy_table, toy_embeddings)
     assert s["narrative_daily_id"]
-    assert "records no ravenpack_headlines source" in caplog.text
+    assert "records no rp_headlines source" in caplog.text
 
 
 def test_verifiers_accept_the_layouts_before_type_and_the_pole_mask(tmp_path):

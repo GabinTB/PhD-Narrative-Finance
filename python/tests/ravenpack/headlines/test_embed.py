@@ -19,6 +19,7 @@ Covers:
 from __future__ import annotations
 
 import zlib
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -29,6 +30,7 @@ import pytest
 from nlp.backends.base import Backend, EmbeddingConfig, IncompatibleModelError, unit_rows
 from nlp.embedding import Embedder
 from ravenpack.headlines.embed import (
+    PIPELINE_VERSION,
     embed_month,
     embed_range,
     embed_to_datalake,
@@ -81,13 +83,13 @@ def _write_source_month(path: Path, story_ids: list[str], headlines: list) -> No
     """Write a synthetic structured (ingest) parquet -- more columns than needed."""
     pl.DataFrame(
         {
-            "TIMESTAMP_UTC": ["2000-01-01 00:00:00"] * len(story_ids),
+            "TIMESTAMP_UTC": [datetime(2000, 1, 1, tzinfo=timezone.utc)] * len(story_ids),
             "RP_STORY_ID": story_ids,
             "HEADLINE": headlines,
             "SOURCE_NAME": ["Reuters"] * len(story_ids),
         },
         schema={
-            "TIMESTAMP_UTC": pl.String,
+            "TIMESTAMP_UTC": pl.Datetime("us", "UTC"),
             "RP_STORY_ID": pl.String,
             "HEADLINE": pl.String,
             "SOURCE_NAME": pl.String,
@@ -282,7 +284,7 @@ class FakeBackend(Backend):
 
 
 def _register_source(index, root: Path):
-    with index.run(kind="ravenpack_headlines", pipeline="test", pipeline_version="v0",
+    with index.run(kind="rp_headlines", pipeline="test", pipeline_version="v0",
                    hyperparams={"start_year": 2000, "end_year": 2000}) as run:
         for name in ("2000-01", "2000-02"):
             _write_source_month(run.out_dir / f"{name}.parquet",
@@ -344,14 +346,14 @@ class TestLayouts:
         from datalake.layout import layout_of
 
         index = DatalakeIndex(tmp_path / "lake")
-        with index.run(kind="ravenpack_headlines", pipeline="test", pipeline_version="v0",
+        with index.run(kind="rp_headlines", pipeline="test", pipeline_version="v0",
                        hyperparams={"partition_freq": "Q", "start": "2000-01-01",
                                     "end": "2000-06-30"}) as run:
             for key in ("2000Q1", "2000Q2"):
                 _write_source_month(run.out_dir / f"{key}.parquet",
                                     [f"{key}-S{i}" for i in range(3)],
                                     [f"{key} headline {i}" for i in range(3)])
-        art = embed_to_datalake(index, "v0.3.0", embedder=Embedder(FakeBackend()))
+        art = embed_to_datalake(index, PIPELINE_VERSION, embedder=Embedder(FakeBackend()))
         lay = layout_of(art)
         assert (lay.freq, str(lay.start), str(lay.end)) == ("Q", "2000-01-01", "2000-06-30")
         assert list(lay.existing(art.path)) == ["2000Q1", "2000Q2"]
@@ -365,7 +367,7 @@ class TestResume:
         index = DatalakeIndex(tmp_path / "lake")
         _register_source(index, tmp_path)
         with pytest.raises(RuntimeError, match="killed"):
-            embed_to_datalake(index, "v0.3.0", embedder=Embedder(CrashingBackend(die_at=3)))
+            embed_to_datalake(index, PIPELINE_VERSION, embedder=Embedder(CrashingBackend(die_at=3)))
         return index, index.list("headline_embeddings", include_partial=True)[0]
 
     def test_resume_finishes_in_place(self, tmp_path):
@@ -496,5 +498,5 @@ class TestEmbedJob:
         done = runner.resume(part.artifact_id, embedder=Embedder(CrashingBackend()))
         assert not done.partial and sorted(done.file_hashes) == ["2000-01.parquet",
                                                                  "2000-02.parquet"]
-        assert "__v0.3.0__TEMP__" in done.artifact_id
+        assert f"__{PIPELINE_VERSION}__TEMP__" in done.artifact_id
         index.close()

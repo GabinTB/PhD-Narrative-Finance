@@ -1,7 +1,7 @@
 """Model sentiment (RavenBERT, FinBERT) -> a ``headline_sentiment`` artifact.
 
 RavenPack I/O around an ``nlp.sentiment.Sentimeter``: every headline of a
-``ravenpack_headlines`` partition goes through the sentimeter (``clean_text``
+``rp_headlines`` partition goes through the sentimeter (``clean_text``
 preprocessing, one inference pass per read batch, on TEI by default or a local
 model). The table stores the model's output only, as a distribution on the 41-point
 grid s = linspace(-1, 1, 41):
@@ -47,9 +47,9 @@ from nlp.sentiment import (
     load_sentimeter,
     sentimeter_from_card,
 )
+from ravenpack.annotations.access import latest_headlines
 from ravenpack.headlines.sentiment import (
     ID_COL,
-    SOURCE_KIND,
     HeadlineSentimentJob,
     MonthProducer,
     job_from_recorded,
@@ -202,7 +202,7 @@ def main(argv: list[str] | None = None) -> int:
                     raise SystemExit("run needs --model")
                 args.source = args.model
                 hl = (dl.get(args.headlines_artifact) if args.headlines_artifact
-                      else dl.latest(SOURCE_KIND))
+                      else latest_headlines(dl))
                 layout = sentiment_layout(hl, date(args.start_year, 1, 1),
                                           date(args.end_year, 12, 31))
                 art = runner.start(job_from_args(args, dl, hl, layout))

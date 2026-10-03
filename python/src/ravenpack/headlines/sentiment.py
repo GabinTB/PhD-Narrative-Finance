@@ -1,8 +1,8 @@
 """The ``headline_sentiment`` family: a score database contract shared by every producer.
 
 An artifact of this kind is one parquet file per partition of its source
-``ravenpack_headlines`` artifact, each holding RP_STORY_ID (String, unique, EXACTLY
-the story set of that headlines partition) and ONE of:
+``rp_headlines`` artifact (``ravenpack.annotations``), each holding RP_STORY_ID
+(String, unique, EXACTLY the story set of that headlines partition) and ONE of:
 
     SENT_*        vendor scores: one or more Float32 columns, finite in [-1, 1] or NaN
                   (NaN = "no score", never zero; nulls not allowed)
@@ -44,6 +44,7 @@ from datalake.jobs import Job, JobContext, Unit, register_job
 from datalake.layout import Layout, layout_from_hyperparams
 from datalake.periods import partition_file, period_of
 from nlp.sentiment.base import GRID_COLUMNS
+from ravenpack.annotations.access import HEADLINES_KIND, latest_headlines, require_headlines
 
 if TYPE_CHECKING:
     from datalake import Artifact, DatalakeIndex, ModelCard
@@ -52,7 +53,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 KIND = "headline_sentiment"
-SOURCE_KIND = "ravenpack_headlines"
+SOURCE_KIND = HEADLINES_KIND          # rp_headlines
 ID_COL = "RP_STORY_ID"
 SCORE_PREFIX = "SENT_"
 GRID_ROW_SUM = (0.99, 1.01)                  # Float16 grid: accepted row-sum range
@@ -61,7 +62,8 @@ DECILES = tuple(round(0.1 * i, 1) for i in range(1, 10))
 
 PIPELINE = "PhD-Narrative-Finance"
 PIPELINE_REPO = "https://github.com/GabinTB/PhD-Narrative-Finance"
-PIPELINE_VERSION = "v0.2.0"   # v0.2.0: partition layout (partition_freq/start/end) in the id
+PIPELINE_VERSION = "v0.3.0"   # v0.3.0: reads rp_headlines (Annotations tables);
+                              # v0.2.0: partition layout (partition_freq/start/end) in the id
 TEMP_SUFFIX = "__TEMP"                        # = datalake.jobs.TEMP_SUFFIX
 
 MonthProducer = Callable[[Path, str], pl.DataFrame]
@@ -323,7 +325,7 @@ def _source_module(source: str) -> Any:
 
 @register_job
 class HeadlineSentimentJob(Job):
-    """Headline scores (vendor or model) aligned to a ravenpack_headlines artifact."""
+    """Headline scores (vendor or model) aligned to an rp_headlines artifact."""
 
     kind = KIND
     pipeline_version = PIPELINE_VERSION
@@ -333,7 +335,7 @@ class HeadlineSentimentJob(Job):
                  extra_hyperparams: dict[str, Any] | None = None,
                  model_card: ModelCard | None = None, backends: Sequence[Any] = (),
                  notes: str = "", temp: bool = False) -> None:
-        self.headlines, self.layout, self.source = headlines, layout, source
+        self.headlines, self.layout, self.source = require_headlines(headlines), layout, source
         self.columns, self.produce = list(columns), produce
         self.extra_hyperparams = dict(extra_hyperparams or {})
         self._card, self._backends, self._notes, self.temp = model_card, list(backends), \
@@ -395,7 +397,7 @@ class HeadlineSentimentJob(Job):
 
         parser.add_argument("--source", required=True, choices=sorted(SOURCE_MODULES))
         parser.add_argument("--headlines-artifact", default=None,
-                            help="default: the latest ravenpack_headlines")
+                            help="default: the latest rp_headlines")
         add_layout_args(parser, default_freq=None, required=False)
         parser.add_argument("--temp", action="store_true", help="agent-created (__TEMP)")
         vendor = parser.add_argument_group("ravenpack (vendor) source")
@@ -414,7 +416,7 @@ class HeadlineSentimentJob(Job):
         from datalake.layout import layout_from_args
 
         headlines = (index.get(args.headlines_artifact) if args.headlines_artifact
-                     else index.latest(SOURCE_KIND))
+                     else latest_headlines(index))
         given = layout_from_args(args, default=layout_from_hyperparams(
             headlines.meta.hyperparams))
         src_freq = layout_from_hyperparams(headlines.meta.hyperparams).freq

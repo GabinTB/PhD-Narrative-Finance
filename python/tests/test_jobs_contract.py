@@ -88,21 +88,21 @@ def _stories() -> list[tuple[str, datetime, str]]:
 
 
 def _register_headlines(index: DatalakeIndex, freq: str, *, with_embeddings: bool = False):
-    """ravenpack_headlines (and optionally headline_embeddings) partitioned at ``freq``."""
+    """rp_headlines + entities (and optionally headline_embeddings) partitioned at ``freq``."""
     from ravenpack.headlines.schema import EMBEDDING_DIM
 
     hp = Layout(freq, START, END).hyperparams()
     by_key: dict[str, list] = {}
     for sid, ts, text in _stories():
         by_key.setdefault(period_key(ts.date(), freq), []).append((sid, ts, text))
-    with index.run(kind="ravenpack_headlines", pipeline="t", pipeline_version="v0",
-                   hyperparams=hp) as run:
-        for key, rows in by_key.items():
-            pl.DataFrame({"RP_STORY_ID": [r[0] for r in rows],
-                          "TIMESTAMP_UTC": [r[1] for r in rows],
-                          "HEADLINE": [r[2] for r in rows]}
-                         ).write_parquet(run.out_dir / f"{key}.parquet")
-    headlines = index.get(run.artifact_id)
+    from tests.ravenpack.annotations.fixtures import register_annotations
+
+    headlines, _ = register_annotations(
+        index, {key: pl.DataFrame({"RP_STORY_ID": [r[0] for r in rows],
+                                   "TIMESTAMP_UTC": [r[1] for r in rows],
+                                   "HEADLINE": [r[2] for r in rows]})
+                for key, rows in by_key.items()},
+        layout=Layout(freq, START, END), temp=False)
     if not with_embeddings:
         return headlines, None
     rng = np.random.default_rng(3)

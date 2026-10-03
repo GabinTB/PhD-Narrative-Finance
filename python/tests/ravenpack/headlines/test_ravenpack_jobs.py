@@ -97,7 +97,7 @@ def _vendor_lake(tmp_path: Path) -> tuple[Path, Path]:
             zf.writestr(f"{stem}/2008-{month:02d}.csv", _csv([(sid, "0.10", "0.50", "100")]))
     lake = tmp_path / "lake"
     with DatalakeIndex(lake) as dl:
-        with dl.run(kind="ravenpack_headlines", pipeline="t", pipeline_version="v0",
+        with dl.run(kind="rp_headlines", pipeline="t", pipeline_version="v0",
                     hyperparams={"start_year": 2008, "end_year": 2008}) as r:
             for key, ids in (("2008-01", ["J", "x"]), ("2008-02", ["F"])):
                 pl.DataFrame({"RP_STORY_ID": ids}).write_parquet(r.out_dir / f"{key}.parquet")

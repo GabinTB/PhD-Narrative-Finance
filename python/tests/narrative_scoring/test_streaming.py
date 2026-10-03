@@ -1,8 +1,10 @@
 """Day access: the per-day SQL reference, the one-read partition source (embeddings, tag
-codes, assets), single-copy conversion, day totals, prefetch error propagation."""
+codes, assets from the entities table), UTC days, single-copy conversion, day totals,
+prefetch error propagation. Headlines are written in the rp_headlines shape (UTC
+datetimes); entities in the rp_headline_entities shape (one row per story x entity)."""
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -35,9 +37,10 @@ def _write_month(root: Path, per_day: dict[date, np.ndarray]) -> tuple[Path, Pat
     for d, X in per_day.items():
         for i, row in enumerate(X):
             ids.append(f"{d.isoformat()}-{i}")
-            ts.append(f"{d.isoformat()} {i % 24:02d}:30:00.000")
+            ts.append(datetime(d.year, d.month, d.day, i % 24, 30, tzinfo=timezone.utc))
             embs.append(row.astype(np.float16))
-    hl = pl.DataFrame({"RP_STORY_ID": ids, "TIMESTAMP_UTC": ts, "SOURCE_NAME": ["s"] * len(ids)})
+    hl = pl.DataFrame({"RP_STORY_ID": ids, "TIMESTAMP_UTC": ts, "SOURCE_NAME": ["s"] * len(ids)},
+                      schema_overrides={"TIMESTAMP_UTC": pl.Datetime("us", "UTC")})
     em = pl.DataFrame({"RP_STORY_ID": ids[::-1], "EMBEDDING": embs[::-1]},
                       schema={"RP_STORY_ID": pl.String,
                               "EMBEDDING": pl.Array(pl.Float16, EMBEDDING_DIM)})
@@ -153,61 +156,91 @@ def test_partition_source_sentiment_strict_coverage(month, tmp_path):
         PartitionHeadlineSource(sql.headlines_dir, sql.embeddings_dir, sentiment_dir=sdir)
 
 
-def _with_entities(sql: ParquetHeadlineSource) -> dict[str, list]:
-    """Entity lists on the fixture headlines: per detection, AAPL three times in row 0."""
-    path = sql.headlines_dir / _file(D)
-    hl = pl.read_parquet(path)
-    ents, rels = [], []
-    for i in range(hl.height):
+def _with_entities(sql: ParquetHeadlineSource, extra: pl.DataFrame | None = None,
+                   ) -> tuple[Path, dict[str, list]]:
+    """An entities partition next to the fixture headlines (rp_headline_entities shape:
+    one row per story x entity): row 0 has AAPL and USPL, odd rows MSFT and OTHER, even
+    rows none."""
+    hl = pl.read_parquet(sql.headlines_dir / _file(D))
+    rows = []
+    for i, sid in enumerate(hl["RP_STORY_ID"].to_list()):
         if i == 0:
-            ents.append(["AAPL", "AAPL", "USPL", "AAPL"])
-            rels.append([40, 100, 20, 70])
-        else:
-            ents.append(["MSFT", "OTHER"] if i % 2 else [])
-            rels.append([i % 101, 100] if i % 2 else [])
-    hl.with_columns(pl.Series("RP_ENTITY_ID", ents, dtype=pl.List(pl.String)),
-                    pl.Series("RELEVANCE", rels, dtype=pl.List(pl.UInt8))).write_parquet(path)
-    return dict(zip(hl["RP_STORY_ID"].to_list(), zip(ents, rels)))
+            rows += [(sid, "AAPL", 100), (sid, "USPL", 20)]
+        elif i % 2:
+            rows += [(sid, "MSFT", i % 101), (sid, "OTHER", 100)]
+    ent = pl.DataFrame(rows, schema={"RP_STORY_ID": pl.String, "RP_ENTITY_ID": pl.String,
+                                     "RELEVANCE": pl.UInt8}, orient="row")
+    if extra is not None:
+        ent = pl.concat([ent, extra])
+    edir = sql.headlines_dir.parent / "entities"
+    edir.mkdir(exist_ok=True)
+    ent.write_parquet(edir / _file(D))
+    by_id: dict[str, list] = {}
+    for sid, e, w in rows:
+        by_id.setdefault(sid, []).append((e, w))
+    return edir, by_id
+
+
+def _universe(*ids: str):
+    from narrative_scoring.assets import AssetUniverse
+
+    return AssetUniverse.from_frame(pl.DataFrame({"snapshot_date": [date(2008, 1, 1)] * len(ids),
+                                                  "rp_entity_id": list(ids)}), artifact_id="u")
 
 
 def test_partition_source_gives_each_row_its_assets_once(month):
-    from narrative_scoring.assets import AssetUniverse
     from narrative_scoring.streaming import PartitionHeadlineSource
 
     _, sql = month
-    by_id = _with_entities(sql)
-    u = AssetUniverse.from_frame(pl.DataFrame({"snapshot_date": [date(2008, 1, 1)] * 2,
-                                               "rp_entity_id": ["AAPL", "MSFT"]}),
-                                 artifact_id="u")
+    edir, by_id = _with_entities(sql)
     part = PartitionHeadlineSource(sql.headlines_dir, sql.embeddings_dir, chunk_size=7,
-                                   assets=u)
+                                   assets=_universe("AAPL", "MSFT"), entities_dir=edir)
     rows = []
     for c in part.iter_day(D):
         for r in range(c.n):
             lo, hi = c.asset_indptr[r], c.asset_indptr[r + 1]
             rows.append(list(zip(c.asset_idx[lo:hi].tolist(), c.asset_rel[lo:hi].tolist())))
-    ids = sorted(k for k in by_id if k.startswith(D.isoformat()))
+    ids = sorted(i for i in pl.read_parquet(sql.headlines_dir / _file(D))["RP_STORY_ID"]
+                 if i.startswith(D.isoformat()))
+    assert len(rows) == len(ids) == 50
     for sid, got in zip(ids, rows):
-        ents, rels = by_id[sid]
-        best: dict[int, int] = {}
-        for e, w in zip(ents, rels):
-            if e in ("AAPL", "MSFT"):
-                a = 0 if e == "AAPL" else 1
-                best[a] = max(best.get(a, 0), w)
-        assert got == sorted(best.items()), sid
-    assert rows[ids.index(f"{D.isoformat()}-0")] == [(0, 100)]     # three events, once, max
+        want = sorted((0 if e == "AAPL" else 1, w) for e, w in by_id.get(sid, [])
+                      if e in ("AAPL", "MSFT"))
+        assert got == want, sid
+    assert rows[ids.index(f"{D.isoformat()}-0")] == [(0, 100)]
+    assert rows[ids.index(f"{D.isoformat()}-2")] == []                # no entity at all
 
 
-def test_the_asset_layer_needs_relevance(month):
-    from narrative_scoring.assets import AssetUniverse
+def test_the_asset_layer_needs_the_entities_table(month):
     from narrative_scoring.streaming import PartitionHeadlineSource
 
     _, sql = month
-    u = AssetUniverse.from_frame(pl.DataFrame({"snapshot_date": [date(2008, 1, 1)],
-                                               "rp_entity_id": ["AAPL"]}), artifact_id="u")
-    part = PartitionHeadlineSource(sql.headlines_dir, sql.embeddings_dir, assets=u)
-    with pytest.raises(ValueError, match="RELEVANCE"):
+    with pytest.raises(ValueError, match="entities directory"):
+        PartitionHeadlineSource(sql.headlines_dir, sql.embeddings_dir, assets=_universe("AAPL"))
+    part = PartitionHeadlineSource(sql.headlines_dir, sql.embeddings_dir,
+                                   assets=_universe("AAPL"),
+                                   entities_dir=sql.headlines_dir.parent / "nowhere")
+    with pytest.raises(FileNotFoundError, match="entities partition"):
         list(part.iter_day(D))
+
+
+def test_entities_of_absent_stories_are_refused(month):
+    from narrative_scoring.streaming import PartitionHeadlineSource
+
+    _, sql = month
+    orphan = pl.DataFrame({"RP_STORY_ID": ["nope"], "RP_ENTITY_ID": ["AAPL"],
+                           "RELEVANCE": [90]}, schema_overrides={"RELEVANCE": pl.UInt8})
+    edir, _ = _with_entities(sql, extra=orphan)
+    part = PartitionHeadlineSource(sql.headlines_dir, sql.embeddings_dir,
+                                   assets=_universe("AAPL"), entities_dir=edir)
+    with pytest.raises(ValueError, match="absent from the headlines"):
+        list(part.iter_day(D))
+    other = pl.DataFrame({"RP_STORY_ID": ["nope"], "RP_ENTITY_ID": ["ZZZ"],
+                          "RELEVANCE": [90]}, schema_overrides={"RELEVANCE": pl.UInt8})
+    edir, _ = _with_entities(sql, extra=other)                    # not a universe entity
+    assert sum(c.n for c in PartitionHeadlineSource(
+        sql.headlines_dir, sql.embeddings_dir, assets=_universe("AAPL"),
+        entities_dir=edir).iter_day(D)) == 50
 
 
 def test_arrow_conversion_rejects_nulls():
@@ -294,6 +327,22 @@ def test_partition_source_reads_a_partition_once(month, monkeypatch):
     assert len(reads) == 2                                        # headlines + embeddings
 
 
+def test_entities_are_scanned_once_per_partition(month, monkeypatch):
+    from narrative_scoring.streaming import PartitionHeadlineSource
+
+    _, sql = month
+    edir, _ = _with_entities(sql)
+    part = PartitionHeadlineSource(sql.headlines_dir, sql.embeddings_dir,
+                                   assets=_universe("AAPL"), entities_dir=edir)
+    scans = []
+    real = pl.scan_parquet
+    monkeypatch.setattr(pl, "scan_parquet", lambda *a, **k: scans.append(a[0]) or real(*a, **k))
+    for d in (date(2008, 9, 15), date(2008, 9, 16), date(2008, 9, 15)):
+        list(part.iter_day(d))
+        part.day_total(d)
+    assert len(scans) == 1
+
+
 def _rewrite(path: Path, fn) -> None:
     fn(pl.read_parquet(path)).write_parquet(path)
 
@@ -312,12 +361,20 @@ def test_partition_source_strict_coverage(month, what):
         list(_partition_source(sql).iter_day(date(2008, 9, 15)))
 
 
-def test_partition_source_accepts_datetime_timestamps(month):
-    _, sql = month
-    want = [c.embeddings for c in sql.iter_day(date(2008, 9, 16))]
-    _rewrite(sql.headlines_dir / _file(date(2008, 9, 16)),
-             lambda df: df.with_columns(pl.col("TIMESTAMP_UTC").str.to_datetime()))
-    got = [c.embeddings for c in _partition_source(sql).iter_day(date(2008, 9, 16))]
-    assert len(got) == len(want)
-    for g, w in zip(got, want):
-        np.testing.assert_array_equal(g, w)
+def test_days_are_utc_days_whatever_the_machine_zone(month, monkeypatch):
+    """A story at 23:30 UTC belongs to its UTC day in both sources, even when the process
+    runs in another time zone (DuckDB pinned to UTC; polars converts nothing)."""
+    import time
+
+    days, sql = month
+    want = {d: sql.day_total(d) for d in (date(2008, 9, 15), date(2008, 9, 16))}
+    assert want == {date(2008, 9, 15): 50, date(2008, 9, 16): 23}
+    monkeypatch.setenv("TZ", "Asia/Tokyo")
+    time.tzset()
+    try:
+        part = _partition_source(sql)
+        for d, n in want.items():
+            assert sql.day_total(d) == n and part.day_total(d) == n
+    finally:
+        monkeypatch.delenv("TZ")
+        time.tzset()

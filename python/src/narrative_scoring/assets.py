@@ -8,10 +8,10 @@ Coverage is every entity EVER in the universe; membership is applied as of each 
 ``rp_entity_id`` (ambiguous or unmatched) cannot be counted; how many there are as of
 the day is reported (``N_UNMAPPED``).
 
-A headline's assets come from its aligned RP_ENTITY_ID / RELEVANCE lists (one entry per
-raw detection, so an entity detected in several events of a story appears several
-times): they are collapsed to (headline, asset) with RELEVANCE = max BEFORE anything is
-counted, so a story counts once per asset.
+A headline's assets come from the ``rp_headline_entities`` table (one row per
+story x entity, RELEVANCE constant per pair by construction): they are collapsed to
+(headline, asset) with RELEVANCE = max BEFORE anything is counted, so a story counts
+once per asset whatever the input.
 
 Every headline tagging an asset counts, at any relevance. ``min_relevance`` (a fraction,
 default 0.6: RELEVANCE >= 60 on the vendor's 0-100 scale) is always applied, as extra
@@ -162,11 +162,11 @@ def headline_assets(rows: pl.DataFrame, asset_map: pl.DataFrame,
                     n_rows: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """CSR (indptr int64 [n_rows + 1], asset int32, relevance uint8) of each row's assets.
 
-    ``rows`` holds ``_r`` (the row position, 0..n_rows-1) and the aligned RP_ENTITY_ID /
-    RELEVANCE lists; entities outside ``asset_map`` are dropped and every (row, asset)
-    is kept once, with the maximum RELEVANCE, assets in ascending order within a row."""
+    ``rows`` is long: one row per (``_r``, RP_ENTITY_ID) detection with its RELEVANCE,
+    ``_r`` the headline's row position (0..n_rows-1). Entities outside ``asset_map`` are
+    dropped and every (row, asset) is kept once, with the maximum RELEVANCE, assets in
+    ascending order within a row."""
     ent = (rows.select("_r", ENTITY_COL, "RELEVANCE")
-           .explode([ENTITY_COL, "RELEVANCE"], empty_as_null=True)
            .drop_nulls(ENTITY_COL)
            .join(asset_map, on=ENTITY_COL, how="inner")
            .group_by("_r", ASSET_COL).agg(pl.col("RELEVANCE").max())

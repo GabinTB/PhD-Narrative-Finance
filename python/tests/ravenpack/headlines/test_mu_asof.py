@@ -135,7 +135,8 @@ class TestComputeDailyStats:
         embeddings_dir.mkdir()
         rng = np.random.default_rng(0)
         ids = [f"s{i}" for i in range(6)]
-        stamps = [pd.Timestamp("2000-01-03 09:00") + pd.Timedelta(hours=10 * i) for i in range(6)]
+        stamps = [pd.Timestamp("2000-01-03 09:00", tz="UTC") + pd.Timedelta(hours=10 * i)
+                  for i in range(6)]
         emb = rng.normal(size=(6, EMBEDDING_DIM)).astype(np.float16)
         pl.DataFrame({"RP_STORY_ID": ids, "TIMESTAMP_UTC": stamps}).write_parquet(
             headlines_dir / "2000-01.parquet")
@@ -281,11 +282,11 @@ def test_killed_job_resumes_from_checkpoints(tmp_path, monkeypatch):
     def lake(root):
         index = DatalakeIndex(root)
         rng = np.random.default_rng(0)
-        with index.run(kind="ravenpack_headlines", pipeline="t", pipeline_version="v0") as h, \
+        with index.run(kind="rp_headlines", pipeline="t", pipeline_version="v0") as h, \
              index.run(kind="headline_embeddings", pipeline="t", pipeline_version="v0") as e:
             for m in (1, 2, 3):
                 ids = [f"{m}-{i}" for i in range(20)]
-                stamps = [pd.Timestamp(f"2000-0{m}-01") + pd.Timedelta(hours=37 * i)
+                stamps = [pd.Timestamp(f"2000-0{m}-01", tz="UTC") + pd.Timedelta(hours=37 * i)
                           for i in range(20)]
                 pl.DataFrame({"RP_STORY_ID": ids, "TIMESTAMP_UTC": stamps}).write_parquet(
                     h.out_dir / f"2000-0{m}.parquet")
@@ -303,11 +304,11 @@ def test_killed_job_resumes_from_checkpoints(tmp_path, monkeypatch):
     index = lake(tmp_path / "lake")
     real, queried = mod._month_stats, []
 
-    def killed_in_february(hl_file, emb_file, pooling, threads):
+    def killed_in_february(hl_file, emb_file, pooling, threads, day_tz="UTC"):
         queried.append(emb_file.name)
         if emb_file.name == "2000-02.parquet" and len(queried) == 2:
             raise RuntimeError("killed")
-        return real(hl_file, emb_file, pooling, threads)
+        return real(hl_file, emb_file, pooling, threads, day_tz)
 
     monkeypatch.setattr(mod, "_month_stats", killed_in_february)
     with pytest.raises(RuntimeError, match="killed"):
@@ -333,7 +334,7 @@ def test_embeddings_of_other_headlines_are_refused(tmp_path):
     index = DatalakeIndex(tmp_path / "lake")
     arts = []
     for name in ("old", "new"):
-        with index.run(kind="ravenpack_headlines", pipeline="t", pipeline_version="v0",
+        with index.run(kind="rp_headlines", pipeline="t", pipeline_version="v0",
                        hyperparams={"name": name}) as r:
             pass
         arts.append(index.get(r.artifact_id))
@@ -341,7 +342,43 @@ def test_embeddings_of_other_headlines_are_refused(tmp_path):
                    sources=[arts[0]]) as r:
         pass
     emb = index.get(r.artifact_id)
-    with pytest.raises(LineageError, match="was built from ravenpack_headlines"):
+    with pytest.raises(LineageError, match="was built from rp_headlines"):
         MuAsofJob(arts[1], emb, "1d", "expanding")
     MuAsofJob(arts[0], emb, "1d", "expanding")            # its own headlines: fine
     index.close()
+
+
+def test_day_tz_buckets_local_days_across_utc_month_files(tmp_path: Path):
+    """Days in Asia/Tokyo: a story at 2000-01-31 20:00 UTC is on 2000-02-01 locally; it
+    sits in the January file and is merged with February's stories of that local day.
+    In UTC the same stories fall on their UTC days."""
+    hdir, edir = tmp_path / "h", tmp_path / "e"
+    hdir.mkdir(), edir.mkdir()
+    rng = np.random.default_rng(1)
+    files = {"2000-01": ["2000-01-31 10:00", "2000-01-31 20:00"],
+             "2000-02": ["2000-02-01 02:00", "2000-02-01 20:00"]}
+    for key, times in files.items():
+        ids = [f"{key}-{i}" for i in range(len(times))]
+        pl.DataFrame({"RP_STORY_ID": ids,
+                      "TIMESTAMP_UTC": [pd.Timestamp(t, tz="UTC") for t in times]}
+                     ).write_parquet(hdir / f"{key}.parquet")
+        pl.DataFrame({"RP_STORY_ID": ids,
+                      "EMBEDDING": list(rng.normal(size=(len(ids), EMBEDDING_DIM))
+                                        .astype(np.float16))},
+                     schema={"RP_STORY_ID": pl.String,
+                             "EMBEDDING": pl.Array(pl.Float16, EMBEDDING_DIM)}
+                     ).write_parquet(edir / f"{key}.parquet")
+    days, _, counts = compute_daily_stats(hdir, edir, day_tz="UTC")
+    assert dict(zip(days.date, counts.tolist())) == {date(2000, 1, 31): 2, date(2000, 2, 1): 2}
+    days, _, counts = compute_daily_stats(hdir, edir, day_tz="Asia/Tokyo")
+    assert dict(zip(days.date, counts.tolist())) == {
+        date(2000, 1, 31): 1, date(2000, 2, 1): 2, date(2000, 2, 2): 1}
+
+
+def test_day_tz_enters_the_identity_only_when_not_utc():
+    from ravenpack.annotations.access import day_tz_params
+
+    assert day_tz_params("UTC") == {}
+    assert day_tz_params("Europe/Paris") == {"day_tz": "Europe/Paris"}
+    with pytest.raises(ValueError, match="unknown time zone"):
+        day_tz_params("Mars/Olympus")

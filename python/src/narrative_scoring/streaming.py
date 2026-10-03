@@ -9,15 +9,21 @@ all go through the same code. Every row of a day is yielded (the null model sees
 headline); the tags only route a row's scores.
 
 ``PartitionHeadlineSource`` is the datalake implementation: each storage partition is
-read ONCE (headlines, embeddings, and the sentiment grid / entity lists when needed),
+read ONCE (headlines, embeddings, and the sentiment grid / the universe's rows of the
+entities table when needed),
 joined once on RP_STORY_ID with strict coverage, sorted by (day, RP_STORY_ID) and served
 day by day as slices. ``ParquetHeadlineSource`` is the previous per-day DuckDB query,
 kept as the reference the partition source is tested against (same rows, same order,
 same float32 values). Rows are ordered by RP_STORY_ID within a day so the chunk stream,
 and with it the seeded null-draw sample, is deterministic across runs.
 
-Point-in-time: a sentiment score and an entity list are functions of the story as
+Point-in-time: a sentiment score and a story's entities are functions of the story as
 published, available at the headline's own timestamp.
+
+Days: TIMESTAMP_UTC is UTC (``ravenpack.annotations.access.STORAGE_TZ``); the scorer's
+calendar days are UTC days, the storage partitions being UTC months (a day of another
+time zone could straddle two partitions, which this one-partition-at-a-time reader does
+not join). DuckDB sessions are pinned to UTC.
 """
 from __future__ import annotations
 
@@ -40,6 +46,7 @@ from narrative_scoring.schema import EMBEDDING_DIM
 from narrative_scoring.tags import UNTAGGED, SentimentTags
 from nlp.sentiment import GRID_COLUMNS
 from nlp.sentiment.ordinal_sql import reference
+from ravenpack.annotations.access import pin_utc
 
 log = logging.getLogger(__name__)
 
@@ -119,7 +126,7 @@ class ParquetHeadlineSource:
                 and self.layout.file_for(self.embeddings_dir, day).exists())
 
     def _connect(self) -> duckdb.DuckDBPyConnection:
-        conn = duckdb.connect()
+        conn = pin_utc(duckdb.connect())
         conn.execute("SET enable_progress_bar=false")
         conn.execute(f"SET threads={int(self.threads)}")
         conn.execute(f"SET memory_limit='{self.duckdb_memory_limit}'")
@@ -205,6 +212,7 @@ class PartitionHeadlineSource:
     sentiment_dir: Path | None = None
     tags: SentimentTags | None = None
     assets: AssetUniverse | None = None
+    entities_dir: Path | None = None
     _path: Path | None = field(default=None, init=False, repr=False)
     _emb: np.ndarray | None = field(default=None, init=False, repr=False)
     _codes: np.ndarray | None = field(default=None, init=False, repr=False)
@@ -222,6 +230,10 @@ class PartitionHeadlineSource:
             raise ValueError("sentiment tags need the sentiment directory, and vice versa")
         if self.sentiment_dir is not None:
             self.sentiment_dir = Path(self.sentiment_dir)
+        if (self.assets is None) != (self.entities_dir is None):
+            raise ValueError("the asset layer needs the entities directory, and vice versa")
+        if self.entities_dir is not None:
+            self.entities_dir = Path(self.entities_dir)
 
     def describe(self) -> str:
         return self.source_id or f"partition:{self.headlines_dir.name}+{self.embeddings_dir.name}"
@@ -254,14 +266,7 @@ class PartitionHeadlineSource:
         if not self.has_day(day):
             return False
         name = hl_path.name
-        cols = [ID_COL, "TIMESTAMP_UTC"]
-        if self.assets is not None:
-            cols += [ENTITY_COL, "RELEVANCE"]
-        try:
-            hl = pl.read_parquet(hl_path, columns=cols)
-        except pl.exceptions.ColumnNotFoundError as exc:
-            raise ValueError(f"{name}: the headlines lack {cols[2:]} (the asset layer needs "
-                             "headlines with RELEVANCE)") from exc
+        hl = pl.read_parquet(hl_path, columns=[ID_COL, "TIMESTAMP_UTC"])
         if hl[ID_COL].is_duplicated().any():
             raise ValueError(f"{name}: duplicate {ID_COL} in the headlines partition")
         rows = (hl.with_columns(day_expr(hl.schema["TIMESTAMP_UTC"]).alias("_day"))
@@ -287,13 +292,35 @@ class PartitionHeadlineSource:
             del P
         csr = None
         if self.assets is not None:
-            csr = headline_assets(rows, self.assets.asset_map(), n)
+            csr = headline_assets(self._universe_entities(day, ids.with_row_index("_r")),
+                                  self.assets.asset_map(), n)
         bounds = (rows.group_by("_day")
                   .agg(pl.col("_r").min().alias("lo"), pl.col("_r").max().alias("hi")))
         self._days = {d: (int(lo), int(hi) + 1) for d, lo, hi in bounds.iter_rows()}
         self._emb, self._codes, self._csr, self._path = emb, codes, csr, hl_path
         log.info("partition %s: %d headlines over %d day(s) held", name, n, len(self._days))
         return True
+
+    def _universe_entities(self, day: date, ids: pl.DataFrame) -> pl.DataFrame:
+        """The partition's entity rows of universe entities only, as (_r, RP_ENTITY_ID,
+        RELEVANCE): one projected scan of the entities file, filtered to the universe
+        before anything is collected (most entity rows are places, people, currencies...),
+        then joined to the row positions. Strict: a story of the entities file that is
+        not in the headlines partition raises."""
+        assert self.entities_dir is not None and self.assets is not None
+        path = self.layout.file_for(self.entities_dir, day)
+        if not path.exists():
+            raise FileNotFoundError(f"entities partition missing: {path}")
+        universe = self.assets.asset_map().select(ENTITY_COL).lazy()
+        ent = (pl.scan_parquet(path).select(ID_COL, ENTITY_COL, "RELEVANCE")
+               .join(universe, on=ENTITY_COL, how="semi")
+               .collect())
+        out = ent.join(ids, on=ID_COL, how="left")
+        orphans = out["_r"].null_count()
+        if orphans:
+            raise ValueError(f"{path.name}: {orphans} entity row(s) of universe entities "
+                             "belong to stories absent from the headlines partition")
+        return out.select("_r", ENTITY_COL, "RELEVANCE")
 
     def day_total(self, day: date) -> int:
         with self._lock:

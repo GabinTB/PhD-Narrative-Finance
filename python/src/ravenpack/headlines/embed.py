@@ -1,8 +1,8 @@
 """RavenBERT headline embedding pipeline (RavenPack I/O around ``nlp.Embedder``).
 
-Reads the ``ravenpack_headlines`` datalake artifact (one structured parquet per
-month, with a ``HEADLINE`` column) and writes one embedding parquet per month
-into a new ``headline_embeddings`` artifact.
+Reads the ``rp_headlines`` datalake artifact (``ravenpack.annotations``: one row per
+story, one parquet per month, with a ``HEADLINE`` column) and writes one embedding
+parquet per month into a new ``headline_embeddings`` artifact.
 
 Output layout (mirrors the ingest layout)::
 
@@ -52,6 +52,7 @@ import pyarrow.parquet as pq
 from datalake.jobs import TEMP_SUFFIX, Job, JobContext, Unit, register_job
 from datalake.layout import Layout, layout_from_hyperparams
 from datalake.periods import partition_file, period_of
+from ravenpack.annotations.access import HEADLINES_KIND, latest_headlines, require_headlines
 from ravenpack.headlines.schema import EMBEDDING_DIM, EMBEDDING_SCHEMA
 
 if TYPE_CHECKING:
@@ -63,7 +64,7 @@ log = logging.getLogger(__name__)
 
 # Datalake artifact kind produced by this module, and the kind it reads from.
 KIND = "headline_embeddings"
-SOURCE_KIND = "ravenpack_headlines"
+SOURCE_KIND = HEADLINES_KIND          # rp_headlines
 
 # Model identity -- must match the archive migration so that
 # `dl.latest("headline_embeddings", model="ravenbert", version="1.0")` resolves
@@ -292,7 +293,8 @@ def embed_range(
 # The Job (datalake.jobs) and the datalake-aware entry points
 # ---------------------------------------------------------------------------
 
-PIPELINE_VERSION = "v0.3.0"   # v0.3.0: partition layout in the id; v0.2.0: nlp backends
+PIPELINE_VERSION = "v0.4.0"   # v0.4.0: reads rp_headlines (Annotations tables);
+                              # v0.3.0: partition layout in the id; v0.2.0: nlp backends
 
 
 def embedding_layout(src: Artifact, start: date | None = None,
@@ -310,7 +312,7 @@ def embedding_layout(src: Artifact, start: date | None = None,
 
 @register_job
 class EmbedJob(Job):
-    """RavenBERT embeddings of a ravenpack_headlines artifact, one file per partition."""
+    """RavenBERT embeddings of an rp_headlines artifact, one file per partition."""
 
     kind = KIND
     pipeline_version = PIPELINE_VERSION
@@ -318,7 +320,8 @@ class EmbedJob(Job):
     def __init__(self, source: Artifact, layout: Layout, embedder: Embedder, *,
                  temp: bool = False, pipeline_version: str | None = None,
                  write_chunk_rows: int = 200_000, log_every: int = 100_000) -> None:
-        self.source, self.layout, self.embedder, self.temp = source, layout, embedder, temp
+        self.source, self.layout, self.embedder, self.temp = (require_headlines(source), layout,
+                                                              embedder, temp)
         if pipeline_version is not None:
             self.pipeline_version = pipeline_version
         self.write_chunk_rows, self.log_every = write_chunk_rows, log_every
@@ -395,7 +398,8 @@ class EmbedJob(Job):
                                           else None, **backend_kwargs)
         else:
             assert_same_model((card.serving or {}).get("identity") or {}, embedder.backend)
-        source_id = next((s for s in artifact.meta.sources if s.startswith(SOURCE_KIND)), None)
+        source_id = next((s for s in artifact.meta.sources
+                          if s.split("__", 1)[0] == SOURCE_KIND), None)
         if source_id is None:
             raise ValueError(f"{artifact.artifact_id} records no {SOURCE_KIND} source")
         return cls(index.get(source_id), layout_from_hyperparams(artifact.meta.hyperparams),
@@ -407,7 +411,7 @@ class EmbedJob(Job):
         from datalake.layout import add_layout_args
 
         parser.add_argument("--source-artifact", default=None,
-                            help="default: the latest ravenpack_headlines")
+                            help="default: the latest rp_headlines")
         add_layout_args(parser, default_freq=None, required=False)
         parser.add_argument("--backend", default="tei", choices=["tei", "local", "embedx"])
         parser.add_argument("--dtype", default="float16", help="float16 (default) | float32")
@@ -426,7 +430,7 @@ class EmbedJob(Job):
         if args.device and args.backend != "local":
             raise ValueError("--device applies to the local backend only")
         src = index.get(args.source_artifact) if args.source_artifact \
-            else index.latest(SOURCE_KIND)
+            else latest_headlines(index)
         src_layout = layout_from_hyperparams(src.meta.hyperparams)
         if args.partition_freq and args.partition_freq != src_layout.freq:
             raise ValueError(f"embeddings follow their source's partitioning "
@@ -461,7 +465,7 @@ def embed_to_datalake(
     log_every: int = 100_000,
     temp: bool = False,
 ) -> "Artifact":
-    """Embed a ``ravenpack_headlines`` artifact into a new ``headline_embeddings`` one
+    """Embed an ``rp_headlines`` artifact into a new ``headline_embeddings`` one
     (library entry point; runs ``EmbedJob``).
 
     Args:
@@ -475,7 +479,7 @@ def embed_to_datalake(
         model_path:         Local backend only; default
                             ``$RAVENBERT_EMBEDDING_MODEL_PATH``.
         source_artifact_id: Explicit source artifact; defaults to
-                            ``index.latest("ravenpack_headlines")``.
+                            the latest ``rp_headlines``.
         start/end (or legacy start_year/end_year): restrict the partitions
                             embedded (rounded out to whole periods of the
                             source's frequency); default to the source
@@ -486,7 +490,7 @@ def embed_to_datalake(
     """
     from datalake.jobs import JobRunner
 
-    src = index.get(source_artifact_id) if source_artifact_id else index.latest(SOURCE_KIND)
+    src = index.get(source_artifact_id) if source_artifact_id else latest_headlines(index)
     if start is None and start_year is not None:
         start = date(start_year, 1, 1)
     if end is None and end_year is not None:
