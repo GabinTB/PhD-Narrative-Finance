@@ -38,6 +38,7 @@ dependencies = [
     "a7>=0.2.3",
     "dbg-cdm",
     "realized-library>=0.1.2",
+    "volforge>=0.3.0",
 ]
 
 [project.scripts]
@@ -102,6 +103,7 @@ override-dependencies = ["pandas>=2.2", "sqlalchemy>=2", "ipython>=9"]
 [tool.uv.sources]
 ravenbert = { git = "ssh://git@github.com/GabinTB/RavenBERT.git" }
 dbg-cdm = { git = "ssh://git@github.com/GabinTB/dbg-cdm.git" }
+volforge = { git = "ssh://git@github.com/GabinTB/VolForge.git", rev = "96dd909" }
 
 [dependency-groups]
 
