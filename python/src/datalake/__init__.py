@@ -3,7 +3,7 @@
     from datalake import DatalakeIndex, ModelCard
 
     dl = DatalakeIndex("/mnt/storage/datalake")
-    source = dl.latest("ravenpack_headlines")
+    source = dl.latest("rp_headlines")
 
     with dl.run(kind="headline_embeddings", pipeline="PhD-Narrative-Finance",
                 pipeline_version="v0.1.0", sources=[source],

@@ -117,6 +117,8 @@ def lake(index):
 
 
 PROJECTION = ProjectionEqual(["ID", "TEXT", "VALUE"], rename={"TEXT": "HEADLINE"})
+KEYS = KeysCover("ID")
+KC = {"toy_parent": "toy_parent_v2"}          # the toy re-ingest changes kind
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +130,7 @@ class TestRelink:
         index, old_parent, child, new_parent = lake
         res = index.relink(child.artifact_id,
                            replace={old_parent.artifact_id: new_parent.artifact_id},
-                           checks=[PROJECTION, KeysCover("ID")], notes="re-ingested parent")
+                           checks=[PROJECTION, KEYS], kind_changes=KC, notes="re-ingested parent")
         assert res.registered and res.passed and res.new_id != child.artifact_id
         new = index.get(res.new_id)
         assert new.meta.sources == [new_parent.artifact_id]
@@ -153,7 +155,7 @@ class TestRelink:
         n_before = len(index.list(include_partial=True))
         with pytest.raises(RelinkError, match="equivalence check") as err:
             index.relink(child.artifact_id, replace={old_parent.artifact_id: edited.artifact_id},
-                         checks=[PROJECTION])
+                         checks=[PROJECTION, KEYS], kind_changes=KC)
         assert not err.value.results[0].passed and "2010-02" in err.value.results[0].details
         assert len(index.list(include_partial=True)) == n_before
         assert sorted(p.name for p in child.path.parent.iterdir()) == [child.artifact_id]
@@ -162,7 +164,7 @@ class TestRelink:
         index, old_parent, child, new_parent = lake
         res = index.relink(child.artifact_id,
                            replace={old_parent.artifact_id: new_parent.artifact_id},
-                           checks=[PROJECTION], dry_run=True)
+                           checks=[PROJECTION, KEYS], kind_changes=KC, dry_run=True)
         assert res.passed and not res.registered and not res.path.exists()
         assert res.n_files == 2 and not index.exists(res.new_id)
 
@@ -171,20 +173,21 @@ class TestRelink:
         rep = {old_parent.artifact_id: new_parent.artifact_id}
         with pytest.raises(RelinkError, match="no equivalence check"):
             index.relink(child.artifact_id, replace=rep)
-        with pytest.raises(RelinkError, match="not sources"):
+        with pytest.raises(RelinkError, match="not recorded sources"):
             index.relink(child.artifact_id, replace={"nope": new_parent.artifact_id},
-                         checks=[PROJECTION])
+                         checks=[PROJECTION, KEYS], kind_changes=KC)
+        # (the message names the rule: not a recorded source)
         with pytest.raises(RelinkError, match="nothing to relink"):
-            index.relink(child.artifact_id, replace={}, checks=[PROJECTION])
+            index.relink(child.artifact_id, replace={}, checks=[PROJECTION, KEYS], kind_changes=KC)
         index.deprecate(new_parent.artifact_id, "test")
         with pytest.raises(RelinkError, match="deprecated"):
-            index.relink(child.artifact_id, replace=rep, checks=[PROJECTION])
+            index.relink(child.artifact_id, replace=rep, checks=[PROJECTION, KEYS], kind_changes=KC)
 
     def test_deprecate_old_only_on_request(self, lake):
         index, old_parent, child, new_parent = lake
         res = index.relink(child.artifact_id,
                            replace={old_parent.artifact_id: new_parent.artifact_id},
-                           checks=[PROJECTION], deprecate_old=True)
+                           checks=[PROJECTION, KEYS], kind_changes=KC, deprecate_old=True)
         old = index.get(child.artifact_id)
         assert old.deprecated and res.new_id in old.meta.deprecation_reason
         assert (old.path / next(iter(old.file_hashes))).exists()     # files kept
@@ -193,17 +196,19 @@ class TestRelink:
         index, old_parent, child, new_parent = lake
         rep = {old_parent.artifact_id: new_parent.artifact_id}
         res = index.relink(child.artifact_id, replace=rep, pipeline_version="v0.1.1",
-                           checks=[RerunSample(["2010-02"])], dry_run=True)
+                           checks=[PROJECTION, KEYS, RerunSample(["2010-02"])],
+                           kind_changes=KC, dry_run=True)
         assert res.passed, res.checks
         ChildJob.bias = 1.0                              # the code now computes something else
         try:
             with pytest.raises(RelinkError, match="outputs differ"):
                 index.relink(child.artifact_id, replace=rep, pipeline_version="v0.1.1",
-                             checks=[RerunSample(["2010-02"])])
+                             checks=[PROJECTION, KEYS, RerunSample(["2010-02"])], kind_changes=KC)
         finally:
             ChildJob.bias = 0.0
         with pytest.raises(RelinkError, match="unknown unit"):
-            index.relink(child.artifact_id, replace=rep, checks=[RerunSample(["1999-01"])])
+            index.relink(child.artifact_id, replace=rep,
+                         checks=[PROJECTION, KEYS, RerunSample(["1999-01"])], kind_changes=KC)
 
     def test_chain_and_relink_order(self, index):
         p = _make_parent(index, src="v1")
@@ -211,15 +216,16 @@ class TestRelink:
         with index.run(kind="toy_grandchild", pipeline=PIPELINE, pipeline_version=VERSION,
                        hyperparams={"child": c.artifact_id, "parent": p.artifact_id},
                        sources=[c.artifact_id, p.artifact_id]) as run:
-            (run.out_dir / "2010-01.parquet").write_bytes(b"g")
+            (run.out_dir / "series.parquet").write_bytes(b"g")       # not a period partition
         g = index.get(run.artifact_id)
         assert relink_order(index, p.artifact_id) == [c.artifact_id, g.artifact_id]
         p2 = _make_parent(index, "toy_parent_v2", src="v2")
         c2 = index.relink(c.artifact_id, replace={p.artifact_id: p2.artifact_id},
-                          checks=[FilesIdentical()])
+                          checks=[FilesIdentical(), KEYS], kind_changes=KC)
         g2 = index.relink(g.artifact_id, replace={c.artifact_id: c2.new_id,
                                                   p.artifact_id: p2.artifact_id},
-                          checks=[FilesIdentical(c.artifact_id), FilesIdentical(p.artifact_id)])
+                          checks=[FilesIdentical(c.artifact_id), FilesIdentical(p.artifact_id)],
+                          kind_changes=KC)
         assert index.get(g2.new_id).meta.hyperparams == {"child": c2.new_id,
                                                          "parent": p2.artifact_id}
         assert sorted(index.parents(g2.new_id)) == sorted([c2.new_id, p2.artifact_id])
@@ -228,7 +234,7 @@ class TestRelink:
         index, old_parent, child, new_parent = lake
         res = index.relink(child.artifact_id,
                            replace={old_parent.artifact_id: new_parent.artifact_id},
-                           checks=[PROJECTION])
+                           checks=[PROJECTION, KEYS], kind_changes=KC)
         job = ChildJob.from_artifact(index.get(res.new_id), index)
         assert job.parent_id == new_parent.artifact_id and job.params() == \
             index.get(res.new_id).meta.hyperparams
@@ -241,7 +247,7 @@ class TestRelink:
             index.relink(child.artifact_id,
                          replace={old_parent.artifact_id: new_parent.artifact_id},
                          set_params={"note": f"from {old_parent.artifact_id}"},
-                         checks=[PROJECTION], dry_run=True)
+                         checks=[PROJECTION, KEYS], kind_changes=KC, dry_run=True)
         assert "embed replaced id" in caplog.text
 
 
@@ -312,8 +318,142 @@ class TestChecks:
         index, old_parent, child, new_parent = lake
         res = index.relink(child.artifact_id,
                            replace={old_parent.artifact_id: new_parent.artifact_id},
-                           checks=[PROJECTION])
+                           checks=[PROJECTION, KEYS], kind_changes=KC)
         meta, _ = read_meta(res.path)
         assert meta.relink["replace"] == {old_parent.artifact_id: new_parent.artifact_id}
         index.reindex()
         assert index.get(res.new_id).meta.relink["from"] == child.artifact_id
+
+
+# ---------------------------------------------------------------------------
+# Replace validation (before any check runs) and asserted lineage
+# ---------------------------------------------------------------------------
+
+def _plain(index, kind, frames: dict[str, pl.DataFrame], sources=None, **hp):
+    """A complete artifact holding ``frames`` as {stem}.parquet."""
+    with index.run(kind=kind, pipeline=PIPELINE, pipeline_version=VERSION, hyperparams=hp,
+                   sources=sources) as run:
+        for stem, f in frames.items():
+            f.write_parquet(run.out_dir / f"{stem}.parquet")
+    return index.get(run.artifact_id)
+
+
+def _ids(month: str) -> pl.DataFrame:
+    return _parent_rows(month).select("ID")
+
+
+class TestValidation:
+    def _refused(self, index, child, rep, checks, match, **kw):
+        with pytest.raises(RelinkError, match=match):
+            index.relink(child.artifact_id, replace=rep, checks=checks, **kw)
+        assert not index.exists(f"{child.artifact_id}x")       # nothing registered
+        assert sorted(p.name for p in child.path.parent.iterdir()) == [child.artifact_id]
+
+    def test_needs_a_content_check_per_replaced_parent(self, lake):
+        index, old_parent, child, new_parent = lake
+        self._refused(index, child, {old_parent.artifact_id: new_parent.artifact_id}, [KEYS],
+                      r"\[checks\] no content check", kind_changes=KC)
+
+    def test_needs_a_keys_check_for_partitioned_children(self, lake):
+        index, old_parent, child, new_parent = lake
+        self._refused(index, child, {old_parent.artifact_id: new_parent.artifact_id},
+                      [PROJECTION], r"keys check is required", kind_changes=KC)
+
+    def test_kind_change_must_be_declared(self, lake):
+        index, old_parent, child, new_parent = lake
+        self._refused(index, child, {old_parent.artifact_id: new_parent.artifact_id},
+                      [PROJECTION, KEYS], r"\[kind\]")
+
+    def test_layout_mismatch_and_missing_partition(self, lake):
+        index, old_parent, child, _ = lake
+        daily = _plain(index, "toy_parent_v2", {"2010-01-15": _parent_rows("2010-01")}, d=1)
+        self._refused(index, child, {old_parent.artifact_id: daily.artifact_id},
+                      [PROJECTION, KEYS], r"\[layout\] partition frequencies differ",
+                      kind_changes=KC)
+        short = _plain(index, "toy_parent_v2", {"2010-01": _parent_rows("2010-01")}, d=2)
+        self._refused(index, child, {old_parent.artifact_id: short.artifact_id},
+                      [PROJECTION, KEYS], r"lacks 1 partition\(s\) the child holds",
+                      kind_changes=KC)
+
+    def test_asserted_source(self, index):
+        old_parent = _make_parent(index, src="v1")
+        new_parent = _make_parent(index, "toy_parent_v2", src="v2")
+        legacy = _plain(index, "toy_legacy", {m: _ids(m) for m in MONTHS})   # no sources
+        rep = {old_parent.artifact_id: new_parent.artifact_id}
+        checks = [ProjectionEqual(["ID", "TEXT"]), KeysCover("ID")]
+        self._refused(index, legacy, rep, checks, "not recorded sources", kind_changes=KC,
+                      pipeline_version="v0.2.0")
+        res = index.relink(legacy.artifact_id, replace=rep, checks=checks, kind_changes=KC,
+                           assert_sources=True, pipeline_version="v0.2.0")
+        new = index.get(res.new_id)
+        assert new.meta.sources == [new_parent.artifact_id]
+        assert new.meta.relink["asserted"] == [old_parent.artifact_id]
+        assert "asserted: never recorded" in (new.path / README_FILENAME).read_text()
+
+    def test_asserted_source_with_other_row_counts(self, index):
+        old_parent = _make_parent(index, src="v1")
+        new_parent = _make_parent(index, "toy_parent_v2", src="v2")
+        legacy = _plain(index, "toy_legacy", {"2010-01": _ids("2010-01").head(3),
+                                              "2010-02": _ids("2010-02")})
+        self._refused(index, legacy, {old_parent.artifact_id: new_parent.artifact_id},
+                      [ProjectionEqual(["ID"]), KeysCover("ID")], r"\[asserted\] row counts",
+                      kind_changes=KC, assert_sources=True, pipeline_version="v0.2.0")
+
+
+class TestProjectionOptions:
+    def _ctx(self, index, old, new):
+        from datalake.equivalence import RelinkContext
+
+        return RelinkContext(index, old, old, {old.artifact_id: new.artifact_id})
+
+    def test_as_date_text_vs_datetime_and_time_zones(self, index):
+        text = pl.DataFrame({"ID": ["a", "b"], "TS": ["2010-01-01 23:30:00.000",
+                                                      "2010-01-02 08:00:00"]})
+        dt = text.with_columns(pl.col("TS").str.to_datetime("%Y-%m-%d %H:%M:%S%.f",
+                                                            time_zone="UTC"))
+        old = _plain(index, "p_old", {"2010-01": text})
+        new = _plain(index, "p_new", {"2010-01": dt})
+        ctx = self._ctx(index, old, new)
+        for tz in ("UTC", "Asia/Tokyo", "America/New_York"):
+            assert ProjectionEqual(["ID", "TS"], as_date=["TS"], tz=tz)(ctx).passed
+        shifted = _plain(index, "p_shift", {"2010-01": dt.with_columns(
+            pl.col("TS") + pl.duration(hours=1))})
+        ctx2 = self._ctx(index, old, shifted)
+        assert not ProjectionEqual(["ID", "TS"], as_date=["TS"])(ctx2).passed   # 23:30 -> 00:30
+        assert ProjectionEqual(["ID", "TS"], as_date=["TS"], tz="America/New_York")(ctx2).passed
+
+    def test_old_nulls(self, index):
+        old = _plain(index, "p_old", {"2010-01": pl.DataFrame({"ID": ["a", "b"],
+                                                               "H": ["<NA>", "x"]})})
+        new = _plain(index, "p_new", {"2010-01": pl.DataFrame({"ID": ["a", "b"],
+                                                               "H": [None, "x"]})})
+        ctx = self._ctx(index, old, new)
+        assert not ProjectionEqual(["ID", "H"])(ctx).passed
+        res = ProjectionEqual(["ID", "H"], old_nulls=["<NA>"])(ctx)
+        assert res.passed and "1 old value(s)" in res.details
+
+    def test_parse_check_options(self):
+        p = parse_check("projection@P=ID,TS,as_date=TS,tz=Asia/Tokyo,old_nulls=<NA>+None")
+        assert (p.as_date, p.tz, p.old_nulls) == (["TS"], "Asia/Tokyo", ["<NA>", "None"])
+
+
+def test_sample_stems_spreads_and_includes_the_ends():
+    from datalake.equivalence import sample_stems
+
+    keys = [f"20{y:02d}-01" for y in range(26)]
+    assert sample_stems(keys, 6) == ["2000-01", "2005-01", "2010-01", "2015-01", "2020-01",
+                                     "2025-01"]
+    assert sample_stems(keys, 0) == keys and sample_stems(keys, 100) == keys
+    assert sample_stems(keys, 1) == ["2000-01"]
+
+
+def test_checks_sample_partitions_and_name_them(lake):
+    index, old_parent, child, new_parent = lake
+    from datalake.equivalence import RelinkContext
+
+    ctx = RelinkContext(index, child, child, {old_parent.artifact_id: new_parent.artifact_id})
+    one = ProjectionEqual(["ID", "TEXT"], rename={"TEXT": "HEADLINE"}, sample=1)(ctx)
+    assert one.passed and "sample 1/2 partitions: 2010-01" in one.details
+    full = ProjectionEqual(["ID", "TEXT"], rename={"TEXT": "HEADLINE"}, sample=0)(ctx)
+    assert full.passed and "sample" not in full.details
+    assert parse_check("keys=ID,sample=3").sample == 3

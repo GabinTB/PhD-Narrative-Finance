@@ -20,7 +20,7 @@ is not also in the sidecars, so `reindex()` can rebuild it from scratch.
 Typical use in a pipeline script:
 
     dl = DatalakeIndex("/mnt/storage/datalake")
-    source = dl.latest("ravenpack_headlines")
+    source = dl.latest("rp_headlines")
 
     with dl.run(
         kind="headline_embeddings",

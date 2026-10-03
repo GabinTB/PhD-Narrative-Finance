@@ -253,8 +253,10 @@ def render_readme(
         lines += ["## Relinked", "",
                   f"Same files as `{rl.get('from')}` (hard links), registered under new "
                   "inputs or code after the equivalence checks below.", ""]
+        asserted = set(rl.get("asserted") or [])
         for old, new in sorted((rl.get("replace") or {}).items()):
-            lines.append(f"- `{old}` -> `{new}`")
+            mark = " (asserted: never recorded as a source)" if old in asserted else ""
+            lines.append(f"- `{old}` -> `{new}`{mark}")
         checks = rl.get("checks") or []
         if checks:
             lines += ["", "| Check | Result | Details |", "| --- | --- | --- |"]

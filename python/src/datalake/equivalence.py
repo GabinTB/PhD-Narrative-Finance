@@ -119,8 +119,37 @@ def _projected(path: Path, columns: Sequence[str], rename: dict[str, str] | None
     src = [rename.get(c, c) for c in columns]
     frame = pl.read_parquet(path, columns=src).rename(dict(zip(src, columns)))
     if schema is not None:
-        frame = frame.cast({c: schema[c] for c in columns if frame.schema[c] != schema[c]})
+        frame = frame.cast({c: t for c, t in schema.items()
+                            if c in frame.columns and frame.schema[c] != t})
     return frame.unique() if unique else frame
+
+
+DEFAULT_SAMPLE = 6        # partitions a content check reads by default (0: all of them)
+
+
+def sample_stems(stems: Sequence[str], n: int) -> list[str]:
+    """``n`` stems spread over the sorted ``stems`` (first and last included,
+    deterministic); every stem when ``n`` is 0 or not smaller than their number."""
+    keys = sorted(stems)
+    if n <= 0 or n >= len(keys):
+        return keys
+    if n == 1:
+        return [keys[0]]
+    idx = sorted({round(i * (len(keys) - 1) / (n - 1)) for i in range(n)})
+    return [keys[i] for i in idx]
+
+
+def _sampled(a: dict[str, Path], b: dict[str, Path], n: int) -> tuple[dict[str, Path],
+                                                                      dict[str, Path], str]:
+    """Both sides restricted to ``n`` sampled stems of the union (a stem missing on one
+    side still fails the comparison); plus a note naming the sample."""
+    keys = sample_stems(set(a) | set(b), n)
+    if len(keys) == len(set(a) | set(b)):
+        return a, b, ""
+    pick = set(keys)
+    note = f" [sample {len(keys)}/{len(set(a) | set(b))} partitions: {', '.join(keys)}]"
+    return ({k: v for k, v in a.items() if k in pick},
+            {k: v for k, v in b.items() if k in pick}, note)
 
 
 def _files(art_path: Path, pattern: str) -> dict[str, Path]:
@@ -175,6 +204,26 @@ class FilesIdentical:
         return CheckResult(self.name, False, f"{len(diff)} file(s) differ, e.g. {diff[:5]}")
 
 
+TIMESTAMP_TEXT_FORMAT = "%Y-%m-%d %H:%M:%S%.f"
+
+
+def _as_date(col: Any, dtype: Any, tz: str) -> Any:
+    """The calendar day in ``tz`` of a timestamp column: a datetime (naive = UTC) is
+    converted to ``tz``; a text timestamp is read as UTC (``TIMESTAMP_TEXT_FORMAT``,
+    or a bare date) and converted the same way; a date stays as is."""
+    import polars as pl
+
+    if dtype == pl.Date:
+        return col
+    if dtype == pl.String:
+        col = col.str.to_datetime(TIMESTAMP_TEXT_FORMAT, time_unit="us", time_zone="UTC",
+                                  strict=False).fill_null(
+            col.str.to_datetime("%Y-%m-%d", time_unit="us", time_zone="UTC", strict=False))
+    elif isinstance(dtype, pl.Datetime) and dtype.time_zone is None:
+        col = col.dt.replace_time_zone("UTC")
+    return col.dt.convert_time_zone(tz).dt.date()
+
+
 @dataclass
 class ProjectionEqual:
     """Old and new parent hold the same rows projected on ``columns``.
@@ -182,18 +231,53 @@ class ProjectionEqual:
     ``rename`` maps an old column name to its name in the new parent; the new
     columns are cast to the old dtypes (a failing cast fails the check). ``by``:
     "stem" compares partition by partition (same file stems), "all" the whole
-    artifact (layouts may differ)."""
+    artifact (layouts may differ).
+
+    ``as_date`` columns are compared as calendar days in ``tz`` on both sides (text or
+    datetime timestamps, see ``_as_date``; an unparseable value fails the check).
+    ``old_nulls`` strings read as null on the OLD side only (a legacy writer's null
+    text, e.g. "<NA>"); how many values that touched is reported."""
 
     columns: list[str]
     parent: str | None = None
     rename: dict[str, str] = field(default_factory=dict)
     by: str = "stem"
     pattern: str = PARQUET
+    as_date: list[str] = field(default_factory=list)
+    tz: str = "UTC"
+    old_nulls: list[str] = field(default_factory=list)
+    sample: int = DEFAULT_SAMPLE
 
     @property
     def name(self) -> str:
         cols = ",".join(f"{c}:{self.rename[c]}" if c in self.rename else c for c in self.columns)
-        return f"projection{'@' + self.parent if self.parent else ''}[{cols}] by {self.by}"
+        extra = "".join([f" as_date={'+'.join(self.as_date)}@{self.tz}" if self.as_date else "",
+                         f" old_nulls={'+'.join(self.old_nulls)}" if self.old_nulls else ""])
+        return f"projection{'@' + self.parent if self.parent else ''}[{cols}] by {self.by}{extra}"
+
+    def _side(self, path: Path, *, old: bool, schema: dict[str, Any] | None,
+              counter: list[int]) -> Any:
+        import polars as pl
+
+        rename = None if old else self.rename
+        cast_to = None if schema is None else {c: t for c, t in schema.items()
+                                               if c not in self.as_date}
+        frame = _projected(path, self.columns, rename, cast_to)
+        if old and self.old_nulls:
+            text = [c for c in self.columns if frame.schema[c] == pl.String]
+            hit = frame.select([pl.col(c).is_in(self.old_nulls).sum() for c in text])
+            counter[0] += int(sum(hit.row(0))) if text else 0
+            frame = frame.with_columns([pl.when(pl.col(c).is_in(self.old_nulls)).then(None)
+                                        .otherwise(pl.col(c)).alias(c) for c in text])
+        if self.as_date:
+            before = frame.select([pl.col(c).null_count() for c in self.as_date]).row(0)
+            frame = frame.with_columns([_as_date(pl.col(c), frame.schema[c], self.tz).alias(c)
+                                        for c in self.as_date])
+            after = frame.select([pl.col(c).null_count() for c in self.as_date]).row(0)
+            if after != before:
+                raise ValueError(f"{path.name}: timestamps that do not parse in "
+                                 f"{self.as_date}")
+        return frame
 
     def __call__(self, ctx: RelinkContext) -> CheckResult:
         import polars as pl
@@ -202,20 +286,27 @@ class ProjectionEqual:
         old_files, new_files = _files(old_p.path, self.pattern), _files(new_p.path, self.pattern)
         if not old_files or not new_files:
             return CheckResult(self.name, False, "no partition file on one side")
+        note = ""
+        if self.by == "stem":
+            old_files, new_files, note = _sampled(old_files, new_files, self.sample)
         first = next(iter(old_files.values()))
         schema = dict(pl.read_parquet_schema(first))
         missing = [c for c in self.columns if c not in schema]
         if missing:
             return CheckResult(self.name, False, f"columns {missing} not in {old_p.artifact_id}")
+        schema = {c: schema[c] for c in self.columns}
+        nulled = [0]
         try:
-            a = {k: _rows_digest(_projected(p, self.columns, None, None))
+            a = {k: _rows_digest(self._side(p, old=True, schema=None, counter=nulled))
                  for k, p in old_files.items()}
-            b = {k: _rows_digest(_projected(p, self.columns, self.rename, schema))
+            b = {k: _rows_digest(self._side(p, old=False, schema=schema, counter=nulled))
                  for k, p in new_files.items()}
         except Exception as exc:  # noqa: BLE001 - a read / cast failure is a failed check
             return CheckResult(self.name, False, f"{type(exc).__name__}: {exc}")
         ok, details = _compare_digests(a, b, self.by, "rows")
-        return CheckResult(self.name, ok, details)
+        if self.old_nulls:
+            details += (f"; {nulled[0]:,} old value(s) in {self.old_nulls} read as null")
+        return CheckResult(self.name, ok, details + note)
 
 
 @dataclass
@@ -228,6 +319,7 @@ class KeysCover:
     parent_key: str | None = None
     by: str = "stem"
     pattern: str = PARQUET
+    sample: int = DEFAULT_SAMPLE
 
     @property
     def name(self) -> str:
@@ -240,6 +332,9 @@ class KeysCover:
         _, new_p = ctx.parents(self.parent)
         child_files = _files(ctx.new.path, self.pattern)
         parent_files = _files(new_p.path, self.pattern)
+        note = ""
+        if self.by == "stem":
+            child_files, parent_files, note = _sampled(child_files, parent_files, self.sample)
         if not child_files or not parent_files:
             return CheckResult(self.name, False, "no partition file on one side")
         try:
@@ -252,7 +347,7 @@ class KeysCover:
         except Exception as exc:  # noqa: BLE001
             return CheckResult(self.name, False, f"{type(exc).__name__}: {exc}")
         ok, details = _compare_digests(a, b, self.by, "keys")
-        return CheckResult(self.name, ok, details)
+        return CheckResult(self.name, ok, details + note)
 
 
 @dataclass
@@ -338,11 +433,15 @@ def parse_check(spec: str) -> Check:
     """A check from its CLI spec::
 
         files[@PARENT]
-        projection[@PARENT]=COL,COL,OLDCOL:NEWCOL[,by=all]
-        keys[@PARENT]=KEY[:PARENT_KEY][,by=all]
+        projection[@PARENT]=COL,COL,OLDCOL:NEWCOL[,by=all][,as_date=C+C][,tz=Europe/Paris]
+                                                 [,old_nulls=<NA>+None][,sample=N]
+        keys[@PARENT]=KEY[:PARENT_KEY][,by=all][,sample=N]
         rerun=UNIT,UNIT[,rtol=1e-6][,atol=0]
 
-    ``@PARENT`` (an old parent id) may be omitted when one parent is replaced."""
+    ``@PARENT`` (an old parent id) may be omitted when one parent is replaced.
+    ``sample``: partitions read by a ``by=stem`` check, spread over the range (first and
+    last included; default ``DEFAULT_SAMPLE``; 0 = every partition, an explicit choice:
+    it costs about what recomputing costs). The sampled stems are named in the result."""
     head, _, body = spec.partition("=")
     name, _, parent = head.partition("@")
     tokens = [t for t in body.split(",") if t] if body else []
@@ -358,10 +457,15 @@ def parse_check(spec: str) -> Check:
             columns.append(old)
             if new:
                 rename[old] = new
-        return ProjectionEqual(columns, parent_id, rename, by=opts.get("by", "stem"))
+        plus = lambda key: [v for v in opts.get(key, "").split("+") if v]  # noqa: E731
+        return ProjectionEqual(columns, parent_id, rename, by=opts.get("by", "stem"),
+                               as_date=plus("as_date"), tz=opts.get("tz", "UTC"),
+                               old_nulls=plus("old_nulls"),
+                               sample=int(opts.get("sample", DEFAULT_SAMPLE)))
     if name == "keys" and len(args) == 1:
         key, _, parent_key = args[0].partition(":")
-        return KeysCover(key, parent_id, parent_key or None, by=opts.get("by", "stem"))
+        return KeysCover(key, parent_id, parent_key or None, by=opts.get("by", "stem"),
+                         sample=int(opts.get("sample", DEFAULT_SAMPLE)))
     if name == "rerun" and args and not parent:
         return RerunSample(args, rtol=float(opts.get("rtol", 0.0)),
                            atol=float(opts.get("atol", 0.0)))

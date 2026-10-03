@@ -8,7 +8,8 @@
     datalake reindex
     datalake move ID [ID ...] (--group GROUP | --no-group) [--allow-partial] [--dry-run]
     datalake relink ID --replace OLD=NEW [...] [--set KEY=JSON ...] [--pipeline-version V]
-                    --check SPEC [...] [--notes TEXT] [--deprecate-old] [--dry-run]
+                    --check SPEC [...] [--assert-source] [--kind-change OLD=NEW ...]
+                    [--notes TEXT] [--deprecate-old] [--dry-run]
     datalake relink-plan ARTIFACT_ID
 
 Check specs (datalake.equivalence.parse_check): files[@PARENT] |
@@ -125,7 +126,10 @@ def cmd_show(index: DatalakeIndex, args: argparse.Namespace) -> int:
     if artifact.file_hashes:
         print(f"  files      {len(artifact.file_hashes)}")
     if meta.relink:
-        print(f"  relinked   from {meta.relink.get('from')}")
+        print(f"  relinked   from {meta.relink.get('from')} "
+              f"({meta.relink.get('from_version', '?')})")
+        if meta.relink.get("asserted"):
+            print(f"    asserted (unrecorded) sources: {meta.relink['asserted']}")
         for old, new in sorted((meta.relink.get("replace") or {}).items()):
             print(f"    {old} -> {new}")
         for check in meta.relink.get("checks") or []:
@@ -220,7 +224,9 @@ def cmd_relink(index: DatalakeIndex, args: argparse.Namespace) -> int:
         result = relink(index, args.artifact_id, replace=_pairs(args.replace or [], "--replace"),
                         set_params=set_params, pipeline_version=args.pipeline_version,
                         checks=[parse_check(c) for c in args.check or []], notes=args.notes,
-                        deprecate_old=args.deprecate_old, dry_run=args.dry_run)
+                        deprecate_old=args.deprecate_old, dry_run=args.dry_run,
+                        assert_sources=args.assert_source,
+                        kind_changes=_pairs(args.kind_change or [], "--kind-change"))
     except RelinkError as exc:
         for check in exc.results:
             print(f"  [{'pass' if check.passed else 'FAIL'}] {check.name}: {check.details}")
@@ -332,6 +338,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_rl.add_argument("--pipeline-version", help="record a new pipeline version")
     p_rl.add_argument("--check", action="append", metavar="SPEC",
                       help="equivalence check (see above); repeatable")
+    p_rl.add_argument("--assert-source", action="store_true",
+                      help="accept replaced ids the artifact never recorded as sources "
+                           "(legacy lineage; extra partition / row-count validation)")
+    p_rl.add_argument("--kind-change", action="append", metavar="OLD_KIND=NEW_KIND",
+                      help="declare that a replaced parent changes kind; repeatable")
     p_rl.add_argument("--notes", default="")
     p_rl.add_argument("--deprecate-old", action="store_true",
                       help="deprecate the old artifact once the relink is registered")

@@ -15,6 +15,16 @@ registers a NEW artifact that
   * records ``meta.relink`` = {from, replace, checks, commit}, NOT a lineage source:
     ``require_lineage`` keeps comparing true inputs.
 
+Every replacement is validated before any check runs (``validate_replace``): the
+new parent is complete and not deprecated; it has the old parent's kind unless the
+kind change is declared (``kind_changes``); both parents share a partition frequency
+and the new one holds every partition the child holds; at least one content check
+(``files`` or ``projection``) compares each old parent with its new one; a child with
+period partitions needs a ``keys`` check. A replaced id the child never recorded is
+refused unless ``assert_sources`` (legacy lineage, owner-asserted): then the asserted
+parent must also hold exactly the child's partitions with the same row counts
+(parquet metadata). Asserted ids are recorded in ``meta.relink["asserted"]``.
+
 The equivalence checks (``datalake.equivalence``) run before anything is
 registered: the explicit ones plus the kind's defaults. Any failure removes the
 new directory and registers nothing. The old artifact is never modified, except
@@ -37,7 +47,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from datalake.artifact import Artifact, RunMeta, RunRecord, utc_now_iso
-from datalake.equivalence import Check, CheckResult, RelinkContext, default_checks
+from datalake.equivalence import (
+    Check,
+    CheckResult,
+    FilesIdentical,
+    KeysCover,
+    ProjectionEqual,
+    RelinkContext,
+    default_checks,
+)
 from datalake.index import DatalakeError, _same_device
 from datalake.meta import (
     JOB_CONTROL_FILES,
@@ -47,6 +65,7 @@ from datalake.meta import (
     read_meta,
     write_sidecars,
 )
+from datalake.periods import PeriodError, parse_key
 
 if TYPE_CHECKING:
     from datalake.index import DatalakeIndex
@@ -134,10 +153,89 @@ def _link_tree(source: Path, target: Path) -> tuple[int, int]:
     return n_files, n_bytes
 
 
+def _partitions(art: Artifact) -> dict[str, Path]:
+    """Period-keyed parquet files of an artifact (stem -> path); other files ignored."""
+    out = {}
+    for p in sorted(art.path.glob("*.parquet")):
+        try:
+            parse_key(p.stem)
+        except PeriodError:
+            continue
+        out[p.stem] = p
+    return out
+
+
+def _freqs(parts: dict[str, Path]) -> set[str]:
+    return {parse_key(k).freq for k in parts}
+
+
+def _row_counts(parts: dict[str, Path]) -> dict[str, int]:
+    import pyarrow.parquet as pq
+
+    return {k: pq.ParquetFile(p).metadata.num_rows for k, p in parts.items()}
+
+
+def validate_replace(index: DatalakeIndex, old: Artifact, replace: dict[str, str],
+                     checks: Sequence[Check], *, assert_sources: bool = False,
+                     kind_changes: dict[str, str] | None = None) -> list[str]:
+    """Problems that refuse ``replace`` for ``old`` before any check runs (empty: valid).
+    See the module docstring for the rules."""
+    kind_changes = dict(kind_changes or {})
+    problems: list[str] = []
+    child_parts = _partitions(old)
+    for old_id, new_id in replace.items():
+        recorded = old_id in old.meta.sources
+        if not recorded and not assert_sources:
+            problems.append(f"[source] {old_id} is not a recorded source of {old.artifact_id} "
+                            f"(sources: {old.meta.sources}); pass assert_sources if it was "
+                            "built from it without recording it")
+            continue
+        if not index.exists(old_id) or not index.exists(new_id):
+            problems.append(f"[registered] {old_id if not index.exists(old_id) else new_id} "
+                            "is not registered")
+            continue
+        op, np_ = index.get(old_id), index.get(new_id)
+        if np_.partial or np_.deprecated:
+            problems.append(f"[state] new parent {new_id} is "
+                            f"{'partial' if np_.partial else 'deprecated'}")
+        if np_.kind != op.kind and kind_changes.get(op.kind) != np_.kind:
+            problems.append(f"[kind] {old_id} is a {op.kind}, {new_id} a {np_.kind}: declare "
+                            f"the change (kind_changes {{{op.kind!r}: {np_.kind!r}}})")
+        op_parts, np_parts = _partitions(op), _partitions(np_)
+        if _freqs(op_parts) != _freqs(np_parts):
+            problems.append(f"[layout] partition frequencies differ: {sorted(_freqs(op_parts))} "
+                            f"vs {sorted(_freqs(np_parts))}")
+        missing = sorted(set(child_parts) - set(np_parts))
+        if missing:
+            problems.append(f"[layout] {new_id} lacks {len(missing)} partition(s) the child "
+                            f"holds: {missing[:5]}")
+        if not recorded:
+            if set(op_parts) != set(child_parts):
+                problems.append(f"[asserted] {old_id} and {old.artifact_id} hold different "
+                                f"partitions ({len(op_parts)} vs {len(child_parts)})")
+            else:
+                a, b = _row_counts(op_parts), _row_counts(child_parts)
+                bad = [k for k in child_parts if a[k] != b[k]]
+                if bad:
+                    problems.append(f"[asserted] row counts differ in {len(bad)} partition(s), "
+                                    f"e.g. {bad[0]}: {a[bad[0]]:,} vs {b[bad[0]]:,}")
+        single = len(replace) == 1
+        content = [c for c in checks if isinstance(c, (FilesIdentical, ProjectionEqual))
+                   and (c.parent == old_id or (c.parent is None and single))]
+        if not content:
+            problems.append(f"[checks] no content check (files@ / projection@) compares "
+                            f"{old_id} with {new_id}")
+    if child_parts and replace and not any(isinstance(c, KeysCover) for c in checks):
+        problems.append(f"[checks] {old.artifact_id} has period partitions: a keys check is "
+                        "required")
+    return problems
+
+
 def relink(index: DatalakeIndex, artifact_id: str, *, replace: dict[str, str],
            set_params: dict[str, Any] | None = None, pipeline_version: str | None = None,
            checks: Sequence[Check] = (), notes: str = "", deprecate_old: bool = False,
-           dry_run: bool = False, repo_dir: Path | None = None) -> RelinkResult:
+           dry_run: bool = False, repo_dir: Path | None = None, assert_sources: bool = False,
+           kind_changes: dict[str, str] | None = None) -> RelinkResult:
     """Register ``artifact_id``'s files as a new artifact under ``replace`` /
     ``set_params`` / ``pipeline_version``, after the equivalence checks.
 
@@ -150,15 +248,11 @@ def relink(index: DatalakeIndex, artifact_id: str, *, replace: dict[str, str],
         raise RelinkError(f"{artifact_id} is partial: finish it before relinking")
     if not replace and not set_params and pipeline_version is None:
         raise RelinkError("nothing to relink: give replace, set_params or pipeline_version")
-    unknown = [p for p in replace if p not in old.meta.sources]
-    if unknown:
-        raise RelinkError(f"{unknown} are not sources of {artifact_id} "
-                          f"(sources: {old.meta.sources})")
-    for new_parent in replace.values():
-        parent = index.get(new_parent)
-        if parent.partial or parent.deprecated:
-            raise RelinkError(f"new parent {new_parent} is "
-                              f"{'partial' if parent.partial else 'deprecated'}")
+    asserted = [p for p in replace if p not in old.meta.sources]
+    if asserted and not assert_sources:              # first: it decides everything below
+        raise RelinkError(f"{artifact_id}: relink refused:\n  [source] {asserted} are not "
+                          f"recorded sources (sources: {old.meta.sources}); pass "
+                          "assert_sources if it was built from them without recording it")
 
     hyperparams = substitute(dict(old.meta.hyperparams), replace)
     hyperparams.update(set_params or {})
@@ -170,7 +264,8 @@ def relink(index: DatalakeIndex, artifact_id: str, *, replace: dict[str, str],
         kind=old.kind, pipeline=old.meta.pipeline,
         pipeline_version=pipeline_version or old.meta.pipeline_version,
         pipeline_repo=old.meta.pipeline_repo, hyperparams=hyperparams,
-        sources=[replace.get(s, s) for s in old.meta.sources],
+        sources=[replace.get(s, s) for s in old.meta.sources]
+        + [replace[a] for a in asserted],
         model_card=old.meta.model_card, verifier=old.meta.verifier, group=old.group,
     )
     new_id = meta.artifact_id
@@ -187,6 +282,17 @@ def relink(index: DatalakeIndex, artifact_id: str, *, replace: dict[str, str],
                for k in sorted(set(old.meta.hyperparams) | set(hyperparams))
                if old.meta.hyperparams.get(k) != hyperparams.get(k)}
 
+    digests = {k: v["digest"] for k, v in file_hashes.items()}
+    pre = RelinkContext(index, old, Artifact(new_id, old.layer, old.path, meta, digests), replace)
+    all_checks = list(checks) + default_checks(pre)
+    if not all_checks:
+        raise RelinkError("no equivalence check given and none registered for "
+                          f"{old.kind}: refusing an unchecked relink")
+    problems = validate_replace(index, old, replace, all_checks,
+                                assert_sources=assert_sources, kind_changes=kind_changes)
+    if problems:
+        raise RelinkError(f"{artifact_id}: relink refused:\n  " + "\n  ".join(problems))
+
     if dry_run:
         content = list(_content_files(old.path))
         n_files, n_bytes = len(content), sum(p.stat().st_size for p in content)
@@ -194,15 +300,9 @@ def relink(index: DatalakeIndex, artifact_id: str, *, replace: dict[str, str],
     else:
         n_files, n_bytes = _link_tree(old.path, new_dir)
         work_dir = new_dir
-    provisional = Artifact(new_id, old.layer, work_dir, meta,
-                           {k: v["digest"] for k, v in file_hashes.items()})
-    ctx = RelinkContext(index, old, provisional, replace)
+    ctx = RelinkContext(index, old, Artifact(new_id, old.layer, work_dir, meta, digests), replace)
     results: list[CheckResult] = []
     try:
-        all_checks = list(checks) + default_checks(ctx)
-        if not all_checks:
-            raise RelinkError("no equivalence check given and none registered for "
-                              f"{old.kind}: refusing an unchecked relink")
         for check in all_checks:
             try:
                 results.append(check(ctx))
@@ -235,7 +335,9 @@ def relink(index: DatalakeIndex, artifact_id: str, *, replace: dict[str, str],
 
     commit = git_commit(repo_dir)
     now = utc_now_iso()
-    meta.relink = {"from": artifact_id, "replace": replace,
+    meta.relink = {"from": artifact_id, "from_version": old.meta.pipeline_version,
+                   "replace": replace, "asserted": asserted,
+                   "kind_changes": dict(kind_changes or {}),
                    "checks": [c.to_dict() for c in results], "commit": commit}
     meta.notes = notes
     meta.runs = [RunRecord(run_start=now, run_end=now, pipeline_version=meta.pipeline_version,
@@ -269,4 +371,5 @@ def relink_order(index: DatalakeIndex, artifact_id: str) -> list[str]:
     return ordered
 
 
-__all__ = ["RelinkError", "RelinkResult", "relink", "relink_order", "substitute"]
+__all__ = ["RelinkError", "RelinkResult", "relink", "relink_order", "substitute",
+           "validate_replace"]
